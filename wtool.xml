@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tools/dsh-remote —— 用手机远程看着/接着指挥家里这台机器上的 DSH 会话。
+
+  链路（Plan B，纯浏览器，不需要在手机上装任何东西）：
+
+      手机浏览器 ──https──> 阿里云 Caddy ──反向代理──> 127.0.0.1:18080
+      （basic auth 挡住所有人）                              │
+                                                             │ SSH 反向隧道
+                                                             │ （家主动连出去，云上不用开新端口）
+                                                             ▼
+                                            家里 127.0.0.1:3080（dsh web）
+
+  **刻意做成独立项目**：只有 `wtool install tools/dsh-remote` 之后才会有
+  dsh-remote / dsh-notify 这两条命令。不装它就没有任何影响。
+
+  两件事分开表达：
+    * <env>  —— 只导出项目目录（命令本体由 scripts/install.sh 软链进
+                 $WTOOL_PREFIX/bin）。zsh 和 bash 各一份，内容等价。
+    * scripts/install.sh —— wtool.xml 表达不了的那件事：软链命令 + 装推送配置样板。
+
+  仓库里只有文本：没有二进制、没有证书、没有密码。云端脚本在 cloud/，
+  家这头的命令在 bin/，用法与安全边界见 README.md。
+-->
+<wtool schema="1" id="tools/dsh-remote" priority="47">
+
+  <env src="env.zsh"  shells="zsh"/>
+  <env src="env.bash" shells="bash"/>
+
+  <!-- 没有构建步骤：源码包就是产物 -->
+  <publish kind="source"/>
+
+</wtool>

@@ -1,0 +1,44 @@
+# notify.conf —— dsh-notify 的推送配置（样板）
+#
+# 位置：~/.config/dsh-remote/notify.conf（默认；用户级，不进任何仓库）
+# 也可以用 $DSH_NOTIFY_CONF 指到别处
+#
+# 只有 provider 那一行必须取消注释；其余按你选的渠道来。改完用
+#   dsh-remote notify-test
+# 试一条。
+
+# --------------------------------------------------------------- 选一个渠道
+# serverchan  微信推送（Server酱，最简单，国内直连）
+# dingtalk    钉钉群机器人
+# telegram    Telegram Bot（国内要挂代理：curl 认 https_proxy 环境变量）
+# bark        iOS 的 Bark App（可以自建 server）
+# generic     任意 HTTP 端点：POST 正文是 text/plain
+
+provider=serverchan
+
+# --------------------------------------------------------------- Server酱
+# https://sct.ftqq.com/ 拿 SendKey
+#SENDKEY=SCTxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --------------------------------------------------------------- 钉钉机器人
+# 群设置 → 智能群助手 → 添加机器人 → 自定义；安全设置选"自定义关键词"，
+# 关键词填下面 dsh-notify 标题里一定有的字（默认标题里有"会话""跑完"）。
+#WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=xxxx
+
+# --------------------------------------------------------------- Telegram
+#BOT_TOKEN=123456:ABC-DEF...
+#CHAT_ID=123456789
+
+# --------------------------------------------------------------- Bark（iOS）
+#BARK_KEY=xxxxxxxxxxxxxxxxxxxx
+#BARK_SERVER=https://api.day.app
+
+# --------------------------------------------------------------- 通用 webhook
+#URL=https://example.com/hook
+
+# --------------------------------------------------------------- 行为开关
+# 每一轮跑完也推一条（0 = 只在"等用户回答"时推）
+#on_stop=1
+
+# 手机该点的地址：云端 Caddy 装好后写这里，推送正文末尾会带上它
+#public_url=https://dsh.example.com/

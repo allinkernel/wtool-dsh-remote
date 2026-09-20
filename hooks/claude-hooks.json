@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "ask_user_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__DSH_NOTIFY__ --hook --async",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__DSH_NOTIFY__ --hook --async",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

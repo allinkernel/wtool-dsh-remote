@@ -1,0 +1,236 @@
+#!/bin/sh
+# dsh-notify —— 一条命令把消息推到手机。
+#
+# 用法：
+#   dsh-notify "标题" "正文"          直接推一条
+#   dsh-notify --test                 推一条测试消息（看配置通不通）
+#   dsh-notify --hook [--async]       给 DSH 的 hook 桥用：从 stdin 读 Claude Code
+#                                     格式的 hook JSON，自动拼出"会话在等你回答"之类的消息
+#
+# 配置：~/.config/dsh-remote/notify.conf（可用 $DSH_NOTIFY_CONF 换路径）。样板见
+#   tools/dsh-remote/notify.conf.example
+#
+#   provider=serverchan   SENDKEY=...
+#   provider=dingtalk     WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=...
+#   provider=telegram     BOT_TOKEN=... CHAT_ID=...
+#   provider=bark         BARK_KEY=...            （iOS，Bark App；可选 BARK_SERVER）
+#   provider=generic      URL=https://...         （POST，正文是 text/plain）
+#
+# 退出码**永远是 0**。这是有意的：
+#   它会挂在 PreToolUse 钩子上，而钩子退出码 2 = 阻止这次工具调用。
+#   推送失败（没网、key 过期、云服务抽风）绝不能把 agent 卡住或者把工具拦掉 ——
+#   失败只写一行到 ~/.local/state/dsh-remote/notify.log。
+#
+# 只依赖 curl；解析 hook JSON 时优先用 python3，没有就退化成"只发事件名"。
+
+set -u
+
+# 我们的目录（不是 ~/.dsh —— 那是 DSH 自己的）。DSH_REMOTE_HOME 是测试用的伞覆盖。
+: "${DSH_REMOTE_HOME:=}"
+CONF_DIR=${DSH_REMOTE_CONF_DIR:-${DSH_REMOTE_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}}
+STATE_DIR=${DSH_REMOTE_STATE_DIR:-${DSH_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}}
+CONF=${DSH_NOTIFY_CONF:-$CONF_DIR/notify.conf}
+LOG=${DSH_NOTIFY_LOG:-$STATE_DIR/notify.log}
+
+log() {
+    [ -n "$LOG" ] || return 0
+    mkdir -p -- "$(dirname -- "$LOG")" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+# 从配置里取一个键（大小写不敏感地取两种写法；取到的是最后一个）
+conf() {
+    [ -f "$CONF" ] || return 1
+    _v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -n 1)
+    _v=$(printf '%s' "$_v" | sed -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    [ -n "$_v" ] || return 1
+    printf '%s' "$_v"
+}
+
+conf_any() {
+    for k in "$@"; do
+        if _r=$(conf "$k"); then printf '%s' "$_r"; return 0; fi
+    done
+    return 1
+}
+
+# JSON 里放字符串：优先 python3，退化用 sed。输出不带引号的内容。
+json_str() {
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'
+    else
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | awk '{printf "%s\\n", $0}' | sed -e 's/\\n$//'
+    fi
+}
+
+# 标题别太长（Server酱 32 字，钉钉也有限制），按字节截断
+clip() {
+    printf '%s' "$1" | cut -c "1-${2:-60}"
+}
+
+push() {
+    title=$(clip "$1" 60)
+    body=$2
+    provider=$(conf_any provider PROVIDER 2>/dev/null || printf '')
+    [ -n "$provider" ] || provider=serverchan
+
+    case $provider in
+    serverchan | serverchan-* | sct)
+        key=$(conf_any SENDKEY sendkey SEND_KEY) || { log "serverchan: 缺 SENDKEY"; return 1; }
+        curl -fsS -m 20 -X POST "https://sctapi.ftqq.com/${key}.send" \
+            --data-urlencode "title=${title}" --data-urlencode "desp=${body}" >/dev/null
+        ;;
+    dingtalk | ding)
+        url=$(conf_any WEBHOOK webhook DINGTALK_WEBHOOK) || { log "dingtalk: 缺 WEBHOOK"; return 1; }
+        payload=$(printf '{"msgtype":"text","text":{"content":"%s"}}' "$(json_str "${title}
+${body}")")
+        # 钉钉要求消息里带自定义关键词（机器人安全设置里选的），标题就当那个关键词
+        curl -fsS -m 20 -X POST -H 'Content-Type: application/json' -d "$payload" "$url" >/dev/null
+        ;;
+    telegram | tg)
+        tok=$(conf_any BOT_TOKEN bot_token TELEGRAM_BOT_TOKEN) || { log "telegram: 缺 BOT_TOKEN"; return 1; }
+        chat=$(conf_any CHAT_ID chat_id TELEGRAM_CHAT_ID) || { log "telegram: 缺 CHAT_ID"; return 1; }
+        # 国内直连 api.telegram.org 通常不通，curl 会自己用 https_proxy 环境变量
+        curl -fsS -m 20 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${title}
+${body}" >/dev/null
+        ;;
+    bark)
+        key=$(conf_any BARK_KEY bark_key) || { log "bark: 缺 BARK_KEY"; return 1; }
+        server=$(conf_any BARK_SERVER bark_server 2>/dev/null || printf 'https://api.day.app')
+        curl -fsS -m 20 -X POST "${server%/}/${key}" \
+            --data-urlencode "title=${title}" --data-urlencode "body=${body}" >/dev/null
+        ;;
+    generic | webhook | http)
+        url=$(conf_any URL url WEBHOOK) || { log "generic: 缺 URL"; return 1; }
+        printf '%s\n%s\n' "$title" "$body" |
+            curl -fsS -m 20 -X POST -H 'Content-Type: text/plain; charset=utf-8' --data-binary @- "$url" >/dev/null
+        ;;
+    none | off | '')
+        log "provider=none，什么也不发"
+        return 0
+        ;;
+    *)
+        log "不认识的 provider: $provider"
+        return 1
+        ;;
+    esac
+}
+
+# ---------------------------------------------------------------- hook 模式
+# 读 stdin 上的 Claude Code 格式 hook JSON，输出：
+#   第 1 行 EVENT=<事件名>（sh 这边要用它判断 on_stop 开关）
+#   第 2 行 标题
+#   其余   正文
+hook_message() {
+    _json=$(cat)
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$_json" | python3 -c '
+import json, sys, os
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+ev = d.get("hook_event_name") or d.get("hook_event") or "?"
+cwd = d.get("cwd") or os.getcwd()
+where = os.path.basename(cwd.rstrip("/")) or cwd
+print("EVENT=%s" % ev)
+if ev == "PreToolUse":
+    name = d.get("tool_name") or ""
+    ti = d.get("tool_input") or {}
+    if name == "ask_user_question":
+        title = "❓ 会话在等你回答"
+        lines = []
+        for q in (ti.get("questions") or []):
+            head = q.get("header") or ""
+            lines.append(("[%s] " % head if head else "") + (q.get("question") or "").strip())
+            for o in (q.get("options") or []):
+                lines.append("  · " + (o.get("label") or ""))
+        if not lines:
+            lines.append("（问题内容没解析出来，去界面上看）")
+        body = "\n".join(lines)
+    else:
+        title = "🔧 要用工具：%s" % name
+        body = json.dumps(ti, ensure_ascii=False)[:300]
+    print(title)
+    print(body)
+    print("工作区：%s" % where)
+elif ev == "Stop":
+    print("✅ 这一轮跑完了")
+    print("工作区：%s" % where)
+elif ev == "SessionStart":
+    print("▶️ 新会话开始了")
+    print("工作区：%s" % where)
+else:
+    print("DSH hook：%s" % ev)
+    print("工作区：%s" % where)
+' && return 0
+    fi
+    printf 'EVENT=unknown\n%s\n%s\n' "DSH 有事找你" "（python3 不在，解析不了详情；工作目录：${PWD}）"
+}
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+ASYNC=0
+MODE=plain
+while [ $# -gt 0 ]; do
+    case $1 in
+    --hook) MODE=hook ;;
+    --async) ASYNC=1 ;;
+    --test) MODE=test ;;
+    --help | -h) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) printf 'dsh-notify: 不认识的参数 %s\n' "$1" >&2; exit 0 ;;
+    *) break ;;
+    esac
+    shift
+done
+
+case $MODE in
+hook)
+    msg=$(hook_message)
+    EVENT=$(printf '%s' "$msg" | sed -n 's/^EVENT=//p' | head -n 1)
+    TITLE=$(printf '%s' "$msg" | sed -n '2p')
+    BODY=$(printf '%s' "$msg" | tail -n +3)
+    # "每一轮跑完也推一条"可以关掉：notify.conf 里 on_stop=0
+    if [ "$EVENT" = Stop ]; then
+        case $(conf_any on_stop ON_STOP 2>/dev/null || printf '1') in
+        0 | off | no | false | none) exit 0 ;;
+        esac
+    fi
+    ;;
+test)
+    TITLE="🔔 dsh-notify 测试"
+    BODY="能看到这条就说明推送配好了。
+主机：$(hostname)
+时间：$(date '+%Y-%m-%d %H:%M:%S')
+配置：$CONF"
+    ;;
+*)
+    TITLE=${1:-"DSH 消息"}
+    BODY=${2:-""}
+    ;;
+esac
+
+# 把手机该点的地址附在最后（配了就附）
+if [ "$MODE" != test ]; then
+    if _u=$(conf_any public_url PUBLIC_URL 2>/dev/null); then
+        BODY="${BODY}
+打开：${_u}"
+    fi
+fi
+
+if [ "$ASYNC" = 1 ]; then
+    # 关键：子进程的 fd 全部重定向走。否则钩子 runner 会一直等管道 EOF，
+    # "--async" 就成了摆设（agent 还是被拖住）。
+    (
+        push "$TITLE" "$BODY" >>"$LOG" 2>&1 || log "推送失败（退出码 $?）"
+    ) </dev/null >>"$LOG" 2>&1 &
+    exit 0
+fi
+
+push "$TITLE" "$BODY" || log "推送失败：$TITLE"
+exit 0

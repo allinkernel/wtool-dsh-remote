@@ -1,0 +1,233 @@
+# tools/dsh-remote —— 用手机接管家里的 DSH 会话
+
+出门在外的时候：**看**某个会话是不是卡在等你回答，**答**它，或者**直接派新活**
+（发布 wtool、发邮件……）。手机上不装任何东西，一个浏览器标签页就够。
+
+它是独立子项目：`wtool install tools/dsh-remote` 之后才有 `dsh-remote` /
+`dsh-notify` 两条命令。
+
+---
+
+## 1. 长什么样
+
+```
+   📱 手机浏览器
+        │  https（Let's Encrypt 或自签）+ HTTP basic auth
+        ▼
+   阿里云 Caddy                     ← 对外唯一的入口
+        │  reverse_proxy → 127.0.0.1:18080
+        │  （顺手把 Host/Origin 改写成回环，见 §4）
+        ▼
+   云上 sshd 的反向隧道端            ← 云上不用开新端口，家主动连出去
+        ▲
+        │  ssh -N -R 127.0.0.1:18080:127.0.0.1:3080
+        │
+   家里这台机器                     ← 只有这条出站连接，家里不需要公网 IP、不用端口映射
+        │  127.0.0.1:3080 = dsh web
+        ▼
+   DSH 会话（就是你现在用的这个界面）
+```
+
+外加一条**推送**：会话卡在"等你回答"或者一轮跑完时，手机上收一条消息
+（Server酱 / 钉钉 / Telegram / Bark / 任意 webhook）。推送走 DSH 官方的
+hook 桥（`@deepseek-ai/dsh-hooks-claude-code`），不是去猜会话日志的格式。
+
+---
+
+## 2. 五步装好
+
+> 下面 2–4 步在**家**这台机器上；第 5 步在**阿里云**那台。
+
+```sh
+# 0. 装命令（在工作区里）
+wtool install tools/dsh-remote
+
+# 1. 推送（可选，但强烈建议 —— 不然你只能靠"时不时刷一下"）
+cp ~/.config/dsh-remote/notify.conf.example ~/.config/dsh-remote/notify.conf
+vi ~/.config/dsh-remote/notify.conf      # 选一个渠道（provider=…）并把 key 填进去
+dsh-remote notify-test                   # 结果：手机收到一条「🔔 dsh-notify 测试」；没收到看日志
+
+# 2. 打开"卡住就推我"的钩子
+dsh-remote notify-enable      # 写 ~/.dsh/hooks.json + profile patch；web profile 是热加载，不用重启
+
+# 3. 阿里云那台（一条命令：传脚本 → 装 Caddy → 生成随机密码 → 起服务 → 自检 → 记下地址）
+dsh-remote cloud-install --domain dsh.example.com --email me@example.com
+#   没域名/没备案：dsh-remote cloud-install --ip <公网IP> --port 8443
+#   只想看它要做什么：加 --dry-run
+
+# 4. 反向隧道（先在 tmux 里前台跑一次，确认通了再装 systemd）
+cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
+#   填 cloud_host / identity，并把 public_url 填成云端脚本打印的那个地址
+dsh-remote tunnel                                  # 或者 dsh-remote systemd 装成常驻
+dsh-remote status                                  # 体检
+```
+
+手机上：打开 `public_url` → 输一次 basic auth 的用户名密码 → 再贴一次
+`dsh web` 启动时打印的**带 token 的地址**（`dsh-remote serve` 会把它存到
+`~/.dsh/web-url.txt`）→ 之后浏览器就记住了。
+
+---
+
+## 3. 命令
+
+| 命令 | 作用 |
+|---|---|
+| `dsh-remote status` | 体检：harness / 隧道 / 推送 / 手机地址 |
+| `dsh-remote serve` | 在**后台**起 `dsh web --no-open`，把带 token 的地址存下来 |
+| `dsh-remote tunnel` | 前台保活反向隧道（放 tmux 或 systemd） |
+| `dsh-remote systemd` | 生成 systemd user 单元（可 `loginctl enable-linger` 常驻） |
+| `dsh-remote url` | 打印手机该收藏的地址 |
+| `dsh-remote notify-test` | 推一条测试消息 |
+| `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
+| `dsh-remote cloud-install` | 真装到阿里云：传 cloud/ → 跑 relay.sh → 把地址写回配置 |
+| `dsh-remote cloud-setup` | 只打印要做的事（不动手） |
+| `dsh-remote migrate` | 把旧版放在 `~/.dsh` 下的配置/日志搬到自己目录 |
+| `dsh-remote check-hooks` | 一次性进程验证钩子桥到底会不会触发（对照实验，几十秒） |
+| `dsh-remote log` | 看隧道 / 推送日志 |
+| `dsh-notify "标题" "正文"` | 直接推一条（脚本里也能用，退出码永远是 0） |
+
+---
+
+## 4. 为什么这么设计（和踩过的坑）
+
+**为什么把 Host/Origin 改写成回环，而不是给 harness 加 `--trusted-host`？**
+`dsh web` 有一道"浏览器信任围栏"，默认只认回环地址。要想让域名进来，要么
+`--trusted-host dsh.example.com`（**得重启 harness**，而重启会打断正在跑的
+会话），要么让 Caddy 把 `Host` / `Origin` / `Referer` 改写成
+`127.0.0.1:3080`。后者不用重启，代价是 harness 分不清请求来自本地还是远程 ——
+**所以对外的全部安全性都压在 Caddy 那一层**（见 §5）。
+
+**为什么用 SSH 反向隧道，而不是在家开个端口/IPv6/内网穿透？**
+家这台机器没有公网 IP，也不该为了这个去动路由器。反向隧道是家里**主动连出去**，
+云上只在 `127.0.0.1` 上开一个端口，安全组里根本不用放它。
+
+**为什么不用 WireGuard / VPN？**
+公司网络常封 UDP，手机上还要常驻一个 VPN 客户端。反向隧道只用一条 TCP，
+断了自己重连，对网络环境最不挑。
+
+**为什么推送走 hook 桥，而不是去读会话日志？**
+会话日志是 `session.v3.jsonl.zstd`，**多帧 + 自定义分帧**，用标准 zstd 解压
+到第二帧就报 `Unknown frame descriptor`（实测）。格式是内部实现，会变；
+hook 桥是官方给"会话/工具/回合"这些时机留的接口，稳定得多。
+
+**钩子为什么不许失败？**
+`dsh-notify` 挂在 `PreToolUse` 上，而 Claude Code 的钩子协议里**退出码 2 =
+阻止这次工具调用**。推送失败（没网、key 过期、云服务抽风）绝不能把工具拦掉
+或者把 agent 卡住，所以：
+
+- 所有的错误路径都 `exit 0`（连"配置文件不存在""provider 不认识"也是）
+- 钩子里用 `--async`：先把自己 fork 出去，父进程立刻返回；子进程的
+  stdout/stderr/stdin 全部重定向走，不然钩子 runner 会等管道 EOF，
+  `--async` 就成了摆设
+- 失败只写一行到 `~/.dsh/notify.log`
+
+**profile patch 必须写成 `- insert:`。**
+patch 层的语义是"**按 id 覆盖已有的行** + `insert` 列表"，直接写
+`- id: hooks-claude-code` 会被当成"覆盖一个叫这个名字的已有行"，boot 时打印
+`patch: entry "hooks-claude-code" not found`，然后什么都不发生 —— 看着像成功了。
+`dsh --profile web --dump-config` 是验证它到底挂上没有的唯一可信办法，
+`notify-enable` 会提示你跑这一条。
+
+**⚠️ 已知缺口（2026-09-21 实测）：hook 桥"挂上"了，但**没有真的触发**。**
+`dsh-remote notify-enable`（或 dsh-conf 渲染）写出来的 profile patch 能让
+`dsh --profile web --dump-config` 里出现 `hooks-claude-code` 这一行，但插件本身
+**没有真的加载**：把 `configPath` 故意指到一个不存在的文件，harness 不报任何错；
+用一次性的 `dsh --profile headless --patch <同一个 insert 行>` 跑真实任务，
+`SessionStart` / `Stop` / `PreToolUse` 三种钩子**一个都没触发**（本地接收端一条没收到、
+`notify.log` 是空的）；正在跑的那个 web 实例跑了十几轮也没写过一行日志。
+又排除了几种可能（2026-09-21 第二轮实验）：插件**能解析**（`require.resolve` 通）；
+插件树**加载失败会大声报错**（故意插一行重名条目会直接 `duplicate loader entry id` 起不来），
+所以之前"没声音"不是"被静默跳过"；它 `inject` 的 `shell` / `sessionProjections`
+两个服务在 profile 里都有提供者；配置两种形状（`{"hooks":{...}}` 和扁平的
+`{"Stop":[...]}`）都试过——**都不触发**。
+剩下的嫌疑集中在：它挂的事件（`agent/turn-stopping`、`tools/pre-execute`）在这个
+构建里需要别的前置，或者必须作为 bundle 的一部分（`dsh plugin add`）才算正式挂载。
+**一条命令就能复查这件事**（它就是上面那套对照实验的封装，一次性进程、不动正在跑的会话）：
+
+```sh
+dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 退出码 1，并打印两条出路
+```
+
+**结论：推送脚本本身是好的（测试里真发到本地接收端），但"会话卡住就推手机"这条
+链路还没被证实。** 要证实只有两条路，都得你来定：
+
+```sh
+# A. 装 pnpm，把桥正式装进 profile（官方路子）
+npm i -g pnpm && dsh plugin --profile web add @deepseek-ai/dsh-hooks-claude-code
+#    然后重启 dsh web（会打断正在跑的会话），提一个问题看手机响不响
+
+# B. 先不折腾桥：dsh-remote notify-test 证明了推送通道是通的，
+#    需要"卡住就提醒"时手动 `dsh-notify "…" "…"`
+```
+
+在证实之前，别把"会推手机"当成已经有的能力。
+
+**中继器容器被一个真容器测试钉住了。** `tests/relay-e2e.sh` 会在本机起一个
+`caddy` 容器（host 网络）+ 一个假后端，验四件事：没密码 401、密码对 200、
+body 真的来自"隧道口后面的服务"、Host 被改写成回环。写这条测试当场抓到一个真 bug：
+Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆机器没备案用不了 80）时
+容器会 restart 循环 —— 所以两个模板都加了 `auto_https disable_redirects`。
+
+**`cloud/relay.sh --dry-run` 的 stdout 就是 Caddyfile 本体**，
+进度和报告都走 stderr，方便直接重定向成文件去 `caddy validate`。
+
+---
+
+## 5. 安全边界（这段要看）
+
+这个入口等于**整台家里机器的完全控制权**（会话界面能执行任意命令、读写任意
+文件）。所以：
+
+1. **对外只有一个端口**：域名模式 443，或 IP 模式 8443。隧道端口（18080）和
+   harness 端口（3080）**绝对不要在安全组里开**。
+2. **basic auth 的密码必须长且随机**。`relay.sh` 不传 `--password`
+   就每次随机生成 20 位；想固定用 `--password`。
+3. 能上域名就上域名 + Let's Encrypt（自动续期，手机不用点"继续访问"）。
+   大陆机器 80/443 要**备案**；没备案就用 `--ip <公网IP> --port 8443`，
+   Caddy 自签，浏览器第一次会警告一次 —— 点过去就行，流量依然是加密的。
+4. 想再收紧：`--allow-ip <你家出口IP>/32`（Caddy 会 403 掉其它来源）。
+   注意出口 IP 会变，变了要重跑脚本。
+5. 云上的 SSH 只放**你家出口 IP**，并且给隧道专用一把钥匙，在
+   `authorized_keys` 里限制成只能转发：
+
+   ```
+   restrict,port-forwarding,permitlisten="127.0.0.1:18080" ssh-ed25519 AAAA... dsh-remote
+   ```
+
+6. 手机丢了：云上 `systemctl stop caddy`（或者把安全组那个端口关掉）即可
+   断掉整条路。harness 本身没有对公网监听，所以没有第二条路。
+
+**不做什么**：不改 `dsh web` 的默认监听（它拒绝 `0.0.0.0` 是有意的，
+那是把 RCE 直接挂网上）；不把 basic auth 换成"藏在 URL 里的 token"；
+不在仓库里放证书、密码、密钥。
+
+---
+
+## 6. 测试
+
+```sh
+sh tests/run_tests.sh        # 85 条，不联网、不碰 docker、不碰真 $HOME
+sh tests/caddy-validate.sh   # 3 条，用官方 caddy:2 镜像真校验 Caddyfile（要 docker）
+```
+
+`run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、
+`dsh-notify` 真发一条到本地 HTTP 接收端（含 `--hook` 解析、`on_stop` 开关、
+`--async` 不拖住钩子、**所有失败路径退出码都是 0**）、Caddyfile 渲染、
+`dsh-remote` 子命令（含 `notify-enable`/`notify-disable` 幂等和"删干净后补回 `[]`"）。
+
+`caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
+（永远绿的测试等于没测）。
+
+没有自动测的部分（要两台机器，报告里说清楚了）：真阿里云上的
+安全组/防火墙、手机浏览器上的实际体验、隧道断线重连的真实时长。
+
+---
+
+## 7. 占地与清理
+
+- 仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档）；证书、密码、密钥、
+  日志一律在 `~/.dsh/`（用户级）和云上的 `/etc/caddy/`，不进 git。
+- 家里这台机器上运行期只有：`~/.dsh/{remote.conf,notify.conf,hooks.json,notify.log,web.log,web-url.txt}`
+  和一条 ssh 进程。
+- 全撤：`dsh-remote notify-disable` → 停隧道 → 云上
+  `systemctl disable --now caddy` → `wtool uninstall tools/dsh-remote`。

@@ -1,0 +1,47 @@
+# Caddyfile（域名模式）—— 由 tools/dsh-remote/cloud/relay.sh 渲染
+#
+# {{...}} 是占位符，别手改这一份；改脚本或改模板。
+#
+# 手机 → https://{{DOMAIN}} → basic auth → 云上 127.0.0.1:{{TUNNEL_PORT}}
+#      →（SSH 反向隧道）→ 家里 127.0.0.1:{{LOCAL_PORT}}
+
+{
+	email {{EMAIL}}
+	admin 127.0.0.1:2019
+	# 不自动做 http→https 跳转：那会让 Caddy 额外去监听宿主 :80，
+	# 服务器上 80 被别的服务占着（或者大陆机器没备案根本用不了 80）时
+	# 容器会直接起不来（实测：listen tcp :80: bind: address already in use，
+	# 然后 restart 循环）。手机收藏的是 https 地址，不需要这个跳转。
+	auto_https disable_redirects
+}
+
+{{DOMAIN}} {
+	encode zstd gzip
+
+	basic_auth {
+		{{USER}} {{HASH}}
+	}
+
+{{ALLOW_BLOCK}}
+	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
+		# 关键：把 Host/Origin 改成回环地址。
+		# dsh web 有一道"浏览器信任围栏"，只认回环/本机 LAN/--trusted-host；
+		# 这么写就不用给 harness 加参数、也不用重启它（重启会打断正在跑的会话）。
+		# 代价：harness 分不清请求是本地还是远程 —— 所以对外**只有** Caddy 的
+		# basic auth + TLS 这一道门，密码必须长且随机。
+		header_up Host 127.0.0.1:{{LOCAL_PORT}}
+		header_up Origin http://127.0.0.1:{{LOCAL_PORT}}
+		header_up Referer http://127.0.0.1:{{LOCAL_PORT}}/
+
+		# 会话界面是流式的：立刻 flush，别攒着
+		flush_interval -1
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	log {
+		output file /var/log/caddy/dsh-access.log
+		format console
+	}
+}

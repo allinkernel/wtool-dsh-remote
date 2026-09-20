@@ -1,0 +1,44 @@
+# Caddyfile（IP 模式）—— 由 tools/dsh-remote/cloud/relay.sh 渲染
+#
+# 给"没有域名"或者"域名没备案（大陆 80/443 要备案）"的情况用：
+# 换一个高端口 + Caddy 自带 CA 签的自签证书。
+# 浏览器第一次会警告"证书不受信任" —— 点"继续访问"就行，流量照样是加密的，
+# basic auth 的密码不会明文过网。想要没有警告：上域名 + 备案，或把服务器
+# 放香港/新加坡（那边不要求备案）。
+#
+# {{...}} 是占位符，别手改这一份。
+
+{
+	admin 127.0.0.1:2019
+	# 同上：别去占宿主 :80（见 Caddyfile.domain 里的说明）
+	auto_https disable_redirects
+}
+
+{{IP}}:{{PORT}} {
+	tls internal
+
+	encode zstd gzip
+
+	basic_auth {
+		{{USER}} {{HASH}}
+	}
+
+{{ALLOW_BLOCK}}
+	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
+		# 同域名模式：把 Host/Origin 伪装成回环，绕过 dsh web 的浏览器信任围栏，
+		# 这样不用重启 harness。安全完全压在 basic auth + TLS 上。
+		header_up Host 127.0.0.1:{{LOCAL_PORT}}
+		header_up Origin http://127.0.0.1:{{LOCAL_PORT}}
+		header_up Referer http://127.0.0.1:{{LOCAL_PORT}}/
+
+		flush_interval -1
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	log {
+		output file /var/log/caddy/dsh-access.log
+		format console
+	}
+}

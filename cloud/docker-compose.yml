@@ -1,0 +1,38 @@
+# docker-compose.yml —— 阿里云上的"中继器"：一个 Caddy 容器，反代到 SSH 反向隧道的出口。
+#
+# 为什么用容器（而不是在宿主上 apt install caddy）：
+#   * 可复现：换一台机器只要有 docker，`sh relay.sh ...` 两步就装好，宿主干净
+#   * 可迁移：配置全在 Caddyfile + 两个命名卷里，`docker compose down` 就撤掉
+#   * 不挑发行版：云上是 Ubuntu / Debian / Alibaba Cloud Linux 都一样
+#
+# 关键点：**network_mode: host**。两个原因，缺一不可：
+#   1) 要连宿主 127.0.0.1:18080 上的隧道出口 —— 桥接网络里的 127.0.0.1 是容器自己
+#   2) 要直接占用宿主的 443/8443（安全组只放这两个端口）
+# 所以：不要给这个服务加 ports: 映射（host 网络下无效，而且会误导）。
+#
+# 用法（在 /opt/dsh-relay 下，relay.sh 已经把 Caddyfile 渲染好了）：
+#   docker compose up -d        # 起
+#   docker compose logs -f      # 看日志
+#   docker compose down         # 撤（卷留着，证书不丢）
+#   docker compose down -v      # 连证书一起撤
+
+services:
+  relay:
+    image: caddy:2
+    container_name: dsh-relay
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./logs:/var/log/caddy
+      - caddy-data:/data # 证书（Let's Encrypt 的续期状态也在这儿）
+      - caddy-config:/config
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  caddy-data:
+  caddy-config:

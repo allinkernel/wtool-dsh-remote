@@ -1,0 +1,31 @@
+# remote.conf —— 家这一侧（隧道 + 手机地址）的配置（样板）
+#
+# 位置：~/.config/dsh-remote/remote.conf（默认；用户级，不进任何仓库）
+# 日志在 ~/.local/state/dsh-remote/。~/.dsh 是 DSH 自己的目录，我们只往里放
+# 一段 profile patch（harness 规定只能放那儿）。
+# dsh-remote 的所有子命令都读它。
+
+# --------------------------------------------------------------- 阿里云那台
+# 安全组要放你**家里的出口 IP** 访问 22（动态 IP 的话就把变化当成一次维护）
+cloud_host=1.2.3.4
+cloud_user=root
+cloud_ssh_port=22
+
+# 隧道用的私钥（家 → 云）。建议专门配一把，只允许它端口转发：
+#   ~/.ssh/authorized_keys 里写成
+#   restrict,port-forwarding,permitlisten="127.0.0.1:18080" ssh-ed25519 AAAA... dsh-remote
+identity=~/.ssh/id_rsa
+
+# 云上只绑 127.0.0.1 的隧道端口（Caddy 反代它）。**别在安全组里开放它**
+remote_port=18080
+
+# 家里 harness 的端口（dsh web 听的）
+local_port=3080
+
+# 断线重连间隔（秒）；装了 autossh 会自动用它
+retry_seconds=10
+autossh=auto
+
+# --------------------------------------------------------------- 手机地址
+# 云端 Caddy 装好后填进来（relay.sh 最后会打印）
+public_url=

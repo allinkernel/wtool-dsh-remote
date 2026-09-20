@@ -1,0 +1,616 @@
+#!/bin/sh
+# dsh-remote —— 手机远程看着/接着指挥家里的 DSH 会话。
+#
+#   dsh-remote status          体检：harness / 隧道 / 推送 / 手机地址
+#   dsh-remote serve           在后台起 harness（--no-open），把带 token 的 URL 存起来
+#   dsh-remote tunnel          前台保活一条 SSH 反向隧道（放进 tmux / systemd）
+#   dsh-remote systemd        生成（或安装）隧道的 systemd user 单元
+#   dsh-remote url             打印手机该收藏的地址
+#   dsh-remote notify-test     推一条测试消息到手机
+#   dsh-remote notify-enable   打开"会话卡住/跑完就推手机"（写配置目录的 hooks.json + profile patch）
+#   dsh-remote notify-disable  关掉它（把 patch 里那一段删掉）
+#   dsh-remote cloud-install   真装到阿里云上（传 cloud/ → 起 caddy 容器 → 记下地址）
+#   dsh-remote cloud-setup     只打印"送上去并执行"的命令，不动手
+#   dsh-remote migrate         把旧版放在 ~/.dsh 下的配置/日志搬到我们自己的目录
+#   dsh-remote check-hooks     **验证钩子桥到底会不会触发**（一次性进程，跑一次模型，几十秒）
+#   dsh-remote log             看隧道/推送日志
+#
+# 配置在 ~/.config/dsh-remote/remote.conf，日志在 ~/.local/state/dsh-remote/
+# （样板：tools/dsh-remote/remote.conf.example）。**~/.dsh 是 DSH 自己的目录**，
+# 我们只在里面放一样它强制要求的东西：profiles/web/cordis.patch.yml。
+# 安全边界、威胁模型、为什么这么设计：见同目录 README.md。
+
+set -u
+
+# 自己是谁：先解掉软链。~/.local/bin/dsh-remote 是软链，不解的话
+# PROJ_DIR 会算成 ~/.local（踩过：status 打印"项目 /home/xxx/.local"，然后
+# hooks/claude-hooks.json 也找不到）。
+SELF=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
+PROJ_DIR=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
+
+# 我们的目录 vs harness 的目录 —— 分清楚，别往别人的目录里放东西：
+#
+#   $CONF_DIR   ~/.config/dsh-remote/          配置（remote.conf / notify.conf / hooks.json）
+#   $STATE_DIR  ~/.local/state/dsh-remote/     日志和运行期文件（notify.log / web.log / web-url.txt）
+#   $DSH_HOME   ~/.dsh/                        这是 **DSH 自己的**目录。只有一样东西必须
+#                                              放在它里面：profiles/web/cordis.patch.yml ——
+#                                              DSH 只从那里读 profile patch，改不了。
+#
+# DSH_REMOTE_HOME 是一个"伞"覆盖（测试用）：设了它就两个目录都在它下面。
+# DSH_HOME 只是跟着 DSH 的约定（$DSH_HOME，默认 ~/.dsh），我们不改它。
+DSH_HOME=${DSH_HOME:-$HOME/.dsh}
+: "${DSH_REMOTE_HOME:=}"
+CONF_DIR=${DSH_REMOTE_CONF_DIR:-${DSH_REMOTE_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}}
+STATE_DIR=${DSH_REMOTE_STATE_DIR:-${DSH_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}}
+CONF=${DSH_REMOTE_CONF:-$CONF_DIR/remote.conf}
+NOTIFY=${DSH_NOTIFY_BIN:-$(command -v dsh-notify 2>/dev/null || printf '%s' "$SELF_DIR/dsh-notify")}
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '警告：%s\n' "$*" >&2; }
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+conf() {
+    [ -f "$CONF" ] || return 1
+    _v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -n 1)
+    _v=$(printf '%s' "$_v" | sed -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    [ -n "$_v" ] || return 1
+    printf '%s' "$_v"
+}
+
+conf_any() {
+    for k in "$@"; do
+        if _r=$(conf "$k"); then printf '%s' "$_r"; return 0; fi
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------ 体检
+port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -q "[:.]$1\$"
+    else
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q "[:.]$1\$"
+    fi
+}
+
+pid_of() { # 用命令行特征找进程（找不到返回 1）
+    pgrep -f "$1" 2>/dev/null | head -n 1
+}
+
+cmd_status() {
+    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    rp=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
+    host=$(conf_any cloud_host CLOUD_HOST 2>/dev/null || printf '')
+    pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+
+    say "配置      $CONF$([ -f "$CONF" ] || printf '（还没有，先照 remote.conf.example 抄一份）')"
+    say "项目      $PROJ_DIR"
+
+    if port_listening "$lp"; then
+        say "harness   127.0.0.1:$lp 在跑$(pid_of "dsh.*--port $lp" >/dev/null 2>&1 && printf '' )"
+    elif pid_of 'dsh .*web|dsh web' >/dev/null 2>&1; then
+        say "harness   有 dsh web 进程，但 127.0.0.1:$lp 没在听（端口对不对？）"
+    else
+        say "harness   没在跑（dsh-remote serve 起它）"
+    fi
+
+    if [ -n "$host" ]; then
+        if pid_of 'ssh .*-R .*127\.0\.0\.1' >/dev/null 2>&1; then
+            say "隧道      在跑：云上 127.0.0.1:$rp → 家里 127.0.0.1:$lp"
+        else
+            say "隧道      没在跑（dsh-remote tunnel，或装成 systemd 单元）"
+        fi
+    else
+        say "隧道      remote.conf 里还没写 cloud_host"
+    fi
+
+    if [ -n "$pub" ]; then
+        say "手机地址   $pub"
+    else
+        say "手机地址   还没写 public_url（云端 Caddy 装好之后填进来）"
+    fi
+
+    if [ -f "$CONF_DIR/notify.conf" ]; then
+        prov=$(sed -n 's/^[[:space:]]*provider[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/notify.conf" | tail -n 1)
+        say "推送       provider=${prov:-serverchan}（dsh-remote notify-test 试一下）"
+    else
+        say "推送       还没配（照 notify.conf.example 写 ~/.dsh/notify.conf）"
+    fi
+
+    if [ -f "$CONF_DIR/hooks.json" ]; then
+        if grep -q 'dsh-remote notify' "$DSH_HOME/profiles/web/cordis.patch.yml" 2>/dev/null; then
+            say "hook 推送  已开启（问问题/跑完会推手机）"
+        else
+            say "hook 推送  钩子文件在，但 profile 里没挂上（dsh-remote notify-enable）"
+        fi
+    else
+        say "hook 推送  没开（dsh-remote notify-enable）"
+    fi
+}
+
+# ------------------------------------------------------------------ 起 harness
+cmd_serve() {
+    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    urlfile="$STATE_DIR/web-url.txt"
+    logfile="$STATE_DIR/web.log"
+    mkdir -p -- "$STATE_DIR"
+
+    if port_listening "$lp"; then
+        warn "127.0.0.1:$lp 已经有人在听 —— 大概率 harness 正在跑。"
+        warn "别在会话里重启它：正在跑的会话会被打断（历史不会丢，能 resume）。"
+        [ -f "$urlfile" ] && say "上次记下来的地址：$(cat "$urlfile")"
+        return 1
+    fi
+
+    command -v dsh >/dev/null 2>&1 || die "PATH 里没有 dsh"
+
+    say "起 harness：dsh web --no-open --port $lp（日志 $logfile）"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup dsh web --no-open --port "$lp" >"$logfile" 2>&1 </dev/null &
+    else
+        nohup dsh web --no-open --port "$lp" >"$logfile" 2>&1 </dev/null &
+    fi
+
+    i=0
+    while [ "$i" -lt 40 ]; do
+        if grep -o "http://127\.0\.0\.1:$lp/[^ ]*token=[^ ]*" "$logfile" 2>/dev/null | head -n 1 >"$urlfile.tmp"; then
+            if [ -s "$urlfile.tmp" ]; then
+                mv -f "$urlfile.tmp" "$urlfile"
+                say "地址（**手机第一次要用这个带 token 的**，登录后浏览器会记住）："
+                say "  $(cat "$urlfile")"
+                return 0
+            fi
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    rm -f "$urlfile.tmp"
+    warn "20 秒没等到 token URL，自己看日志：$logfile"
+    return 1
+}
+
+# ------------------------------------------------------------------ 隧道
+tunnel_args() {
+    host=$(conf_any cloud_host CLOUD_HOST) || die "remote.conf 里没有 cloud_host"
+    user=$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')
+    sport=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
+    rp=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
+    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
+    case $key in '~/'*) key="$HOME/${key#\~/}" ;; esac
+
+    set -- -N -T \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        -o TCPKeepAlive=yes \
+        -o StrictHostKeyChecking=accept-new \
+        -p "$sport"
+    [ -n "$key" ] && set -- "$@" -i "$key"
+    set -- "$@" -R "127.0.0.1:${rp}:127.0.0.1:${lp}" "${user}@${host}"
+    printf '%s\n' "$@"
+}
+
+cmd_tunnel() {
+    retry=$(conf_any retry_seconds RETRY_SECONDS 2>/dev/null || printf '10')
+    autossh=
+    if [ "$(conf_any autossh AUTOSSH 2>/dev/null || printf auto)" != off ] &&
+        command -v autossh >/dev/null 2>&1; then
+        autossh=1
+    fi
+
+    say "反向隧道：云上 127.0.0.1:$(conf_any remote_port 2>/dev/null || printf 18080) → 家里 127.0.0.1:$(conf_any local_port 2>/dev/null || printf 3080)"
+    say "（云上那个端口只绑 127.0.0.1，安全组里**不要**开放它；对外只开放 Caddy 的 443/8443）"
+
+    while :; do
+        # shellcheck disable=SC2046
+        if [ -n "$autossh" ]; then
+            AUTOSSH_GATETIME=0 autossh -M 0 $(tunnel_args)
+        else
+            ssh $(tunnel_args)
+        fi
+        code=$?
+        say "隧道断了（退出码 $code），${retry}s 后重连。Ctrl-C 退出。"
+        sleep "$retry"
+    done
+}
+
+cmd_systemd() {
+    unit_dir="$HOME/.config/systemd/user"
+    unit="$unit_dir/dsh-remote-tunnel.service"
+    mkdir -p -- "$unit_dir"
+    cat >"$unit" <<EOF
+[Unit]
+Description=DSH 反向隧道（手机远程接管）
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SELF_DIR/dsh-remote tunnel
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+    say "已写 $unit"
+    say "启用："
+    say "  systemctl --user daemon-reload && systemctl --user enable --now dsh-remote-tunnel"
+    say "  loginctl enable-linger $USER     # 让它在你没登录时也活着（可选）"
+    say "看状态：systemctl --user status dsh-remote-tunnel"
+}
+
+# ------------------------------------------------------------------ 推送
+cmd_notify_test() { "$NOTIFY" --test; say "已尝试推送，看手机。失败细节：$STATE_DIR/notify.log"; }
+
+cmd_url() {
+    pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+    [ -n "$pub" ] || die "remote.conf 里还没有 public_url（云端 Caddy 装好之后填）"
+    say "$pub"
+}
+
+# 把 profile 的 patch 文件里我们那一段换掉/删掉。
+# 用标记注释围起来，这样 disable 一定是精确删除，不会误伤别人写的行。
+patch_file() { printf '%s' "$DSH_HOME/profiles/web/cordis.patch.yml"; }
+
+patch_block() {
+    cat <<EOF
+# >>> dsh-remote notify（这一段由 dsh-remote notify-enable 生成，notify-disable 删；别手改）
+# 必须写成 - insert: 的形式。profile 的 patch 层是"按 id 覆盖已有的行 + insert 列表"，
+# 光写 - id: xxx 会被当成"覆盖一个叫 xxx 的已有行"，于是 boot 时警告
+#   patch: entry "hooks-claude-code" not found
+# 然后什么也不发生（这个坑踩过一次，别改回去）。
+- insert:
+    - id: hooks-claude-code
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: $CONF_DIR/hooks.json
+        defaultTimeoutMs: 20000
+# <<< dsh-remote notify
+EOF
+}
+
+patch_strip() { # 从 stdin 读，输出去掉我们那一段
+    awk '
+        /^# >>> dsh-remote notify/ { skip = 1; next }
+        /^# <<< dsh-remote notify/ { skip = 0; next }
+        !skip { print }
+    '
+}
+
+cmd_notify_enable() {
+    mkdir -p -- "$CONF_DIR" "$DSH_HOME/profiles/web"
+
+    hook_src="$PROJ_DIR/hooks/claude-hooks.json"
+    [ -f "$hook_src" ] || die "找不到 $hook_src"
+    sed "s|__DSH_NOTIFY__|$NOTIFY|g" "$hook_src" >"$CONF_DIR/hooks.json"
+    say "已写 $CONF_DIR/hooks.json（命令指向 $NOTIFY）"
+
+    pf=$(patch_file)
+    if [ ! -f "$pf" ]; then
+        printf '# 你的 profile patch 层（dsh-remote 会往里加一段 hooks 桥）\n[]\n' >"$pf"
+        say "已建 $pf"
+    fi
+    if ! grep -q '^# >>> dsh-remote notify' "$pf"; then
+        cp -f -- "$pf" "$pf.bak-dsh-remote" 2>/dev/null || true
+        # 空层（注释 + 一行 []）要把 [] 换成真正的列表：YAML 里两个顶层值会
+        # 打架，直接追加是不行的。注释留着 —— 那可能是人自己写的说明。
+        if grep -qx '\[\]' "$pf"; then
+            patch_block >"$pf.block"
+            awk -v blockfile="$pf.block" '
+                /^\[\]$/ && !done { while ((getline line < blockfile) > 0) print line; done = 1; next }
+                { print }
+            ' "$pf" >"$pf.tmp"
+            rm -f -- "$pf.block"
+            # 理论上不会走到，但 [] 没了就退回"直接追加"，别静默丢掉钩子
+            if ! grep -q 'hooks-claude-code' "$pf.tmp"; then
+                { cat -- "$pf"; patch_block; } >"$pf.tmp"
+            fi
+        else
+            { cat -- "$pf"; patch_block; } >"$pf.tmp"
+        fi
+        mv -f -- "$pf.tmp" "$pf"
+        say "已把 hooks 桥写进 $pf（备份 $pf.bak-dsh-remote）"
+    else
+        say "$pf 里已经有这一段，跳过"
+    fi
+
+    say ""
+    say "web profile 的 patchReload 是 live，正常情况下**不用重启**就生效。"
+    say "验证：dsh --profile web --dump-config | grep -A3 hooks-claude-code"
+    say "重启才生效的话：先 dsh-remote serve（会记下带 token 的新地址）。"
+}
+
+cmd_notify_disable() {
+    pf=$(patch_file)
+    [ -f "$pf" ] || die "没有 $pf"
+    patch_strip <"$pf" >"$pf.tmp"
+    # 删干净之后如果只剩注释，得补回一个 []：profile 的 patch 层是
+    # "空文件或只有注释会让 boot 失败"，必须显式写 []。
+    if ! sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$pf.tmp" | grep -q .; then
+        printf '[]\n' >>"$pf.tmp"
+    fi
+    mv -f -- "$pf.tmp" "$pf"
+    say "已从 $pf 里删掉 hooks 桥那一段（$CONF_DIR/hooks.json 留着，想再开就 notify-enable）"
+}
+
+# ------------------------------------------------------------------ 云端
+cmd_cloud_setup() {
+    host=$(conf_any cloud_host CLOUD_HOST 2>/dev/null || printf '<你的阿里云公网 IP>')
+    user=$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')
+    pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+    rp=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
+    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    say "在阿里云那台机器上装 Caddy（在**你这台机器**上执行）："
+    say ""
+    say "  # 1) 把云上要用的东西传过去（就一个脚本 + 两个 Caddyfile 模板）"
+    say "  scp -r $PROJ_DIR/cloud ${user}@${host}:/opt/dsh-relay"
+    say ""
+    say "  # 2) 登录上去跑它（中继器起成 caddy 容器；宿主上只需 docker）"
+    say "  ssh ${user}@${host}"
+    say "  cd /opt/dsh-relay && sudo sh relay.sh --tunnel-port $rp"
+    say ""
+    say "  有域名（且已备案）：加 --domain dsh.example.com    → 443 + Let's Encrypt 证书"
+    say "  没域名/IP 没备案：  加 --ip <公网IP> --port 8443  → 自签证书，浏览器会提示一次"
+    say "  想再收紧一层：      加 --allow-ip <你家出口IP>/32"
+    say ""
+    say "  脚本最后会打印：手机该收藏的 https 地址 + 随机生成的用户名/密码。"
+    say "  把那个地址写进 $CONF 的 public_url，推送里就会带上它。"
+    [ -n "$pub" ] && say ""
+    [ -n "$pub" ] && say "现在记的是：$pub"
+    say ""
+    say "安全组只开放：22（你家的出口 IP）、443（有域名时）或 8443。**绝不要开 $rp 和 $lp**。"
+}
+
+# ------------------------------------------------- 云端：真装（一条命令）
+# dsh-remote cloud-install --domain dsh.example.com
+# dsh-remote cloud-install --ip 47.98.1.2
+# 做的事：把 cloud/ 传到云上 /opt/dsh-relay → 跑 relay.sh（把 Caddy 起成
+# docker 容器、渲染 Caddyfile、自检）→ 把它打印的地址写回 remote.conf 的 public_url。
+cmd_cloud_install() {
+    ci_domain=
+    ci_ip=
+    ci_email=
+    ci_port=
+    ci_user=
+    ci_ssh_user=
+    ci_allow=
+    ci_dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --domain)
+            ci_domain=${2:-}
+            shift 2
+            ;;
+        --ip)
+            ci_ip=${2:-}
+            shift 2
+            ;;
+        --email)
+            ci_email=${2:-}
+            shift 2
+            ;;
+        --port)
+            ci_port=${2:-}
+            shift 2
+            ;;
+        --user)
+            ci_user=${2:-}
+            shift 2
+            ;;
+        --allow-ip)
+            ci_allow="${ci_allow} ${2:-}"
+            shift 2
+            ;;
+        --ssh-user)
+            ci_ssh_user=${2:-}
+            shift 2
+            ;;
+        --dry-run)
+            ci_dry=1
+            shift
+            ;;
+        *) die "cloud-install 不认识的参数：$1（--help）" ;;
+        esac
+    done
+
+    host=$(conf_any cloud_host CLOUD_HOST) || die "remote.conf 里没有 cloud_host（先照 remote.conf.example 抄一份）"
+    ssh_user=${ci_ssh_user:-$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')}
+    sport=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
+    rp=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
+    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
+    case $key in '~/'*) key="$HOME/${key#\~/}" ;; esac
+
+    # 没给 --domain / --ip 时，cloud_host 本身就是公网 IP 的话直接当 --ip 用
+    if [ -z "$ci_domain" ] && [ -z "$ci_ip" ]; then
+        case $host in
+        *[!0-9.]* | '') die "要么 --domain dsh.example.com，要么 --ip <公网IP>" ;;
+        *) ci_ip=$host ;;
+        esac
+    fi
+
+    # 远端脚本的参数拼成一个字符串（它会原样传进 ssh 的那条命令里）
+    rargs="--tunnel-port $rp --local-port $lp"
+    [ -n "$ci_domain" ] && rargs="$rargs --domain $ci_domain"
+    [ -n "$ci_ip" ] && rargs="$rargs --ip $ci_ip"
+    [ -n "$ci_email" ] && rargs="$rargs --email $ci_email"
+    [ -n "$ci_port" ] && rargs="$rargs --port $ci_port"
+    [ -n "$ci_user" ] && rargs="$rargs --user $ci_user"
+    for a in $ci_allow; do rargs="$rargs --allow-ip $a"; done
+
+    remote_dir=/opt/dsh-relay
+    remote_cmd="cd $remote_dir && if [ \"\$(id -u)\" = 0 ]; then sh relay.sh $rargs; else sudo sh relay.sh $rargs; fi"
+
+    ssh_opts="-p $sport -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR"
+    [ -n "$key" ] && ssh_opts="$ssh_opts -i $key"
+    scp_opts="-P $sport -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR"
+    [ -n "$key" ] && scp_opts="$scp_opts -i $key"
+
+    say "云上那台：$ssh_user@$host:$sport"
+    say "云上要执行的：cd $remote_dir && sudo sh relay.sh $rargs（Caddy 跑在容器里）"
+
+    if [ "$ci_dry" = 1 ]; then
+        say ""
+        say "（--dry-run：只打印，不动手。真跑就去掉 --dry-run）"
+        say "  scp -r $scp_opts \"$PROJ_DIR/cloud\" $ssh_user@$host:$remote_dir"
+        say "  ssh -t $ssh_opts $ssh_user@$host '$remote_cmd'"
+        return 0
+    fi
+
+    say ""
+    say "== 1/3 传 cloud/ 上去（$remote_dir）"
+    # shellcheck disable=SC2086
+    if ! scp -r $scp_opts "$PROJ_DIR/cloud" "$ssh_user@$host:$remote_dir"; then
+        die "scp 失败（云上 ssh 通不通？密钥对不对？$ssh_user@$host:$sport）"
+    fi
+
+    say ""
+    say "== 2/3 在云上装（Caddy + basic auth + HTTPS；要 sudo 密码的话会提示）"
+    out="$STATE_DIR/cloud-install.log"
+    mkdir -p -- "$STATE_DIR"
+    # shellcheck disable=SC2086
+    if ! ssh -t $ssh_opts "$ssh_user@$host" "$remote_cmd" 2>&1 | tee "$out"; then
+        warn "云上那步没成功（完整输出在 $out）"
+        return 1
+    fi
+
+    say ""
+    say "== 3/3 把地址记进 $CONF"
+    url=$(grep -o 'https://[^ 　]*' "$out" | head -n 1)
+    if [ -n "$url" ]; then
+        if grep -q '^[[:space:]]*public_url[[:space:]]*=' "$CONF" 2>/dev/null; then
+            sed -i "s|^[[:space:]]*public_url[[:space:]]*=.*|public_url=$url|" "$CONF"
+        else
+            printf 'public_url=%s\n' "$url" >>"$CONF"
+        fi
+        say "public_url=$url"
+    else
+        warn "没从输出里认出地址，自己把 relay.sh 打印的那行填进 $CONF 的 public_url"
+    fi
+
+    say ""
+    say "接下来（回家这台上跑）："
+    say "  dsh-remote tunnel     # 起反向隧道（或 dsh-remote systemd 装成常驻）"
+    say "  dsh-remote status     # 体检"
+    say "手机上打开 $url （basic auth 的用户名/密码就是上面打印的那两组）"
+}
+
+# ------------------------------------------------- 从旧的 ~/.dsh 搬过来
+cmd_migrate() {
+    moved=0
+    mkdir -p -- "$CONF_DIR" "$STATE_DIR"
+    for f in remote.conf notify.conf hooks.json; do
+        if [ -f "$DSH_HOME/$f" ] && [ ! -f "$CONF_DIR/$f" ]; then
+            mv -f -- "$DSH_HOME/$f" "$CONF_DIR/$f"
+            say "搬走 $DSH_HOME/$f → $CONF_DIR/$f"
+            moved=1
+        fi
+    done
+    for f in notify.log web.log web-url.txt; do
+        if [ -f "$DSH_HOME/$f" ] && [ ! -f "$STATE_DIR/$f" ]; then
+            mv -f -- "$DSH_HOME/$f" "$STATE_DIR/$f"
+            say "搬走 $DSH_HOME/$f → $STATE_DIR/$f"
+            moved=1
+        fi
+    done
+    rm -f -- "$DSH_HOME/remote.conf.example" "$DSH_HOME/notify.conf.example" 2>/dev/null || true
+    if [ "$moved" = 1 ]; then
+        say "配置搬到 $CONF_DIR，日志搬到 $STATE_DIR 了。"
+        say "记得重跑一次 dsh-remote notify-enable，把 profile patch 里的 hooks.json 路径更新到新位置。"
+    else
+        say "没有要搬的（$DSH_HOME 下已经没有我们的文件）"
+    fi
+}
+
+
+# ------------------------------------------------ 验证钩子桥（不动正在跑的那个实例）
+# 背景：profile patch 里挂了 hooks-claude-code，dump-config 里也看得到那一行，
+# **但这不等于插件真的加载了**（实测：configPath 指到不存在的文件都不报错；
+# 正在跑的实例十几轮没触发过任何钩子）。这条命令用一次性进程做对照实验：
+# 起个本地接收端 → 渲染一份临时 patch → 跑一次 headless 任务 → 看有没有收到。
+cmd_check_hooks() {
+    command -v dsh >/dev/null 2>&1 || die "PATH 里没有 dsh"
+    command -v python3 >/dev/null 2>&1 || die "要 python3（起本地接收端）"
+    [ -f "$CONF_DIR/hooks.json" ] || die "$CONF_DIR/hooks.json 不存在（先跑 dsh-remote notify-enable）"
+
+    tmp=$(mktemp -d)
+    sink="$tmp/sink.txt"
+    : >"$sink"
+    port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+    python3 "$PROJ_DIR/tests/http_sink.py" "$port" "$sink" >/dev/null 2>&1 &
+    sink_pid=$!
+    sleep 1
+
+    cat >"$tmp/notify.conf" <<EOF
+provider=generic
+URL=http://127.0.0.1:$port/hook
+on_stop=1
+EOF
+    cat >"$tmp/patch.yml" <<EOF
+- insert:
+    - id: hooks-claude-code
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: $CONF_DIR/hooks.json
+EOF
+
+    say "跑一次一次性 harness（dsh --profile headless --patch …）—— 会真的调一次模型，几十秒"
+    DSH_NOTIFY_CONF="$tmp/notify.conf" DSH_NOTIFY_LOG="$tmp/notify.log" \
+        timeout 300 dsh --profile headless --patch "$tmp/patch.yml" "只回答一个字：好" \
+        >"$tmp/out" 2>"$tmp/err" || warn "headless 退出码非 0（细节：$tmp/err）"
+    sleep 1
+    kill "$sink_pid" 2>/dev/null || true
+
+    if [ -s "$sink" ]; then
+        say "✅ 钩子桥**真的会触发**（收到：$(head -c 100 "$sink")）"
+        rm -rf "$tmp"
+        return 0
+    fi
+    say "❌ 钩子桥**没有触发** —— 插件没被加载（不是"加载了但事件不匹配"）"
+    say "   佐证：把 configPath 指向不存在的文件，harness 也不报错、静默跳过。"
+    say "   原因大概率是 profile 的 dependencies 为空 + 本机没有 pnpm，插入的那一行解析不到包。"
+    say "   两条路："
+    say "     A) npm i -g pnpm && dsh plugin --profile web add @deepseek-ai/dsh-hooks-claude-code"
+    say "        然后重启 dsh web（**会打断正在跑的会话**），再跑一次 dsh-remote check-hooks"
+    say "     B) 先不靠钩子：dsh-remote notify-test 说明推送通道是好的，需要提醒时手动 dsh-notify"
+    say "   诊断文件留在 $tmp（out / err / notify.log / notify.conf）"
+    return 1
+}
+
+cmd_log() {
+    for f in "$STATE_DIR/notify.log" "$STATE_DIR/web.log"; do
+        [ -f "$f" ] || continue
+        say "=== $f"
+        tail -n 20 -- "$f"
+    done
+}
+
+usage() {
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case ${1:-help} in
+status) cmd_status ;;
+serve) cmd_serve ;;
+tunnel) cmd_tunnel ;;
+systemd) cmd_systemd ;;
+url) cmd_url ;;
+notify-test) cmd_notify_test ;;
+notify-enable) cmd_notify_enable ;;
+notify-disable) cmd_notify_disable ;;
+cloud-install)
+    shift
+    cmd_cloud_install "$@"
+    ;;
+cloud-setup) cmd_cloud_setup ;;
+migrate) cmd_migrate ;;
+check-hooks) cmd_check_hooks ;;
+log) cmd_log ;;
+help | --help | -h) usage ;;
+*) die "不认识的命令：$1（dsh-remote help）" ;;
+esac
