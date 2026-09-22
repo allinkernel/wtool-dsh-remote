@@ -6,7 +6,7 @@
 #
 # 两份必须同改；tests/run_tests.sh 会用同一张用例表把两个 shell 都跑一遍。
 
-DSH_REMOTE_DIR=${WTOOL_PROJECT_DIR:-$HOME/.wtool/links/tools/dsh-remote}
+DSH_REMOTE_DIR=${WTOOL_PROJECT_DIR:-$HOME/.wtool/wtool-work-dir/links/tools/dsh-remote}
 export DSH_REMOTE_DIR
 
 # 配置和日志**不放 ~/.dsh** —— 那是 DSH 自己的目录。我们只在那里放一样

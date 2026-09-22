@@ -28,7 +28,7 @@ set -eu
 
 say() { printf '%s: %s\n' 'tools/dsh-remote' "$*"; }
 
-link_dir="$HOME/.wtool/links/tools/dsh-remote"
+link_dir="$HOME/.wtool/wtool-work-dir/links/tools/dsh-remote"
 prefix="${WTOOL_PREFIX:-$HOME/.wtool/usr}"
 bin_dir="$prefix/bin"
 etc_dir="$prefix/etc/dsh-remote"
