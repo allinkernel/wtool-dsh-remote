@@ -38,6 +38,12 @@ hook 桥（`@deepseek-ai/dsh-hooks-claude-code`），不是去猜会话日志的
 
 > 下面 2–4 步在**家**这台机器上；第 5 步在**阿里云**那台。
 
+> ⚠️ **第 0 步的 `wtool install` 属于"真机安装"**（用户级规矩，2026-10-04）：wtool 的
+> 项目平时**只在容器里装 / 测**，本机（WSL）是临时的手工环境、wtool 调通之前不在本地
+> 落地。本项目天生要在真机上跑（手机要连的就是这台机器），所以**真机上装必须由用户
+> 明确同意**，助手不得自行 `wtool install`。只想验证脚本行为就用临时
+> `HOME`/`WTOOL_HOME`/`WTOOL_PREFIX`（`tests/run_tests.sh` 的 I 节就是这么做的）。
+
 ```sh
 # 0. 装命令（在工作区里）
 wtool install tools/dsh-remote
@@ -220,8 +226,8 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 179 条，不联网、不碰 docker、不碰真 $HOME
-sh tests/caddy-validate.sh   # 3 条，用官方 caddy:2 镜像真校验 Caddyfile（要 docker）
+sh tests/run_tests.sh        # 179 条（以输出为准），不联网、不碰 docker、不碰真 $HOME
+sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker
 ```
 
 `run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、

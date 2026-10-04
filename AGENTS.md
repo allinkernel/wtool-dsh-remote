@@ -74,13 +74,18 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 179 条，不联网、不碰 docker、不碰真 $HOME（秒级）
+sh tests/run_tests.sh         # 179 条（以输出为准），不联网、不碰 docker、不碰真 $HOME（秒级）
 sh tests/caddy-validate.sh    # 3 条，用 caddy:2 镜像真校验 Caddyfile（要 docker，人工）
 tests/relay-e2e.sh            # 真起 caddy 容器验 HTTPS+basic auth+反代（要 docker，人工）
 ```
 
 改了 `scripts/install.sh` / `env.zsh` / `env.bash` / `wtool.xml` **一定要跑
 `tests/run_tests.sh`**（I 节守的就是"命令真装得出来、源找不到不装假"）。
+
+⚠️ **真机安装要用户点头。** 本项目天生装在真机上才有用（手机连的就是这台机器），
+但用户级规矩（2026-10-04）是"wtool 的项目只在容器里装 / 测，真机安装需用户明确同意"
+—— 助手不得自行 `wtool install tools/dsh-remote`；要验证就用
+临时 `HOME`/`WTOOL_HOME`/`WTOOL_PREFIX` 跑 `tests/run_tests.sh` 的 I 节。
 
 ## 已知缺口（别当成已经有能力）
 
