@@ -41,6 +41,9 @@ hook 桥（`@deepseek-ai/dsh-hooks-claude-code`），不是去猜会话日志的
 ```sh
 # 0. 装命令（在工作区里）
 wtool install tools/dsh-remote
+#    命令软链进 $WTOOL_PREFIX/bin（默认 ~/.wtool/usr/bin，已在 PATH 上）；
+#    配置实体在 $WTOOL_PREFIX/etc/dsh-remote，日志实体在 $WTOOL_PREFIX/var/dsh-remote，
+#    ~/.config/dsh-remote 和 ~/.local/state/dsh-remote 是指向它们的软链（见 §7）
 
 # 1. 推送（可选，但强烈建议 —— 不然你只能靠"时不时刷一下"）
 cp ~/.config/dsh-remote/notify.conf.example ~/.config/dsh-remote/notify.conf
@@ -48,7 +51,7 @@ vi ~/.config/dsh-remote/notify.conf      # 选一个渠道（provider=…）并�
 dsh-remote notify-test                   # 结果：手机收到一条「🔔 dsh-notify 测试」；没收到看日志
 
 # 2. 打开"卡住就推我"的钩子
-dsh-remote notify-enable      # 写 ~/.dsh/hooks.json + profile patch；web profile 是热加载，不用重启
+dsh-remote notify-enable      # 写 ~/.config/dsh-remote/hooks.json + profile patch；web profile 是热加载，不用重启
 
 # 3. 阿里云那台（一条命令：传脚本 → 装 Caddy → 生成随机密码 → 起服务 → 自检 → 记下地址）
 dsh-remote cloud-install --domain dsh.example.com --email me@example.com
@@ -64,7 +67,7 @@ dsh-remote status                                  # 体检
 
 手机上：打开 `public_url` → 输一次 basic auth 的用户名密码 → 再贴一次
 `dsh web` 启动时打印的**带 token 的地址**（`dsh-remote serve` 会把它存到
-`~/.dsh/web-url.txt`）→ 之后浏览器就记住了。
+`~/.local/state/dsh-remote/web-url.txt`）→ 之后浏览器就记住了。
 
 ---
 
@@ -119,7 +122,7 @@ hook 桥是官方给"会话/工具/回合"这些时机留的接口，稳定得�
 - 钩子里用 `--async`：先把自己 fork 出去，父进程立刻返回；子进程的
   stdout/stderr/stdin 全部重定向走，不然钩子 runner 会等管道 EOF，
   `--async` 就成了摆设
-- 失败只写一行到 `~/.dsh/notify.log`
+- 失败只写一行到 `~/.local/state/dsh-remote/notify.log`
 
 **profile patch 必须写成 `- insert:`。**
 patch 层的语义是"**按 id 覆盖已有的行** + `insert` 列表"，直接写
@@ -171,6 +174,17 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 **`cloud/relay.sh --dry-run` 的 stdout 就是 Caddyfile 本体**，
 进度和报告都走 stderr，方便直接重定向成文件去 `caddy validate`。
 
+**安装脚本为什么不自己拼路径？** `scripts/install.sh` 的"源"问引擎的
+`WTOOL_PROJECT_DIR` 要（手跑时按 `$0` 自推项目目录），"落点"从
+`WTOOL_HOME` / `WTOOL_PREFIX` 推。写死 `~/.wtool/wtool-work-dir/links/...`
+（引擎的内部布局）等于给自己留了第二份真相：换 `WTOOL_HOME` 装（影子家、
+临时家、测试）时它一定指丢，引擎以后再挪一次布局也一样 —— 而脚本的检查是
+"源找不到就跳过"，于是**报了"install 完成"却什么都没装**，敲 `dsh-remote`
+是 command not found。同一个病在 `tools/android_repack`（`14bf463`）和
+`harness/dsh-conf`（`977101b`）上修过，这里是最后一处；回归测试是
+`tests/run_tests.sh` 的 I 节（源找不到时**只跳过那一条**、说清去哪儿找了，
+而且一个字节都不写）。
+
 ---
 
 ## 5. 安全边界（这段要看）
@@ -206,14 +220,29 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 85 条，不联网、不碰 docker、不碰真 $HOME
+sh tests/run_tests.sh        # 179 条，不联网、不碰 docker、不碰真 $HOME
 sh tests/caddy-validate.sh   # 3 条，用官方 caddy:2 镜像真校验 Caddyfile（要 docker）
 ```
 
 `run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、
 `dsh-notify` 真发一条到本地 HTTP 接收端（含 `--hook` 解析、`on_stop` 开关、
 `--async` 不拖住钩子、**所有失败路径退出码都是 0**）、Caddyfile 渲染、
-`dsh-remote` 子命令（含 `notify-enable`/`notify-disable` 幂等和"删干净后补回 `[]`"）。
+`dsh-remote` 子命令（含 `notify-enable`/`notify-disable` 幂等和"删干净后补回 `[]`"）、
+`cloud-install` 的参数拼装（假 ssh/scp）、"自己的东西不放 `~/.dsh`"、`check-hooks`，
+最后是**安装脚本**（I 节，五个场景，全程临时
+`HOME`/`WTOOL_HOME`/`WTOOL_PREFIX`/`DSH_HOME`/`XDG_CONFIG_HOME`）：
+
+| 场景 | 断言 |
+|---|---|
+| 引擎调用（`WTOOL_PROJECT_DIR` 由 `wt_run_project_script` 导出） | 命令/配置/日志都到位，软链指向**项目检出目录**（故意在引擎内部那格埋一份假的，还从那儿取源就会挂） |
+| 手工跑（没设 `WTOOL_PROJECT_DIR`） | 按 `$0` 自推项目目录（cwd 在别处、相对路径两种都试） |
+| 换 `WTOOL_HOME`（≠ `HOME`） | 落点跟着它走，真 `$HOME` 一个东西都不多 |
+| 源找不到 | 只跳过那一条 + 打印去哪儿找了 + **一个字节都不写**（不留空目录/悬空链） |
+| `--uninstall` | 撤掉自己铺的软链，配置/日志实体留着 |
+
+跑完还会比对真 `$HOME`（`.zshrc` / `.bashrc` / `.config/dsh-remote` /
+`.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
+`grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
 （永远绿的测试等于没测）。
@@ -226,8 +255,22 @@ sh tests/caddy-validate.sh   # 3 条，用官方 caddy:2 镜像真校验 Caddyfi
 ## 7. 占地与清理
 
 - 仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档）；证书、密码、密钥、
-  日志一律在 `~/.dsh/`（用户级）和云上的 `/etc/caddy/`，不进 git。
-- 家里这台机器上运行期只有：`~/.dsh/{remote.conf,notify.conf,hooks.json,notify.log,web.log,web-url.txt}`
-  和一条 ssh 进程。
+  日志一律在**安装落点**和云上的 `/etc/caddy/`，不进 git。
+- `wtool install tools/dsh-remote` 装出来的东西（`$WTOOL_PREFIX` 默认
+  `~/.wtool/usr`，`$WTOOL_HOME` 默认 `$HOME`）：
+
+  | 落点 | 是什么 |
+  |---|---|
+  | `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify` | 软链 → 仓库 `bin/` 里的脚本（`$WTOOL_PREFIX/bin` 由引擎放进 PATH） |
+  | `$WTOOL_PREFIX/etc/dsh-remote/` | 配置**实体**（`remote.conf`、`notify.conf`、`hooks.json`、两份 `*.example`） |
+  | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期文件**实体**（`notify.log`、`web.log`、`web-url.txt`） |
+  | `~/.config/dsh-remote` | 软链 → 上面那个 `etc/dsh-remote` |
+  | `~/.local/state/dsh-remote` | 软链 → 上面那个 `var/dsh-remote` |
+  | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `dsh-remote notify-enable` 写 |
+
+  家在跑的时候只有一条 ssh 进程（`dsh-remote tunnel` / systemd 单元）。
 - 全撤：`dsh-remote notify-disable` → 停隧道 → 云上
   `systemctl disable --now caddy` → `wtool uninstall tools/dsh-remote`。
+  **只撤软链**：`etc/` 和 `var/` 里的实体（你的配置和日志）留着 —— 要彻底清
+  得自己删那个目录。
+

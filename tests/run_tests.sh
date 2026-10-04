@@ -12,6 +12,12 @@
 #   D cloud/relay.sh 的渲染：占位符替换干净、host/origin 改写、
 #     basic_auth、allow-ip、参数校验
 #   E dsh-remote 子命令：help/未知命令/status/notify-enable/notify-disable 幂等
+#   F cloud-install（假 ssh/scp）
+#   G 目录边界：自己的东西不放 ~/.dsh
+#   H check-hooks
+#   I 安装脚本：源问 WTOOL_PROJECT_DIR 要（手跑按 $0 自推）、落点从
+#     WTOOL_HOME/WTOOL_PREFIX 推、换 WTOOL_HOME 装到别处、源找不到不建悬空链、
+#     --uninstall 撤干净 —— 全程临时 HOME（跑完比真 $HOME 的指纹）
 #
 # 真起 Caddy 校验 Caddyfile 的那条在 tests/caddy-validate.sh（要 docker）。
 
@@ -467,6 +473,225 @@ chmod +x "$stub2/dsh"
 PATH="$stub2:$PATH" DSH_REMOTE_HOME="$rh" DSH_HOME="$DSH_HOME" sh "$remote" check-hooks >"$TMP/ch2" 2>&1
 check "钩子真的触发 → 退出码 0" "0" "$?"
 check_contains "报成功" "真的会触发" "$(cat "$TMP/ch2")"
+
+# ---------------------------------------------------------------- I 安装脚本
+# 2026-10-04 那个"报成功却什么都没装"的回归测试。五件事：
+#   A 引擎调用（WTOOL_PROJECT_DIR 由 wt_run_project_script 导出）→ 装 / 幂等
+#   B 手工跑（没设 WTOOL_PROJECT_DIR）→ 按 $0 自推项目目录
+#   C 换 WTOOL_HOME（≠ HOME）→ 落点从 WTOOL_HOME/WTOOL_PREFIX 推，不写回 $HOME
+#   D 源找不到 → 只跳过那一条 + 打印去哪儿找了 + 一个字节都不写（不留空目录软链）
+#   E --uninstall 撤干净
+# 老脚本（源写死 $HOME/.wtool/wtool-work-dir/links/tools/dsh-remote）拿这一节跑会挂。
+printf 'I. 安装脚本：临时 HOME/WTOOL_HOME/WTOOL_PREFIX 里真装一遍\n'
+
+check_link() { # <描述> <软链路径> <期望目标>
+    if [ -L "$2" ]; then
+        check "$1" "$3" "$(readlink -- "$2")"
+    else
+        bad "$1" "$2 不是软链"
+    fi
+}
+
+# 真 $HOME 里"被写坏就说明漏进真家目录"的那几个东西（跑完必须逐字不变）。
+# 注意**不比 mtime 会自己动的活文件**（比如 ~/.dsh 下的会话数据）——
+# 这个测试跟正在跑的会话并行，那种断言只会假红。
+real_home_fp() {
+    for p in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.config/dsh-remote" "$HOME/.local/state/dsh-remote"; do
+        if [ -L "$p" ]; then
+            printf '%s|link->%s|%s\n' "$p" "$(readlink -- "$p")" "$(stat -c '%Y' "$p")"
+        elif [ -e "$p" ]; then
+            printf '%s|%s|%s|%s\n' "$p" "$(stat -c '%F' "$p")" "$(stat -c '%s' "$p")" "$(stat -c '%Y' "$p")"
+        else
+            printf '%s|absent\n' "$p"
+        fi
+    done
+}
+
+inst="$TMP/install"
+mkdir -p -- "$inst/home"
+home_fp_before=$(real_home_fp)
+
+# ---- A 引擎调用（WTOOL_PROJECT_DIR 是引擎的契约变量）
+# 引擎内部那格"稳定中转链接"里**故意埋一份假的**：脚本要是还从那儿取源，
+# 软链就会指到 .wtool 里那份假的 —— 断言挂，正是要它挂。
+decoy="$inst/home/.wtool/wtool-work-dir/links/tools/dsh-remote"
+mkdir -p -- "$decoy/bin"
+printf '#!/bin/sh\n# decoy\nexit 9\n' >"$decoy/bin/dsh-remote"
+printf '#!/bin/sh\n# decoy\nexit 9\n' >"$decoy/bin/dsh-notify"
+chmod +x "$decoy/bin/dsh-remote" "$decoy/bin/dsh-notify"
+
+run_install_a() {
+    env HOME="$inst/home" WTOOL_HOME="$inst/home" WTOOL_PREFIX="$inst/prefix" \
+        WTOOL_PROJECT_DIR="$proj" DSH_HOME="$inst/dsh" \
+        XDG_CONFIG_HOME="$inst/xdg-conf" XDG_STATE_HOME="$inst/xdg-state" \
+        sh "$proj/scripts/install.sh" "$@"
+}
+run_install_a >"$TMP/i-a.out" 2>&1
+check "引擎调用：退出 0" "0" "$?"
+check_link "dsh-remote 装进 \$WTOOL_PREFIX/bin" "$inst/prefix/bin/dsh-remote" "$proj/bin/dsh-remote"
+check_link "dsh-notify 装进 \$WTOOL_PREFIX/bin" "$inst/prefix/bin/dsh-notify" "$proj/bin/dsh-notify"
+check_link "配置软链 -> \$WTOOL_PREFIX/etc/dsh-remote" "$inst/xdg-conf/dsh-remote" "$inst/prefix/etc/dsh-remote"
+check_link "日志软链 -> \$WTOOL_PREFIX/var/dsh-remote" "$inst/xdg-state/dsh-remote" "$inst/prefix/var/dsh-remote"
+[ -f "$inst/xdg-conf/dsh-remote/notify.conf.example" ] &&
+    ok "样板 notify.conf.example 复制进来了" || bad "样板 notify.conf.example 复制进来了"
+[ -f "$inst/xdg-conf/dsh-remote/remote.conf.example" ] &&
+    ok "样板 remote.conf.example 复制进来了" || bad "样板 remote.conf.example 复制进来了"
+check "样板内容和项目里那份一致" "$(cat -- "$proj/notify.conf.example")" \
+    "$(cat -- "$inst/xdg-conf/dsh-remote/notify.conf.example" 2>/dev/null || printf '缺')"
+check_not_contains "没从引擎内部那格取源（软链不是指向埋的假链接）" "$decoy" \
+    "$(readlink -- "$inst/prefix/bin/dsh-remote" 2>/dev/null || printf '不是软链')"
+grep -q 'decoy' "$decoy/bin/dsh-remote" 2>/dev/null &&
+    ok "埋的假中转链接原样没动" || bad "埋的假中转链接原样没动"
+[ ! -e "$inst/home/.config/dsh-remote" ] &&
+    ok "XDG_CONFIG_HOME 设了时不在 \$HOME/.config 下另起一份" ||
+    bad "XDG_CONFIG_HOME 设了时不在 \$HOME/.config 下另起一份"
+out=$(env HOME="$inst/home" DSH_HOME="$inst/dsh" "$inst/prefix/bin/dsh-remote" help 2>&1 </dev/null)
+check "装出来的 dsh-remote 真能跑（help 退出 0）" "0" "$?"
+check_contains "help 打的是用法" "status" "$out"
+grep -q -F -- '$HOME/.wtool' "$proj/scripts/install.sh" &&
+    bad "install.sh 里不再有 \$HOME/.wtool/... 字面量" \
+        "$(grep -n -F -- '$HOME/.wtool' "$proj/scripts/install.sh" | head -1)" ||
+    ok "install.sh 里不再有 \$HOME/.wtool/... 字面量"
+grep -q -F -- 'WTOOL_PROJECT_DIR' "$proj/scripts/install.sh" &&
+    ok "install.sh 的源问 WTOOL_PROJECT_DIR 要" || bad "install.sh 的源问 WTOOL_PROJECT_DIR 要"
+for f in env.zsh env.bash; do
+    grep -q -F -- '$HOME/.wtool' "$proj/$f" &&
+        bad "$f 里不再有 \$HOME/.wtool/... 字面量" \
+            "$(grep -n -F -- '$HOME/.wtool' "$proj/$f" | head -1)" ||
+        ok "$f 里不再有 \$HOME/.wtool/... 字面量"
+done
+
+# ---- A2 幂等
+run_install_a >"$TMP/i-a2.out" 2>&1
+check "重复 install 退出 0" "0" "$?"
+check_link "重复 install 后还是同一条软链" "$inst/prefix/bin/dsh-remote" "$proj/bin/dsh-remote"
+check_not_contains "重复 install 不重复复制样板" "配置样板：" "$(cat "$TMP/i-a2.out")"
+check_not_contains "重复 install 没有'找不到源文件'" "找不到源文件" "$(cat "$TMP/i-a2.out")"
+
+# ---- B 手工跑：按 $0 自推项目目录（cwd 在别处 / 相对路径两种）
+(
+    cd -- "$TMP" &&
+        env -u WTOOL_PROJECT_DIR HOME="$inst/b/home" WTOOL_HOME="$inst/b/home" \
+            WTOOL_PREFIX="$inst/b/prefix" XDG_CONFIG_HOME="$inst/b/xdg-conf" \
+            XDG_STATE_HOME="$inst/b/xdg-state" DSH_HOME="$inst/b/dsh" \
+            sh "$proj/scripts/install.sh"
+) >"$TMP/i-b.out" 2>&1
+check "手工跑（绝对路径、cwd 在别处）退出 0" "0" "$?"
+check_link "手工跑：源按 \$0 自推（指到项目检出目录）" "$inst/b/prefix/bin/dsh-remote" "$proj/bin/dsh-remote"
+check_not_contains "手工跑没有'找不到源文件'" "找不到源文件" "$(cat "$TMP/i-b.out")"
+(
+    cd -- "$proj" &&
+        env -u WTOOL_PROJECT_DIR HOME="$inst/b2/home" WTOOL_HOME="$inst/b2/home" \
+            WTOOL_PREFIX="$inst/b2/prefix" XDG_CONFIG_HOME="$inst/b2/xdg-conf" \
+            XDG_STATE_HOME="$inst/b2/xdg-state" DSH_HOME="$inst/b2/dsh" \
+            sh scripts/install.sh
+) >"$TMP/i-b2.out" 2>&1
+check "手工跑（相对路径 scripts/install.sh）退出 0" "0" "$?"
+check "手工跑（相对路径）也指到项目检出目录" "$(readlink -f -- "$proj/bin/dsh-remote")" \
+    "$(readlink -f -- "$inst/b2/prefix/bin/dsh-remote" 2>/dev/null || printf '没装上')"
+
+# ---- C 换 WTOOL_HOME：落点跟着走，不写回 $HOME
+# 这一场要验的正是默认推导，所以用 `env -u` 把 XDG_CONFIG_HOME / XDG_STATE_HOME /
+# WTOOL_PREFIX 都挡住：外面真设了也影响不到它。
+c_home="$inst/c/home"
+c_whome="$inst/c/whome"
+mkdir -p -- "$c_home" "$c_whome"
+env -u XDG_CONFIG_HOME -u XDG_STATE_HOME -u WTOOL_PREFIX \
+    HOME="$c_home" WTOOL_HOME="$c_whome" WTOOL_PROJECT_DIR="$proj" DSH_HOME="$inst/c/dsh" \
+    sh "$proj/scripts/install.sh" >"$TMP/i-c.out" 2>&1
+check "换 WTOOL_HOME 装：退出 0" "0" "$?"
+check_link "命令落在 \$WTOOL_HOME/.wtool/usr/bin（WTOOL_PREFIX 默认值也跟它走）" \
+    "$c_whome/.wtool/usr/bin/dsh-remote" "$proj/bin/dsh-remote"
+check_link "配置软链落在 \$WTOOL_HOME/.config/dsh-remote" \
+    "$c_whome/.config/dsh-remote" "$c_whome/.wtool/usr/etc/dsh-remote"
+check_link "日志软链落在 \$WTOOL_HOME/.local/state/dsh-remote" \
+    "$c_whome/.local/state/dsh-remote" "$c_whome/.wtool/usr/var/dsh-remote"
+if [ ! -e "$c_home/.config" ] && [ ! -e "$c_home/.local" ] && [ ! -e "$c_home/.wtool" ]; then
+    ok "落点没写回 \$HOME（那个家目录一个东西都没多）"
+else
+    bad "落点没写回 \$HOME（那个家目录一个东西都没多）" "$(ls -A "$c_home" | tr '\n' ' ')"
+fi
+
+# ---- D 源找不到：只跳过那一条 + 说清去哪儿找了 + 什么都不建
+d_missing="$inst/d/没有这个目录"
+env HOME="$inst/d/home" WTOOL_HOME="$inst/d/home" WTOOL_PREFIX="$inst/d/prefix" \
+    WTOOL_PROJECT_DIR="$d_missing" DSH_HOME="$inst/d/dsh" \
+    XDG_CONFIG_HOME="$inst/d/xdg-conf" XDG_STATE_HOME="$inst/d/xdg-state" \
+    sh "$proj/scripts/install.sh" >"$TMP/i-d.out" 2>&1
+check "源整个找不到：仍然退出 0（不把整个 wtool install 拉下水）" "0" "$?"
+d_out=$(cat "$TMP/i-d.out")
+check_contains "警告里点名了缺的源（命令）" "$d_missing/bin/dsh-remote" "$d_out"
+check_contains "警告里说了去哪儿找" "找的地方：$d_missing" "$d_out"
+check_contains "警告里说明来源是 WTOOL_PROJECT_DIR" "来自 WTOOL_PROJECT_DIR" "$d_out"
+check_contains "末尾交代跳过了几条" "有 4 条源没找到" "$d_out"
+if [ ! -e "$inst/d/prefix" ] && [ ! -e "$inst/d/xdg-conf" ] && [ ! -e "$inst/d/xdg-state" ]; then
+    ok "一个字节都没写：\$WTOOL_PREFIX / 配置 / 日志落点都没被建"
+else
+    bad "一个字节都没写：\$WTOOL_PREFIX / 配置 / 日志落点都没被建" \
+        "$(ls -d "$inst/d"/* 2>/dev/null | tr '\n' ' ')"
+fi
+[ ! -e "$inst/d/home" ] && ok "\$HOME 也没被建" || bad "\$HOME 也没被建"
+
+# 找不全的项目：只有 bin/dsh-remote，别的都没有 → 找到的照装，缺的只警告
+d_fake="$inst/d/fake-project"
+mkdir -p -- "$d_fake/bin"
+printf '#!/bin/sh\n# fake\nexit 0\n' >"$d_fake/bin/dsh-remote"
+chmod +x "$d_fake/bin/dsh-remote"
+env HOME="$inst/d/home" WTOOL_HOME="$inst/d/home" WTOOL_PREFIX="$inst/d/prefix2" \
+    WTOOL_PROJECT_DIR="$d_fake" DSH_HOME="$inst/d/dsh" \
+    XDG_CONFIG_HOME="$inst/d/xdg-conf2" XDG_STATE_HOME="$inst/d/xdg-state2" \
+    sh "$proj/scripts/install.sh" >"$TMP/i-d2.out" 2>&1
+check "源不全：退出 0（不 die、也不吞掉其余动作）" "0" "$?"
+check_link "找到的那条照装（dsh-remote）" "$inst/d/prefix2/bin/dsh-remote" "$d_fake/bin/dsh-remote"
+if [ ! -e "$inst/d/prefix2/bin/dsh-notify" ] && [ ! -L "$inst/d/prefix2/bin/dsh-notify" ]; then
+    ok "缺的那条（dsh-notify）没装、也没留悬空链接"
+else
+    bad "缺的那条（dsh-notify）没装、也没留悬空链接"
+fi
+if [ ! -e "$inst/d/xdg-conf2/dsh-remote" ] && [ ! -L "$inst/d/xdg-conf2/dsh-remote" ]; then
+    ok "配置软链没建（两张样板一个都没找到，就不铺这一摊）"
+else
+    bad "配置软链没建（两张样板一个都没找到，就不铺这一摊）"
+fi
+if [ ! -e "$inst/d/prefix2/etc" ] && [ ! -e "$inst/d/prefix2/var" ]; then
+    ok "没为缺的源建目录（只有真要装才 mkdir）"
+else
+    bad "没为缺的源建目录（只有真要装才 mkdir）" "$(ls -d "$inst/d/prefix2"/* 2>/dev/null | tr '\n' ' ')"
+fi
+d2_out=$(cat "$TMP/i-d2.out")
+check_contains "警告里点名缺的样板" "$d_fake/notify.conf.example" "$d2_out"
+check_contains "警告里点名缺的命令" "$d_fake/bin/dsh-notify" "$d2_out"
+check_contains "末尾交代跳过了 3 条" "有 3 条源没找到" "$d2_out"
+
+# ---- E --uninstall：撤掉自己铺的软链，实体（配置/日志）留着
+run_install_a --uninstall >"$TMP/i-e.out" 2>&1
+check "uninstall 退出 0" "0" "$?"
+if [ ! -e "$inst/prefix/bin/dsh-remote" ] && [ ! -L "$inst/prefix/bin/dsh-remote" ]; then
+    ok "dsh-remote 软链撤掉了"
+else
+    bad "dsh-remote 软链撤掉了"
+fi
+if [ ! -e "$inst/prefix/bin/dsh-notify" ] && [ ! -L "$inst/prefix/bin/dsh-notify" ]; then
+    ok "dsh-notify 软链撤掉了"
+else
+    bad "dsh-notify 软链撤掉了"
+fi
+if [ ! -e "$inst/xdg-conf/dsh-remote" ] && [ ! -L "$inst/xdg-conf/dsh-remote" ]; then
+    ok "配置软链撤掉了"
+else
+    bad "配置软链撤掉了"
+fi
+if [ ! -e "$inst/xdg-state/dsh-remote" ] && [ ! -L "$inst/xdg-state/dsh-remote" ]; then
+    ok "日志软链撤掉了"
+else
+    bad "日志软链撤掉了"
+fi
+[ -f "$inst/prefix/etc/dsh-remote/notify.conf.example" ] &&
+    ok "实体（配置目录里的样板）留着 —— 那是用户的东西" ||
+    bad "实体（配置目录里的样板）留着 —— 那是用户的东西"
+
+# ---- 真 $HOME 没被碰（整节跑完比指纹）
+check "真 \$HOME 的指纹跑完逐字不变（只写临时目录）" "$home_fp_before" "$(real_home_fp)"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"
