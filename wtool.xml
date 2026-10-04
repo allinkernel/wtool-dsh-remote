@@ -15,17 +15,17 @@
   dsh-remote / dsh-notify 这两条命令。不装它就没有任何影响。
 
   两件事分开表达：
-    * <env>  —— 只导出项目目录（命令本体由 scripts/install.sh 软链进
+    * <zshrc>/<bashrc> —— 只导出项目目录（命令本体由 scripts/install.sh 软链进
                  $WTOOL_PREFIX/bin）。zsh 和 bash 各一份，内容等价。
     * scripts/install.sh —— wtool.xml 表达不了的那件事：软链命令 + 装推送配置样板。
 
   仓库里只有文本：没有二进制、没有证书、没有密码。云端脚本在 cloud/，
   家这头的命令在 bin/，用法与安全边界见 README.md。
 -->
-<wtool schema="1" id="tools/dsh-remote" priority="47">
+<wtool schema="1" priority="47">
 
-  <env src="env.zsh"  shells="zsh"/>
-  <env src="env.bash" shells="bash"/>
+  <zshrc  src="env.zsh"/>
+  <bashrc src="env.bash"/>
 
   <!-- 没有构建步骤：源码包就是产物 -->
   <publish kind="source"/>
