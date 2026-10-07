@@ -825,3 +825,15 @@ env | grep -i DSH_WEB_URL          # 只有 http://127.0.0.1:3080（不带 token
 ```
 
 **验证程度**：源码 + CLI + 文件系统三处各查 1 次；"老 cookie 跨重启仍有效"本机实测 1 次。
+
+**补记（2026-10-07 下午，实测容易误判的一条）**：用 `curl -L "https://<入口>/?token=…"`
+**不带 cookie jar**（没有 `-c/-b`）时会一直 303 打转，直到 `--max-redirs` 用尽 ——
+因为 dsh web 换 cookie 之后 303 回 `./`，而 curl 没存那个 cookie，回到 `/` 又被 Caddy
+交给 broker → 302 回 `?token=` → …。**这不是坏了**：真浏览器会把 `Set-Cookie` 存下来，
+第二次 `/` 就带 cookie 直连 dsh web（本机实测 200、0 次跳转）。
+要复现"像浏览器那样"的完整链路，必须带上 jar：
+
+```sh
+curl -skL -c /tmp/jar -b /tmp/jar -u dsh:<pw> https://<入口>/          # → 200 + <title>DeepSeek Harness</title>
+curl -sk  -c /tmp/jar -b /tmp/jar -u dsh:<pw> -o /dev/null -w '%{http_code}\n' https://<入口>/   # → 200（0 跳转）
+```

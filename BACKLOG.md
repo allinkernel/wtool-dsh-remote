@@ -383,7 +383,7 @@ dsh-remote tunnel-status --probe                  # 一条命令看全
 - **没验的一条**：拿**真 token** 从公网走 302→200 —— 需要用户用新的 `harness` 函数
   重启一次 harness（那个在跑的实例是 10-05 起的，token 读不出来）。手机到手后一条命令就验完。
 
-**测试**：`sh tests/run_tests.sh` → **363 通过 0 失败**（新增 K 节 35 条 / L 节 12 条 / M 节 46 条）。
+**测试**：`sh tests/run_tests.sh` → **366 通过 0 失败**（新增 K 节 38 条 / L 节 12 条 / M 节 46 条）。
 
 ---
 

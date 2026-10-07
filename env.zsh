@@ -48,10 +48,15 @@ harness() {
         printf 'harness：PATH 里没有 npx（这套用法是 npx @deepseek-ai/dsh web）\n' >&2
         return 127
     fi
-    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub
+    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub _hr_mark
     _hr_state=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
     _hr_tok=$_hr_state/current-token.txt
     _hr_url=$_hr_state/web-url.txt
+    # 只有"这次真的抓到了 token"才在退出时删 token 文件。标记文件里存我们写进去的那一刻
+    # 的值：抓取循环在子 shell 里（变量传不出来），而且**端口被占时这个函数会什么都没抓到**
+    # —— 那时绝不能去删别人（另一个正在跑的实例）写的 token 文件，否则 broker 又回 503。
+    _hr_mark=$_hr_state/.harness-wrote-token
+    rm -f -- "$_hr_mark" 2>/dev/null
     _hr_conf=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}/remote.conf
     mkdir -p -- "$_hr_state" 2>/dev/null
 
@@ -67,6 +72,7 @@ harness() {
             *token=*)
                 printf '%s\n' "${_hr_u##*token=}" >"$_hr_tok" && chmod 600 -- "$_hr_tok" 2>/dev/null
                 printf '%s\n' "$_hr_u" >"$_hr_url" && chmod 600 -- "$_hr_url" 2>/dev/null
+                cp -f -- "$_hr_tok" "$_hr_mark" 2>/dev/null && chmod 600 -- "$_hr_mark" 2>/dev/null
                 printf '[dsh-remote] 已捕获 token → %s\n' "$_hr_tok"
                 _hr_pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
                 if [ -n "$_hr_pub" ]; then
@@ -79,6 +85,12 @@ harness() {
         printf '%s\n' "$_hr_line"
     done
 
-    rm -f -- "$_hr_tok"
-    printf '[dsh-remote] harness 退出，token 文件已清掉（broker 现在回 503）\n'
+    if [ -f "$_hr_mark" ] && [ -s "$_hr_tok" ] && cmp -s -- "$_hr_mark" "$_hr_tok"; then
+        rm -f -- "$_hr_tok" "$_hr_mark"
+        printf '[dsh-remote] harness 退出：token 文件已清掉（broker 现在回 503）\n'
+    else
+        rm -f -- "$_hr_mark" 2>/dev/null
+        printf '[dsh-remote] harness 没抓到 token（端口被占 / 没起来？）或 token 已经是别人的了\n' >&2
+        printf '[dsh-remote] —— 原来的 %s **保持不动**（broker 不会因此变 503）\n' "$_hr_tok" >&2
+    fi
 }

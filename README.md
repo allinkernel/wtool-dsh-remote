@@ -320,10 +320,10 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **363**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-07 实测，合计 **366**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 27 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 69** /
-**token 固定地址 K 35** / **二维码 L 12** / **一条命令装好 M 46**。
+**token 固定地址 K 38** / **二维码 L 12** / **一条命令装好 M 46**。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 

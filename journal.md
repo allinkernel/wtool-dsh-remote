@@ -383,3 +383,19 @@ harness（不能动他正在用的那个进程）；真手机扫码。
 
 **没做的**：从**一台全新机器**从零跑一遍（只验了"已装好之后的幂等重跑"）；
 `--domain`（域名 + Let's Encrypt）没跑过；真手机扫码没验（要用户拿手机）。
+
+**补记（2026-10-07 12:55，同一轮收尾）**：
+
+- 上级反馈两条，其中一条是真 bug：`harness` 函数原来**退出时无条件**
+  `rm -f current-token.txt` —— 如果有人在"已经有一个实例在跑"时误跑一次（什么都没抓到），
+  会把**别人**写的 token 删掉，broker 又变 503。改成：抓取时写一个
+  `.harness-wrote-token` 标记（内容 = 那一刻的 token），退出时 `cmp` 相等才删；
+  **没抓到就什么都不动** + 打一行说明。K 节加了 3 条回归（366 通过 0 失败）。
+- 另一条是"别误判"：`curl -L "https://<入口>/?token=…"` **不带 cookie jar** 会 303 打转，
+  真浏览器有 cookie 不会 —— 写进 hazards H22 的补记（附"像浏览器那样"的两条命令）。
+- **真公网完整链路终于验全了**：用户在跑的那个实例的 token 被写进
+  `~/.local/state/dsh-remote/current-token.txt`（设计里的数据源）之后，
+  `curl -skL --interface eth1 -u dsh:<pw> -c/-b jar https://123.56.158.212:8443/`
+  → **302 → `/?token=6b15Sb…` → 303 + Set-Cookie → 200，body 34674 字节、
+  `<title>DeepSeek Harness</title>`**；带 cookie 再打 `/` → 200、0 次跳转；
+  `/go` → 302；老 token 地址照旧。U10 那条"没验的"到此闭合（真手机扫码仍没验）。

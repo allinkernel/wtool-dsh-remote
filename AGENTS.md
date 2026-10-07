@@ -139,7 +139,7 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 363 条（以跑出来的 PASS 行为准），秒级
+sh tests/run_tests.sh         # 366 条（以跑出来的 PASS 行为准），秒级
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
                               #   J 节用 DSH_REMOTE_UNIT_DIR + systemctl/tmux 桩，不碰真 unit / 真 tmux
@@ -151,7 +151,7 @@ sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再�
 `run_tests.sh` 逐节（2026-10-07 实测）：A 语法 10 / B `env.*` 等价 6 /
 C `dsh-notify` 22 / D Caddyfile 渲染 27 / E 子命令 53 / F `cloud-install` 14 /
 G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 55 / J 常驻隧道 69 /
-K token 固定地址 35 / L 二维码 12 / M 一条命令装好 46 = **363**。
+K token 固定地址 38 / L 二维码 12 / M 一条命令装好 46 = **366**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
 
 ⚠️ 两个要 docker 的脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码）：

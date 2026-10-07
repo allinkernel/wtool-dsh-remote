@@ -276,7 +276,11 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
 - **`harness` 函数**（`env.zsh` / `env.bash`，两份逐字等价）：包装
   `npx @deepseek-ai/dsh web "$@"`，把 stdout 里 `dsh web: http://…/?token=…` 的
   token 写进 `$STATE_DIR/current-token.txt`、完整 URL 写进 `web-url.txt`（都 600），
-  并把 `remote.conf` 里的 `public_url` 打出来提示"收藏这个"；**退出时删掉 token 文件**。
+  并把 `remote.conf` 里的 `public_url` 打出来提示"收藏这个"。
+  退出时**只删"这次自己写过的那份"**：抓取时同时写一个 `.harness-wrote-token` 标记
+  （内容 = 那一刻的 token），退出时 `cmp` 一下 —— 只有还相等才 `rm`。
+  **没抓到 token（端口被占 / 没起来）就什么都不动**并打一行说明：不然会把另一个
+  正在跑的实例写的 token 文件删掉，broker 又回 503（2026-10-07 实测踩到过）。
   文件在 source 时还会 `unalias harness`（别名优先于函数，用户原来那条 alias 会盖住它）。
 - **`bin/dsh-token-broker`**（`dsh-remote broker-install` 装成 `dsh-token-broker.service`）：
   只绑 `127.0.0.1:3081`；`GET /`（不带 token）与 `GET /go` → 302 `/?token=<当前值>`；
@@ -626,7 +630,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **363 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / **K 35** / **L 12** / **M 46**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
+| `tests/run_tests.sh` | **366 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / **K 38** / **L 12** / **M 46**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -643,11 +647,12 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 `run_tests.sh` 的 **K / L / M 三节（2026-10-07 加，共 93 条）**：
 
-- **K（token 重定向）**：Caddyfile 两份模板都必须有 `path /` + `not query token=*` +
+- **K（token 重定向，38 条）**：Caddyfile 两份模板都必须有 `path /` + `not query token=*` +
   `not header Cookie *dsh-auth-*` + `{{BROKER_PORT}}` + `@go`；`relay.sh` 里的
   `{{BROKER_PORT}}` 替换与 `--broker-port`；`harness` 函数在 **bash 和 zsh 两份**里
   各用假 `npx` 抓一次 token（写文件 → 退出时删掉，抓的是行首那个不是 LAN 那个）；
-  **broker 起真进程**（python3）验 302/404/405/503 与"只绑回环"。
+  **broker 起真进程**（python3）验 302/404/405/503 与"只绑回环"；
+  还有一条容错回归：**没抓到 token 时不许把别人写的 token 文件清掉**。
 - **L（二维码）**：`dsh-qr` 的矩阵 sha256 与独立实现（npm 那份 JS）对过账的向量、
   中文/emoji 能编、太长必须报错、终端半块画、PNG 头与尺寸、SVG 文本。
 - **M（`server`）**：假 ssh/scp/curl + 临时 unit 目录，验"四类自检失败都给指引"、

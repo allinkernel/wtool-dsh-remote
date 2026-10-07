@@ -1017,6 +1017,28 @@ for shname in bash zsh; do
     fi
 done
 
+# ②b 容错：这次**没抓到** token（端口被占/没起来）→ 不许把别人写的 token 文件清掉
+cat >"$TMP/kbin/npx" <<'STUB'
+#!/bin/sh
+echo "dsh web: 端口被占了，起不来"
+STUB
+chmod +x "$TMP/kbin/npx"
+printf 'OLD-TOKEN-from-running-instance\n' >"$TMP/kstate/current-token.txt"
+chmod 600 "$TMP/kstate/current-token.txt"
+PATH="$TMP/kbin:$PATH" DSH_REMOTE_STATE_DIR="$TMP/kstate" DSH_REMOTE_CONF_DIR="$TMP/kconf" \
+    bash -c ". '$proj/env.bash'; harness --no-open" >"$TMP/k-nocap.out" 2>&1
+check "没抓到 token 时 harness 退出 0（不炸）" "0" "$?"
+check "没抓到 token：**旧 token 文件原样留着**（H22 那条教训）" "OLD-TOKEN-from-running-instance" \
+    "$(cat "$TMP/kstate/current-token.txt" 2>/dev/null)"
+check_contains "没抓到 token：打一行说明，别装没事" "没抓到 token" "$(cat "$TMP/k-nocap.out")"
+
+cat >"$TMP/kbin/npx" <<'STUB'
+#!/bin/sh
+echo "dsh web: http://127.0.0.1:3080/?token=Tok-123_abc (LAN: http://10.0.0.2:3080/?token=Tok-123_abc)"
+sleep 1
+STUB
+chmod +x "$TMP/kbin/npx"
+
 # ③ broker 本体：起真进程（python3 + 一个真在听的假 dsh web）
 k_wport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 k_bport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
