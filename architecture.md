@@ -57,9 +57,9 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 1673 | 家里这头的主命令（22 个子命令） |
+| `bin/dsh-remote` | 1844 | 家里这头的主命令（23 个子命令） |
 | `bin/dsh-token-broker` | 172 | **token 重定向小服务**（纯 python 标准库；只做 302，不代理，见 §3.2） |
-| `bin/dsh-qr` | 549 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
+| `bin/dsh-qr` | 573 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
 | `bin/dsh-remote-server` | 8 | `dsh-remote server` 的薄封装（用户先说的是这个名字，两个入口等价） |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
@@ -127,7 +127,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：22 个子命令的真实行为
+## 3. `bin/dsh-remote`：23 个子命令的真实行为
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -321,8 +321,32 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
 `bin/dsh-qr` 是**自带**的二维码实现（纯 python，不依赖 qrencode / PIL / pip）：
 字节模式、版本 1–40 自动挑、纠错 L/M/Q/H、8 种掩码按 ISO/IEC 18004 §8.8.2 的罚分挑，
 输出终端半块字符画（自带前景/背景色）、1 位灰度 PNG（`zlib`+`struct` 手写）、纯文本 SVG。
+**图片是给手机扫的，所以按像素放大**：`--scale N` = 每个模块占几个像素，默认自动
+（`--target-px`，默认 1024：`scale = ceil(1024 / 模块数)`），静默区由 `--border` 给
+（`server` 用 4）；PNG 宽=高=模块数×scale，**不做插值**（每模块是干净的整数方块）；
+SVG 的 `width`/`height` 同步成像素、`viewBox` 仍是模块坐标。`--png/--svg` 时会往 stderr
+打一行"版本 / 纠错 / 多少模块 / 图片多少 px / 每模块几 px"。
 规格表（纠错分块、对齐图案位置）是标准常数；**正确性拿一份独立实现逐模块对过账**
 （npm 自带 `qrcode-terminal` 里 Kazuhiko Arase 的 JS 实现，MIT），回归向量在 §10 的 L 节。
+
+### 3.4 改密码：`dsh-remote passwd`（2026-10-07 加）
+
+用户实测反馈："照 `relay-password.txt` 里的三步教程改密码，先要 root、加 sudo 又说没有
+compose，命令还是折行的、只复制了半行" → 做成一条命令（ADR-0016）。它做的事：
+
+1. `--user`（默认 `dsh` / conf 的 `web_user`）、`--password`（不给就问，回车 = 随机 20 位；
+   含单引号/空格直接拒）。
+2. 探云上该用 `docker` 还是 `sudo docker`（H18），在**云上**算哈希：
+   `<docker> run --rm caddy:2.11.4 caddy hash-password --plaintext '<新密码>'`。
+3. 远端脚本走 stdin（`ssh … sh -s`）：备份 `Caddyfile` → **只把 `basic_auth` 里那一行的
+   bcrypt 哈希换掉**（`awk` 按用户名精确替换，找不到就 `exit 3`，**不整份重渲染**）→
+   `<docker> restart dsh-relay` → 轮询到 `https://127.0.0.1:<port>/` 回 401（最多 20s）→
+   只替换 `relay-password.txt` 的 `PASSWORD=` 行（没有就补一份）→ `chmod 600`。
+4. 从家里验（`curl -sk [-–interface] -u user:pw <public_url>`）：**新密码 200/302 ✓、
+   旧密码 401 ✓**（旧密码 == 新密码时不做这条，免得自欺）。
+5. 打印"手机怎么用新密码"（含"浏览器可能记着旧密码 → 清掉或换无痕窗口"）。
+
+`--dry-run` 只打印这五步。网卡绕开本机代理用 `DSH_REMOTE_IFACE=eth1`（同 §11）。
 
 ---
 
@@ -419,10 +443,16 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
    再探 `http://127.0.0.1:<TUNNEL_PORT>/`（000 = 家里的隧道还没起，第一次跑正常）
    和 `http://127.0.0.1:<BROKER_PORT>/`（**302 = broker 好、503 = 家里还没有 token**、
    000 = broker 那条隧道没起）。
-7. **写 `$DIR/relay-password.txt`（600）**：`URL=` / `USER=` / `PASSWORD=` + "改密码三步"。
+7. **提示语只给一行、按检测到的模式给全参数**（`mode_cmd()`）：无 compose 就带
+   `--no-compose --dir <DIR> --docker-cmd '<命令>'`，有 compose 就是 `sudo sh relay.sh …`，
+   `--ip/--domain/--email/--port/--user/--tunnel-port/--local-port/--broker-port/--allow-ip`
+   全带上（少一个都会把配置改回去）。**dry-run 也会把这行打成 `HINT-CMD: …`** ——
+   测试拿它去本机再跑一遍 `--dry-run`，验"这条命令真能用"（H23）。
+8. **写 `$DIR/relay-password.txt`（600）**：`URL=` / `USER=` / `PASSWORD=` + "改密码三步"。
    **脚本自己写**，谁重渲染谁负责 —— 以前是人手写、脚本不更新，重跑一次就漂移
    （hazards H17；加强说明也在那一条）。
-8. **结尾打印**（stderr）：手机地址、用户名、密码（并说清三样也写在那个 600 的文件里），看状态/看日志/撤掉三条命令
+9. **结尾打印**（stderr）：手机地址、用户名、密码（并说清三样也写在那个 600 的文件里）、
+   **改密码那条一行命令**、看状态/看日志/撤掉三条命令。
    （按模式给 `docker compose -f …` 或 `$DOCKER …`），以及脚本做不了的两件事
    （安全组只放 22 + 对外端口；手机第一次要 basic auth 一次 + 贴一次带 token 的地址）。
 
@@ -630,7 +660,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **366 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / **K 38** / **L 12** / **M 46**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
+| `tests/run_tests.sh` | **400 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / K 38 / **L 17** / M 46 / **N 22**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -658,6 +688,13 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 - **M（`server`）**：假 ssh/scp/curl + 临时 unit 目录，验"四类自检失败都给指引"、
   `--dry-run` 一个字节不写、`--yes` 全参跑通（部署命令拼装 / 回写 conf / 装两个单元 /
   打印地址）、**部署失败必须非 0**（H20 的回归）、`dsh-remote-server` 薄封装等价。
+- **N（改密码，22 条）**：假 ssh/curl，验 `--dry-run` 不碰云、真跑时"在云上用
+  caddy:2.11.4 算哈希"、"远端脚本里是 awk 精确换哈希（不是整份重渲染）/ 只 restart
+  dsh-relay / 同步并 chmod 600 密码文件"、新密码 302 ✓ 旧密码 401 ✓、旧==新时不谎报、
+  docker 不可用 / 哈希算不出 / 密码带单引号 三条失败路径都给非 0 与说明、help 里有它。
+- **D 节新增（7 条）**：把 `relay.sh --dry-run` 打出来的 `HINT-CMD:` 那一行抽出来、
+  换掉密码占位符、**再跑一遍 `--dry-run`** —— 验"提示里那条命令参数给全、真能用、
+  渲染没有残留占位符、上游端口复现一致"（不是字符串断言，见 H23）。
 
 `run_tests.sh` 的 I 节（55 条）是 2026-10-04 那次修复的回归测试，五个场景：
 ①引擎调用（`WTOOL_PROJECT_DIR`，引擎内部那格故意埋一份假的可执行文件）
@@ -713,6 +750,8 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `DSH_REMOTE_TOKEN_FILE` | dsh-remote、broker | token 文件路径，默认 `$STATE_DIR/current-token.txt` |
 | `DSH_REMOTE_PYTHON` | dsh-remote | 写进 broker 单元的 python3 绝对路径（默认 `command -v python3`） |
 | `DSH_REMOTE_BROKER_PORT` | dsh-token-broker | broker 监听端口（默认 3081；一般由 `broker-install` 用 `--port` 传） |
+| `DSH_REMOTE_IFACE` | dsh-remote（`passwd` 的验证那步） | 给 `curl` 绑网卡（本机绕开 Clash 用 `eth1`，见 hazards H11） |
+| `relay_dir` / `RELAY_DIR`（conf 键） | dsh-remote passwd | 云上中继目录，默认 `/home/mindul/dsh-relay` |
 
 ---
 

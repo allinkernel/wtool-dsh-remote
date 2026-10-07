@@ -14,16 +14,21 @@
    📱 手机浏览器
         │  https（Let's Encrypt 或自签）+ HTTP basic auth
         ▼
-   阿里云 Caddy                     ← 对外唯一的入口
-        │  reverse_proxy → 127.0.0.1:18080
+   阿里云：一个 docker 容器跑 Caddy   ← 对外唯一的入口
+        │  容器名 dsh-relay，镜像 caddy:2.11.4，--network=host，--restart unless-stopped
+        │  文件全在 /home/mindul/dsh-relay/（Caddyfile / 密码文件 / data / config / logs）
+        │  宿主上**不装 caddy 包、没有 caddy.service**（hazards H7）
+        │  按条件转发：不带 token 的 / → 家里的 token broker（302 补 token）；
+        │  其余（会话 / SSE / WebSocket / 带 token 或 cookie 的 /）→ 127.0.0.1:18080
         │  （顺手把 Host/Origin/Referer 改写成回环，见 §4）
         ▼
    云上 sshd 的反向隧道端            ← 云上不用开新端口，家主动连出去
         ▲
-        │  ssh -N -R 127.0.0.1:18080:127.0.0.1:3080
+        │  ssh -N -R 127.0.0.1:18080:127.0.0.1:3080 -R 127.0.0.1:18081:127.0.0.1:3081
         │
    家里这台机器                     ← 只有这条出站连接，家里不需要公网 IP、不用端口映射
-        │  127.0.0.1:3080 = dsh web
+        │  127.0.0.1:3080 = dsh web（会话界面）
+        │  127.0.0.1:3081 = token broker（只做 302，把固定地址补成带 token 的地址）
         ▼
    DSH 会话（就是你现在用的这个界面）
 ```
@@ -89,6 +94,16 @@ harness 也不用改手机上的链接**。
 最省事的是：**`dsh-remote server`**（或 `dsh-remote-server`）一条命令把"云上中继 +
 家里常驻隧道 + broker"装好，最后打印固定地址和一张能直接扫的二维码。
 
+**二维码的尺寸判据**（"手机扫得动"就这么量）：`~/.local/state/dsh-remote/phone-qr.png`
+的**短边 ≥ 1024 像素**、**每个模块是整数个像素**（不做插值/模糊）、**静默区 ≥ 4 个模块**；
+SVG 的 `width`/`height` 与 PNG 一致（`viewBox` 用模块坐标，放大不糊）。终端里那份字符画
+只是给人看的，不用来扫。
+
+**改密码**：`dsh-remote passwd`（家里一条命令）。它会算哈希、**只替换 Caddyfile 里
+`basic_auth` 那一行**（不整份重渲染）、重启容器、从家里验"旧密码 401 / 新密码 200-302"，
+并把云上 `relay-password.txt` 的 `PASSWORD=` 行同步掉。想手工做也行 ——
+云上 `relay-password.txt` 和 `relay.sh` 打印的那条命令是**一整行**，复制全（见 §4 的坑）。
+
 ---
 
 ## 3. 命令
@@ -105,6 +120,7 @@ harness 也不用改手机上的链接**。
 | `dsh-remote token-broker` | 前台跑"把不带 token 的 `/` 302 到当前 token"的小服务（常驻用 `broker-install`） |
 | `dsh-remote broker-install` / `broker-uninstall` | 把 token broker 装成 / 撤出 systemd `--user` 常驻 |
 | `dsh-remote server` | **一条命令装好**：自检 → 云上中继 → 家里常驻隧道 + broker → 起 harness → 打印固定地址 + 二维码（`dsh-remote-server` 是等价入口） |
+| `dsh-remote passwd` | **改中继密码**（在家里一条命令）：云上算哈希 → 只改 Caddyfile 里那一行 → 重启容器 → 验"旧密码被拒 + 新密码能过" → 同步云上的密码文件 |
 | `dsh-remote url` | 打印手机该收藏的地址 |
 | `dsh-remote notify-test` | 推一条测试消息 |
 | `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
@@ -320,10 +336,10 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **366**）：语法 A 10 / `env` 两份 B 6 /
-`dsh-notify` C 22 / Caddyfile 渲染 D 27 / 子命令 E 53 / `cloud-install` F 14 /
+逐节条数（2026-10-07 实测，合计 **400**）：语法 A 10 / `env` 两份 B 6 /
+`dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 69** /
-**token 固定地址 K 38** / **二维码 L 12** / **一条命令装好 M 46**。
+**token 固定地址 K 38** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22**。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 

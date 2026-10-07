@@ -837,3 +837,46 @@ env | grep -i DSH_WEB_URL          # 只有 http://127.0.0.1:3080（不带 token
 curl -skL -c /tmp/jar -b /tmp/jar -u dsh:<pw> https://<入口>/          # → 200 + <title>DeepSeek Harness</title>
 curl -sk  -c /tmp/jar -b /tmp/jar -u dsh:<pw> -o /dev/null -w '%{http_code}\n' https://<入口>/   # → 200（0 跳转）
 ```
+
+---
+
+## H23. 折行的"教程命令"会被复制成半行，而报错指向**错误的方向**
+
+**现象（2026-10-07 用户实测，原话大意）**：`relay-password.txt` 里写着"改密码三步"，
+命令是折行的：
+
+```
+#   1) 云上：cd /home/mindul/dsh-relay && sh cloud/relay.sh --ip 1.2.3.4 --port 8443 --password '<新密码>' \
+#            --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'
+```
+
+用户只复制了**第一行**（到 `--password '<新密码>'` 为止）→ `relay.sh` 落到默认的
+compose 模式 → 先报"要用 root 跑"，加了 `sudo` 之后又报"没有 docker compose 插件"。
+**两个报错都在讲环境，真正的原因（参数掉了）一句没提。**
+
+**根因**：折行 + `\` 续行是"给人读的排版"，但复制粘贴是**按行**的；而且脚本对"没给
+`--no-compose`"的兜底是**猜模式**（compose 优先），没有问"你是不是少给了参数"。
+
+**修法（代码已改，ADR-0016）**：
+
+1. 提示语改成**一行、按检测到的模式给全参数**（`relay.sh` 的 `mode_cmd()`）：
+   无 compose 就带 `--no-compose --dir <DIR> --docker-cmd '<命令>'`，
+   模式/端口/用户/三条隧道端口/`--allow-ip` 全带上，**不折行**。
+2. 首选改成一条命令：`dsh-remote passwd`（家里跑），教程只作为"不装工具时的手工等价"。
+3. dry-run 也会把那一行打成 `HINT-CMD: …`，测试把它抽出来**再跑一遍 `--dry-run`**，
+   验"参数没掉、真能用"（`tests/run_tests.sh` D 节 7 条）。
+
+**判据 / 复现**：
+
+```sh
+sh cloud/relay.sh --ip 127.0.0.1 --port 9443 --tunnel-port 3090 --broker-port 3082 \
+  --local-port 3090 --user u --password pw --no-compose --dir /tmp/h --docker-cmd docker --dry-run 2>&1 |
+  sed -n 's/^HINT-CMD: //p' > /tmp/cmd                       # 抽出那一行
+sed -i "s/'<新密码>'/'pw2'/" /tmp/cmd
+sh -c "$(cat /tmp/cmd) --dry-run" >/dev/null; echo $?          # → 0（改之前：参数不全 → 落到 compose 模式 / 报错）
+grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run" 2>/dev/null)   # → 1（上游端口没被改回去）
+```
+
+**验证程度**：真机 + 本机各 1 次（用户先踩到，2026-10-07 修完在本机 dry-run 复现过
+"抽出来再跑=0"）。**教训（通用）**：**给用户复制的命令，永远只有一行、参数给全**；
+把分支判断留在脚本里，别留在文档里让人挑。

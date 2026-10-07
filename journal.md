@@ -399,3 +399,36 @@ harness（不能动他正在用的那个进程）；真手机扫码。
   → **302 → `/?token=6b15Sb…` → 303 + Set-Cookie → 200，body 34674 字节、
   `<title>DeepSeek Harness</title>`**；带 cookie 再打 `/` → 200、0 次跳转；
   `/go` → 302；老 token 地址照旧。U10 那条"没验的"到此闭合（真手机扫码仍没验）。
+
+---
+
+## 2026-10-07（下午，续三）用户实测两条反馈：二维码放大 + `passwd` 一条命令（ADR-0016）
+
+**反馈 1（二维码太小）**：`phone-qr.png` 原来是 1 模块 1 像素，29 模块就 29px，手机得放大才认。
+改了 `bin/dsh-qr`：加 `--scale N`（每模块几个像素）与 `--target-px`（默认 1024），
+`--png/--svg` 时默认自动 `scale = ceil(1024/模块数)`、不做插值；SVG 的 width/height 同步；
+`server` 用 `--border 4`（静默区 4 模块）。**实测**：重新生成的
+`~/.local/state/dsh-remote/phone-qr.png` = **1036×1036（37 模块 × 28 px，1 位灰度）**，
+SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/整数倍/≥1024/SVG/显式 scale）。
+
+**反馈 2（改密码教程看不懂 —— 这是我们的缺陷）**：用户照 `relay-password.txt` 的三步走，
+先被要 root、加 sudo 又被说"没有 docker compose"，而且那条命令是折行的，他只复制了半行。
+- 新增 `dsh-remote passwd`（ADR-0016）：云上探 docker 用法 → `sudo docker run --rm
+  caddy:2.11.4 caddy hash-password` 算哈希 → 远端脚本（`ssh … sh -s`）**只把 `basic_auth`
+  里那一行的 bcrypt 换成新的**（awk 精确匹配；找不到就 exit 3，**不整份重渲染**）→
+  `restart dsh-relay`（轮询到回 401，最多 20s）→ 只改 `relay-password.txt` 的 `PASSWORD=` 行
+  （600）→ **从家里验"新密码 200/302、旧密码 401"** → 打印手机怎么用新密码。
+- `relay.sh`：提示语改成 `mode_cmd()` **一行给全**（模式/端口/用户/--tunnel-port/--local-port/
+  --broker-port/--allow-ip/--no-compose/--dir/--docker-cmd），**dry-run 也打成 `HINT-CMD: …`**；
+  `relay-password.txt` 里的"三步"改成首选 `dsh-remote passwd` + 一行手工等价命令。
+- **真机实测两次**（`DSH_REMOTE_IFACE=eth1`）：改成临时密码 → **新 302 ✓ / 旧 401 ✓**；
+  再改回 `pELX…` → **新 302 ✓ / 旧 401 ✓**；改完固定地址跟随后 **200 + `<title>DeepSeek
+  Harness</title>`**、带 token 老地址 303、带 cookie 的 `/` 200/0 跳转；临时密码现在 401。
+  云上 `relay-password.txt` = 601 字节 / 600 / `PASSWORD=` 一行；Caddyfile 留了
+  `Caddyfile.bak-20261007-131656`、`…-131709` 两个备份（改密码两次）。
+- **踩到的坑（H23）**：dry-run 里那条 `HINT-CMD` 一开始是**空的** —— `mode_cmd()` 定义在
+  文件后半段，而 dry-run 在前面就 exit 了（函数要执行到定义处才存在）。把定义挪到 `dk()`
+  旁边就好了；测试正是抽这一行去复跑，所以第一次跑就抓出来了。
+- 测试：D 节 +7（抽 `HINT-CMD` 复跑 `--dry-run`，验参数没掉、上游端口一致）、L 节 +5、
+  **新 N 节 22**（passwd 正常路径 + docker 不可用 / 哈希算不出 / 密码带单引号 三条失败路径）。
+  全量 **400 通过 0 失败**。

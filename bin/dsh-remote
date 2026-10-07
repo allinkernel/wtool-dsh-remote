@@ -15,6 +15,7 @@
 #   dsh-remote notify-test     推一条测试消息到手机
 #   dsh-remote notify-enable   打开"会话卡住/跑完就推手机"（写配置目录的 hooks.json + profile patch）
 #   dsh-remote notify-disable  关掉它（把 patch 里那一段删掉）
+#   dsh-remote passwd          改中继的 basic auth 密码（云上只改那一行 + 重启 + 验旧/新）
 #   dsh-remote server          一条命令装好：云上中继 + 家里常驻隧道 + token broker + harness
 #                              （问几个问题 → 自检 → 部署 → 打印手机地址 + 二维码）
 #   dsh-remote cloud-install   真装到阿里云上（传 cloud/ → 起 caddy 容器 → 记下地址）
@@ -891,6 +892,171 @@ cmd_broker_uninstall() {
     say "token 文件 $(token_file) 留着（harness 函数还在写它）"
 }
 
+# ------------------------------------------------- 改密码（家里一条命令）
+# 为什么要有它：以前 relay-password.txt 里写的是"三步教程"，用户照做会撞两次墙
+# （relay.sh 先要 root、加 sudo 又说没有 docker compose），而且命令是**折行**的 ——
+# 只复制前半行就掉参数、被报"没有 compose"，指错方向（hazards H23）。
+# 这条命令：云上算哈希 → **只替换 Caddyfile 里 basic_auth 那一行**（不整份重渲染：
+# 重渲染会重新随机/改一堆无关东西，还会让容器 recreate）→ `docker restart` →
+# **从家里验旧密码被拒、新密码能过** → 同步云上 relay-password.txt（600）。
+relay_dir_conf() { conf_any relay_dir RELAY_DIR 2>/dev/null || printf '/home/mindul/dsh-relay'; }
+
+cloud_ssh() { # cloud_ssh <远端命令…>（BatchMode；用 conf 里的身份/端口）
+    _opts="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -p $ssh_port"
+    [ -n "$identity_key" ] && _opts="$_opts -i $identity_key"
+    # shellcheck disable=SC2086
+    ssh $_opts "${ssh_user}@${host}" "$@"
+}
+
+cloud_docker_cmd() { # 探出这台云上该用 `docker` 还是 `sudo docker`（H18）
+    if cloud_ssh 'docker info >/dev/null 2>&1' 2>/dev/null; then
+        printf 'docker'
+    elif cloud_ssh 'sudo -n docker info >/dev/null 2>&1' 2>/dev/null; then
+        printf 'sudo docker'
+    else
+        printf ''
+    fi
+}
+
+cmd_passwd() {
+    _user=
+    _password=
+    _dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --user)
+            _user=${2:-}
+            shift 2
+            ;;
+        --password)
+            _password=${2:-}
+            shift 2
+            ;;
+        --dry-run)
+            _dry=1
+            shift
+            ;;
+        *) die "passwd 不认识的参数：$1（--user / --password / --dry-run）" ;;
+        esac
+    done
+    host=$(conf_any cloud_host CLOUD_HOST) || die "remote.conf 里没有 cloud_host"
+    ssh_user=$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')
+    ssh_port=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
+    identity_key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
+    case $identity_key in '~/'*) identity_key="$HOME/${identity_key#\~/}" ;; esac
+    public_url=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+    _user=${_user:-$(conf_any web_user WEB_USER 2>/dev/null || printf 'dsh')}
+    _dir=$(relay_dir_conf)
+    case $_user in '' | *[!A-Za-z0-9_.-]*) die "用户名只能是字母数字和 _ . -：$_user" ;; esac
+
+    if [ -z "$_password" ]; then
+        printf '新密码（回车 = 自动生成 20 位随机）: ' >&2
+        IFS= read -r _password || _password=
+        [ -n "$_password" ] || _password=$(derive_password)
+    fi
+    case $_password in
+    *"'"*) die "密码里别用单引号（要塞进远程命令行，单引号最容易出事）" ;;
+    esac
+    case $_password in
+    *[!A-Za-z0-9_.@%+=:-]*) die "密码里别用引号/空格这类字符（要塞进远程命令行）" ;;
+    esac
+
+    say "云上        ${ssh_user}@${host}:${ssh_port}（目录 $_dir）"
+    say "用户名      $_user"
+    say "入口        ${public_url:-https://${host}:8443/}"
+    say ""
+
+    if [ "$_dry" = 1 ]; then
+        say "== --dry-run：会做这些（一个字节都不改）"
+        say "  ① 云上算哈希： <docker> run --rm caddy:2.11.4 caddy hash-password --plaintext '<新密码>'"
+        say "  ② 备份 $_dir/Caddyfile → Caddyfile.bak-<时间戳>，**只把 basic_auth 里 $_user 那行的哈希换掉**"
+        say "  ③ <docker> restart dsh-relay，等它回 401（最多 20 秒）"
+        say "  ④ 更新 $_dir/relay-password.txt 的 PASSWORD= 行（600）"
+        say "  ⑤ 从家里验：旧密码应 401、新密码应 200/302"
+        return 0
+    fi
+
+    _dk=$(cloud_docker_cmd)
+    [ -n "$_dk" ] || die "云上 docker 用不了（docker info 和 sudo -n docker info 都不行）"
+    say "== ① 云上算密码哈希（$_dk run --rm caddy:2.11.4）"
+    _hash=$(cloud_ssh "$_dk run --rm caddy:2.11.4 caddy hash-password --plaintext '$_password'" 2>/dev/null | tr -d '\r' | tail -n 1)
+    case $_hash in
+    '$2a$'* | '$2b$'* | '$2y$'*) ;;
+    *) die "没算出哈希（拿到的是：$_hash）—— 云上 caddy:2.11.4 镜像在吗？" ;;
+    esac
+    say "   ok（哈希已拿到，${#_hash} 字符）"
+
+    _old=$(cloud_ssh "sed -n 's/^PASSWORD=//p' '$_dir/relay-password.txt' 2>/dev/null | tail -n 1" 2>/dev/null | tr -d '\r')
+    _hostport=${public_url#https://}
+    _hostport=${_hostport%%/*}
+    [ -n "$_hostport" ] || _hostport="${host}:8443"
+    _port=${_hostport##*:}
+
+    say "== ② 只改 $_dir/Caddyfile 里 $_user 那行的哈希（先备份）"
+    # 远端脚本走 stdin：哈希/密码/用户名都是本地变量，避免在命令行里再拼一层引号
+    cloud_ssh sh -s <<EOF || return 1
+set -eu
+cd '$_dir'
+[ -f Caddyfile ] || { echo "  ✗ 没有 $_dir/Caddyfile" >&2; exit 1; }
+cp -f Caddyfile "Caddyfile.bak-\$(date +%Y%m%d-%H%M%S)"
+awk -v u='$_user' -v h='$_hash' '
+  BEGIN { done = 0 }
+  {
+    if (!done && \$1 == u && \$2 ~ /^\\\$2[aby]\\\$/) { sub(/\\\$2[aby]\\\$[^ \\t]*/, h); done = 1 }
+    print
+  }
+  END { if (!done) { print "  ✗ Caddyfile 里没有用户 " u " 的 bcrypt 哈希行" > "/dev/stderr"; exit 3 } }
+' Caddyfile > Caddyfile.new
+mv -f Caddyfile.new Caddyfile
+echo "   ok（旧 Caddyfile 备份在旁边）"
+echo "== ③ 重启 dsh-relay"
+$_dk restart dsh-relay >/dev/null
+i=0
+while [ "\$i" -lt 40 ]; do
+  c=\$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 -H 'Host: $_hostport' "https://127.0.0.1:$_port/" 2>/dev/null || true)
+  [ "\$c" = 401 ] && break
+  sleep 0.5
+  i=\$((i+1))
+done
+echo "   ok（容器回来了，HTTP \$c）"
+echo "== ④ 更新 relay-password.txt（只换 PASSWORD= 那一行）"
+if [ -f relay-password.txt ]; then
+  awk -v p='$_password' 'BEGIN{d=0} /^PASSWORD=/{print "PASSWORD=" p; d=1; next} {print} END{if(!d) print "PASSWORD=" p}' \\
+    relay-password.txt > relay-password.txt.new
+  mv -f relay-password.txt.new relay-password.txt
+else
+  printf 'URL=%s\\nUSER=%s\\nPASSWORD=%s\\n' '${public_url:-https://$_hostport/}' '$_user' '$_password' > relay-password.txt
+fi
+chmod 600 relay-password.txt
+echo "   ok（600）"
+EOF
+
+    say "== ⑤ 从家里验（真接口）"
+    _iface=${DSH_REMOTE_IFACE:-}
+    _cif=
+    [ -n "$_iface" ] && _cif="--interface $_iface"
+    _url=${public_url:-https://${host}:8443/}
+    # shellcheck disable=SC2086
+    _new=$(curl -sk $_cif -o /dev/null -w '%{http_code}' --max-time 12 -u "$_user:$_password" "$_url" 2>/dev/null || printf '000')
+    case $_new in
+    200 | 302 | 303) say "   新密码：HTTP $_new ✓（401 = 没生效；000 = 网络/安全组）" ;;
+    *) warn "   新密码：HTTP $_new（预期 200/302）—— 用 dsh-remote tunnel-status --probe 看看中继" ;;
+    esac
+    if [ -n "$_old" ] && [ "$_old" != "$_password" ]; then
+        # shellcheck disable=SC2086
+        _oldc=$(curl -sk $_cif -o /dev/null -w '%{http_code}' --max-time 12 -u "$_user:$_old" "$_url" 2>/dev/null || printf '000')
+        case $_oldc in
+        401) say "   旧密码：401 ✓（已经被换掉了）" ;;
+        *) warn "   旧密码：HTTP $_oldc（预期 401 —— 没换掉？）" ;;
+        esac
+    fi
+    say ""
+    say "手机怎么用："
+    say "  打开 $_url ，basic auth 用户名 $_user / 新密码（上面那个）"
+    say "  已经登过的浏览器可能记着旧密码 → 清掉这个站点的密码，或者换无痕窗口"
+    say "  固定地址不用换：token 由家里的 broker 补（ADR-0014）"
+}
+
 cmd_systemd() { # 旧名字：保留，等价 tunnel-install --no-enable（以前就是"只生成不 enable"）
     say "（旧名字）dsh-remote systemd = dsh-remote tunnel-install --no-enable"
     say "  注意：单元名从 dsh-remote-tunnel.service 换成了 $UNIT_NAME（配置在 $CONF）"
@@ -1303,7 +1469,8 @@ server_qr() { # server_qr <url>
     fi
     if command -v python3 >/dev/null 2>&1 && [ -f "$SELF_DIR/dsh-qr" ]; then
         say "（没装 qrencode，用自带的 dsh-qr 画；这张码也能扫）"
-        python3 "$SELF_DIR/dsh-qr" --ecc M --border 2 \
+        # 手机上扫的那张图：静默区 4 模块、每模块整数倍、短边 ≥1024px（dsh-qr 自动挑）
+        python3 "$SELF_DIR/dsh-qr" --ecc M --border 4 \
             --png "$STATE_DIR/phone-qr.png" --svg "$STATE_DIR/phone-qr.svg" "$1" ||
             warn "二维码画不出来（不影响用：地址在上面）"
         say "  二维码图片：$STATE_DIR/phone-qr.png（SVG 同名 .svg）—— 打不开就自己打开图片"
@@ -1635,6 +1802,10 @@ tunnel-uninstall)
 tunnel-status)
     shift
     cmd_tunnel_status "$@"
+    ;;
+passwd)
+    shift
+    cmd_passwd "$@"
     ;;
 token-broker)
     shift

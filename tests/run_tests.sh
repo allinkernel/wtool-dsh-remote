@@ -293,6 +293,29 @@ check_contains "--no-compose：数据挂在 --dir 指定的目录" "$TMP/relaydi
 check_contains "--no-compose：提示里说要先 rm -f（可重复跑）" "docker rm -f dsh-relay" "$out"
 
 # ---------------------------------------------------------------- E dsh-remote
+# 提示语里那条"手工等价命令"必须**真能跑通**（不是字符串断言）：dry-run 会把它打成
+# `HINT-CMD: …`；这里把它抽出来、换掉密码占位符、追加 --dry-run 再跑一遍。
+mkdir -p "$TMP/hint"
+sh "$proj/cloud/relay.sh" --ip 127.0.0.1 --port 9443 --tunnel-port 3090 --broker-port 3082 \
+    --local-port 3090 --user u --password pw --no-compose --dir "$TMP/hint" --docker-cmd docker \
+    --dry-run >"$TMP/hint.out" 2>"$TMP/hint.err"
+hint=$(sed -n 's/^HINT-CMD: //p' "$TMP/hint.err" | head -n 1)
+check_contains "relay.sh：dry-run 也打印那条可复制的改密码命令" "--no-compose" "$hint"
+check_contains "relay.sh：那条命令带了 --dir" "--dir $TMP/hint" "$hint"
+check_contains "relay.sh：那条命令带了 --docker-cmd" "--docker-cmd 'docker'" "$hint"
+check_contains "relay.sh：那条命令带了模式参数（--ip）" "--ip 127.0.0.1" "$hint"
+hint2=$(printf '%s' "$hint" | sed "s/'<新密码>'/'pw2'/")
+# shellcheck disable=SC2086
+sh -c "$hint2 --dry-run" >"$TMP/hint2.out" 2>/dev/null
+check "relay.sh：提示里那条命令本机 --dry-run 跑得通（参数没掉）" "0" "$?"
+if grep -q "{{[A-Z_]\{1,\}}}" "$TMP/hint2.out"; then
+    bad "relay.sh：提示命令渲染后没有残留占位符" "$(grep -o "{{[A-Z_]\{1,\}}}" "$TMP/hint2.out" | head -1)"
+else
+    ok "relay.sh：提示命令渲染后没有残留占位符"
+fi
+check_contains "relay.sh：提示命令复现的是同一套上游（broker 3082）" \
+    "reverse_proxy @entry 127.0.0.1:3082" "$(cat "$TMP/hint2.out")"
+
 printf 'E. dsh-remote 子命令\n'
 remote=$proj/bin/dsh-remote
 export DSH_REMOTE_CONF="$TMP/remote.conf"
@@ -1120,7 +1143,7 @@ python3 "$qrbin" --ecc M --border 2 "hi" >"$TMP/l-term.txt" 2>/dev/null
 check "dsh-qr：终端画是半块字符（(21+4+1)/2 = 13 行）" "13" "$(wc -l <"$TMP/l-term.txt" | tr -d ' ')"
 check_contains "dsh-qr：终端画自带前景/背景色（ESC 序列）" "$(printf '\033')[3" "$(head -1 "$TMP/l-term.txt")"
 # PNG / SVG 落盘（PNG 是 1 位灰度、手写的 zlib+struct）
-python3 "$qrbin" --ecc M --border 4 --no-terminal --png "$TMP/l.png" --svg "$TMP/l.svg" "hi" >/dev/null 2>&1
+python3 "$qrbin" --ecc M --border 4 --scale 1 --no-terminal --png "$TMP/l.png" --svg "$TMP/l.svg" "hi" >/dev/null 2>&1
 l_png=$(python3 -W ignore -c '
 import struct, sys
 with open(sys.argv[1], "rb") as fh:
@@ -1130,8 +1153,42 @@ w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
 assert (depth, ctype) == (1, 0), (depth, ctype)
 print("%dx%d" % (w, h))
 ' "$TMP/l.png" 2>&1)
-check "dsh-qr：PNG 是 1 位灰度、尺寸 21+8=29" "29x29" "$l_png"
+check "dsh-qr：--scale 1 时 PNG 是「模块=像素」（21+8=29）、1 位灰度" "29x29" "$l_png"
 check_contains "dsh-qr：SVG 是纯文本、带 viewBox" 'viewBox="0 0 29 29"' "$(cat "$TMP/l.svg")"
+
+# 高分辨率：手机扫得动的那张图（默认把短边做到 ≥1024px、每模块整数倍、静默区默认 4）
+l_url="https://123.56.158.212:8443"
+l_mod=$(python3 "$qrbin" --ecc M --border 4 --matrix --no-terminal "$l_url" 2>/dev/null | wc -l | tr -d ' ')
+python3 "$qrbin" --ecc M --border 4 --no-terminal --png "$TMP/l-big.png" --svg "$TMP/l-big.svg" "$l_url" >/dev/null 2>&1
+l_expect=$((l_mod * ((1024 + l_mod - 1) / l_mod)))
+l_got=$(python3 -W ignore -c '
+import struct, sys
+with open(sys.argv[1], "rb") as fh:
+    d = fh.read()
+w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
+print("%dx%d depth=%d ctype=%d" % (w, h, depth, ctype))
+' "$TMP/l-big.png" 2>&1)
+check "dsh-qr：大图 PNG = 模块数×整数 scale（$l_mod 模块 → ${l_expect}px）、1 位灰度" \
+    "${l_expect}x${l_expect} depth=1 ctype=0" "$l_got"
+if [ "$l_expect" -ge 1024 ]; then
+    ok "dsh-qr：大图短边 ≥1024px（手机上不用放大也扫得动）"
+else
+    bad "dsh-qr：大图短边 ≥1024px（手机上不用放大也扫得动）" "$l_expect"
+fi
+check_contains "dsh-qr：SVG 的 width/height 与 PNG 同步" \
+    "width=\"$l_expect\" height=\"$l_expect\"" "$(cat "$TMP/l-big.svg")"
+check_contains "dsh-qr：SVG 用模块坐标当 viewBox（矢量、放大不糊）" \
+    "viewBox=\"0 0 $l_mod $l_mod\"" "$(cat "$TMP/l-big.svg")"
+# 显式 --scale 也要听
+python3 "$qrbin" --ecc M --border 1 --scale 3 --no-terminal --png "$TMP/l-s3.png" "$l_url" >/dev/null 2>&1
+check "dsh-qr：--scale 3 + border 1 → (29+2)*3 = 93px" "93x93 depth=1 ctype=0" \
+    "$(python3 -W ignore -c '
+import struct, sys
+with open(sys.argv[1], "rb") as fh:
+    d = fh.read()
+w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
+print("%dx%d depth=%d ctype=%d" % (w, h, depth, ctype))
+' "$TMP/l-s3.png" 2>&1)"
 
 # ------------------------------------------------- M server（一条命令装好）
 printf 'M. dsh-remote server：自检失败给指引 / --dry-run 不写 / 全参非交互跑通\n'
@@ -1287,6 +1344,105 @@ PATH="$mstub:$PATH" DSH_REMOTE_CONF="$mconf" DSH_REMOTE_UNIT_DIR="$TMP/munits" \
 check "dsh-remote-server（薄封装）退出 0" "0" "$?"
 check_contains "薄封装走的是同一条路（打印计划）" "--no-compose" "$(cat "$TMP/m9.out")"
 check_contains "薄封装也用 cloud_host 作默认" "203.0.113.7" "$(cat "$TMP/m9.out")"
+
+# ------------------------------------------------- N 改密码（dsh-remote passwd）
+printf 'N. dsh-remote passwd：只改哈希那一行 / 验旧新 / 密码文件同步（全用桩）\n'
+nstub="$TMP/nstub"
+mkdir -p "$nstub"
+cat >"$nstub/ssh" <<'STUB'
+#!/bin/sh
+printf 'SSH: %s\n' "$*" >>"$N_LOG"
+cmd=
+for a in "$@"; do cmd=$a; done
+case $* in
+*"sh -s"*) cat >>"$N_SCRIPT"; exit 0 ;;
+esac
+case $cmd in
+*"docker info"*) [ "${N_DOCKER:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"hash-password"*) [ "${N_HASH_OK:-1}" = 1 ] && printf '%s\n' "${N_HASH:-\$2a\$14\$FAKEHASHFAKEHASHFAKEHASHFAKEHASHFAKEHASHFAKEHASH}" || printf 'boom\n' ; exit 0 ;;
+*"PASSWORD="*) printf '%s\n' "${N_OLDPW:-oldpw-from-file}"; exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$nstub/curl" <<'STUB'
+#!/bin/sh
+printf 'CURL: %s\n' "$*" >>"$N_LOG"
+cred=
+prev=
+for a in "$@"; do
+    [ "$prev" = "-u" ] && cred=$a
+    prev=$a
+done
+case $cred in
+*":${N_NEWPW:-NewPass123}") printf '%s' "${N_NEWCODE:-302}" ;;
+*) printf '%s' "${N_OLDCODE:-401}" ;;
+esac
+STUB
+chmod +x "$nstub/ssh" "$nstub/curl"
+export N_LOG="$TMP/n.log" N_SCRIPT="$TMP/n-script.txt" N_HASH_OK=1 N_DOCKER=1 N_OLDPW=oldpw-from-file N_NEWPW=NewPass123 N_NEWCODE=302 N_OLDCODE=401
+: >"$N_LOG"
+: >"$N_SCRIPT"
+nconf="$TMP/n-remote.conf"
+cat >"$nconf" <<EOF
+cloud_host=203.0.113.7
+cloud_user=alice
+cloud_ssh_port=22
+identity=~/.ssh/id_x
+public_url=https://203.0.113.7:9443/
+EOF
+nrun() {
+    PATH="$nstub:$PATH" DSH_REMOTE_CONF="$nconf" DSH_REMOTE_HOME="$TMP/nhome" \
+        DSH_REMOTE_IFACE= "$remote" "$@"
+}
+
+# ① --dry-run：一个字节都不改、不碰云
+: >"$N_LOG"
+nrun passwd --password NewPass123 --dry-run >"$TMP/n1.out" 2>&1
+check "passwd --dry-run 退出 0" "0" "$?"
+n1=$(cat "$TMP/n1.out")
+check_contains "dry-run 说清会只改哈希那一行" "只把 basic_auth 里 dsh 那行的哈希换掉" "$n1"
+check_contains "dry-run 说清会验旧/新" "旧密码应 401" "$n1"
+check "dry-run 没连云（没调 ssh）" "0" "$(grep -c SSH "$N_LOG" || true)"
+
+# ② 真跑（桩）：算哈希 → 只改那一行 → restart → 验旧/新
+: >"$N_LOG"
+: >"$N_SCRIPT"
+nrun passwd --password NewPass123 >"$TMP/n2.out" 2>&1
+check "passwd 退出 0" "0" "$?"
+nlog=$(cat "$N_LOG")
+check_contains "在云上用真实镜像算哈希（不是本地）" "run --rm caddy:2.11.4 caddy hash-password --plaintext 'NewPass123'" "$nlog"
+check_contains "远端脚本里是 awk 精确换哈希（不是整份重渲染）" "sub(/\\\$2[aby]\\\$" "$(cat "$N_SCRIPT")"
+check_contains "远端脚本只重启 dsh-relay" "restart dsh-relay" "$(cat "$N_SCRIPT")"
+check_contains "远端脚本同步 relay-password.txt" "relay-password.txt" "$(cat "$N_SCRIPT")"
+check_contains "远端脚本把密码文件 chmod 600" "chmod 600 relay-password.txt" "$(cat "$N_SCRIPT")"
+n2=$(cat "$TMP/n2.out")
+check_contains "验新密码（302 = 过）" "新密码：HTTP 302 ✓" "$n2"
+check_contains "验旧密码（401 = 已被换掉）" "旧密码：401 ✓" "$n2"
+check_contains "打印手机怎么用新密码" "手机怎么用" "$n2"
+
+# ③ 旧密码 == 新密码时不打"旧密码被换掉"（免得自欺）
+: >"$N_LOG"
+N_OLDPW=NewPass123 nrun passwd --password NewPass123 >"$TMP/n3.out" 2>&1
+check "旧密码和新密码一样时退出 0" "0" "$?"
+check_not_contains "旧密码==新密码：不谎报「已经被换掉」" "旧密码：401" "$(cat "$TMP/n3.out")"
+
+# ④ 云上 docker 用不了 → 非 0 + 说清
+N_DOCKER=0 nrun passwd --password NewPass123 >"$TMP/n4.out" 2>&1
+check "云上 docker 不可用 → 非 0" "1" "$?"
+check_contains "说清是 docker 的问题" "docker 用不了" "$(cat "$TMP/n4.out")"
+
+# ⑤ 哈希算不出来（镜像不在/太老）→ 非 0，别把旧哈希改坏
+N_DOCKER=1 N_HASH_OK=0 nrun passwd --password NewPass123 >"$TMP/n5.out" 2>&1
+check "哈希算不出来 → 非 0" "1" "$?"
+check_contains "提示去查 caddy 镜像" "caddy:2.11.4 镜像在吗" "$(cat "$TMP/n5.out")"
+
+# ⑥ 密码里有引号 → 直接拒（要塞进远程命令行）
+nrun passwd --password "bad'pw" >"$TMP/n6.out" 2>&1
+check "密码里有单引号 → 非 0" "1" "$?"
+check_contains "拒绝时说清为什么（单引号）" "别用单引号" "$(cat "$TMP/n6.out")"
+
+# ⑦ help 里有这条命令
+check_contains "help 里有 passwd" "dsh-remote passwd" "$("$remote" help)"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"

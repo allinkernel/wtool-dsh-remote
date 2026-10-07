@@ -29,6 +29,7 @@
 | 13 | [隧道常驻用 systemd `--user` 单元 + ssh 自带保活（不用 autossh，也不在云上守）](0013-tunnel-residency-systemd-user-not-autossh.md) | 2026-10-07 U3：含"谁来重启 / 重连耗时期望"与 `tunnel-install` 的顺序 |
 | 14 | [手机收藏一个不带 token 的固定地址：家里放一个"只做 302"的 token broker](0014-fixed-phone-url-token-broker.md) | 2026-10-07：含 Caddy 那两条 `not` 为什么缺一不可 |
 | 15 | [一条命令装好：`dsh-remote server`（自检 → 部署 → 常驻 → 二维码）](0015-one-command-server-install.md) | 2026-10-07：含为什么自己实现 QR、二维码为什么不带 token |
+| 16 | [改密码做成一条命令（`dsh-remote passwd`），而且只换那一行哈希](0016-passwd-one-command-and-single-line-hints.md) | 2026-10-07：用户实测"三步教程"走不通之后；含提示语必须一行能复制 |
 
 > **1–11 是同一条线（2026-09-20 的初版 `13734e3` + 2026-10-04 的修复）**，
 > 2026-10-07 补记成 ADR。当时只写了 `README.md` 的"为什么这么设计"一节和代码注释，

@@ -7,7 +7,8 @@ ISO/IEC 18004 自己实现一遍（字节模式、版本 1–40、纠错 L/M/Q/H
 输出三样东西：终端里的半块字符画、PNG（1 位灰度，zlib+struct 手写）、SVG（纯文本）。
 
     dsh-qr "https://example.com:8443"                 # 终端里画
-    dsh-qr --ecc M --border 2 --png out.png --svg out.svg "…"
+    dsh-qr --ecc M --border 4 --png out.png --svg out.svg "…"
+    # --png/--svg 默认把短边做到 ≥1024px（每模块整数倍，手机上扫得动）
 
 **不复制第三方代码**：算法按标准写，规格表（纠错分块、对齐图案位置）是标准里的常数，
 写完之后拿 `tests/qr_test.sh` 跟一份独立实现（npm 自带的 qrcode-terminal 里那份
@@ -455,9 +456,14 @@ def render_terminal(mat, out=sys.stdout) -> None:
     out.write("\n".join(lines) + "\n")
 
 
-def render_png(mat, path: str) -> None:
-    """1 位灰度 PNG（0 = 黑 = 码点，1 = 白 = 底）。zlib/struct 都是标准库。"""
-    n = len(mat)
+def render_png(mat, path: str, scale: int = 1) -> None:
+    """1 位灰度 PNG（0 = 黑 = 码点，1 = 白 = 底）。zlib/struct 都是标准库。
+
+    `scale` 是**每个模块占几个像素**（整数倍）：手机上扫的图不能是 1 模块 1 像素 ——
+    21 模块的版本只有 21px，扫码器要放大才认（2026-10-07 用户实测反馈）。
+    宽 = 高 = 模块数 × scale。**不做插值/抗锯齿**：每个模块必须是干净的整数方块。
+    """
+    n = len(mat) * scale
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + tag + data +
@@ -465,19 +471,20 @@ def render_png(mat, path: str) -> None:
 
     raw = bytearray()
     for row in mat:
-        bits = 0
-        nbits = 0
-        line = bytearray()
+        # 一行模块 → 一行像素位（每个模块重复 scale 次；1 = 白、0 = 黑）
+        bits = bytearray()
         for dark in row:
-            bits = (bits << 1) | (0 if dark else 1)
-            nbits += 1
-            if nbits == 8:
-                line.append(bits)
-                bits, nbits = 0, 0
-        if nbits:
-            line.append(bits << (8 - nbits))
-        raw.append(0)  # 过滤器：无
-        raw.extend(line)
+            bits.extend([0 if dark else 1] * scale)
+        line = bytearray()
+        for i in range(0, n, 8):
+            byte = 0
+            for j in range(8):
+                k = i + j
+                byte = (byte << 1) | (bits[k] if k < n else 1)
+            line.append(byte)
+        for _ in range(scale):  # 同一行像素重复 scale 次（高度方向也一样是整数倍）
+            raw.append(0)       # 过滤器：无
+            raw.extend(line)
     png = (b"\x89PNG\r\n\x1a\n" +
            chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 1, 0, 0, 0, 0)) +
            chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
@@ -486,7 +493,12 @@ def render_png(mat, path: str) -> None:
         fh.write(png)
 
 
-def render_svg(mat, path: str) -> None:
+def render_svg(mat, path: str, scale: int = 1) -> None:
+    """纯文本 SVG：viewBox 用模块坐标（矢量缩放），width/height 给像素尺寸。
+
+    `scale` 只影响 width/height 两个属性 —— 手机上打开时图片是大的（不会显示成
+    21px 的小点），放大也不糊（矢量）。
+    """
     n = len(mat)
     rects = []
     for y, row in enumerate(mat):
@@ -501,9 +513,11 @@ def render_svg(mat, path: str) -> None:
             else:
                 x += 1
     svg = ('<?xml version="1.0" encoding="UTF-8"?>\n'
-           '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" shape-rendering="crispEdges">\n'
+           '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
+           'shape-rendering="crispEdges">\n'
            '  <rect width="100%%" height="100%%" fill="#fff"/>\n'
-           '  <g fill="#000">%s</g>\n</svg>\n' % (n, n, "".join(rects)))
+           '  <g fill="#000">%s</g>\n</svg>\n'
+           % (n * scale, n * scale, n, n, "".join(rects)))
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(svg)
 
@@ -516,6 +530,10 @@ def main(argv) -> int:
     ap.add_argument("--png", help="另存一份 PNG 到这个路径")
     ap.add_argument("--svg", help="另存一份 SVG 到这个路径")
     ap.add_argument("--no-terminal", action="store_true", help="别往终端画")
+    ap.add_argument("--scale", type=int, default=0,
+                    help="每个模块占几个像素（默认自动：把短边做到 ≥ --target-px）")
+    ap.add_argument("--target-px", type=int, default=1024,
+                    help="自动挑 scale 时的目标短边像素（默认 1024；手机上扫足够）")
     ap.add_argument("--mask", type=int, choices=range(8), help="强制某个掩码（默认按标准罚分挑）")
     ap.add_argument("--version", type=int, help="只看这一版够不够放（默认自动挑最小的一版）")
     ap.add_argument("--matrix", action="store_true", help="打印 0/1 矩阵（测试用）")
@@ -528,11 +546,15 @@ def main(argv) -> int:
         ap.error("要编码的内容是空的")
 
     qr = QrCode(text, args.ecc, args.mask)
-    mat = qr.matrix(max(0, args.border))
+    border = max(0, args.border)
+    mat = qr.matrix(border)
+    scale = args.scale
+    if scale <= 0:
+        scale = max(1, -(-args.target_px // len(mat)))  # ceil(目标 / 模块数)
     if args.png:
-        render_png(mat, args.png)
+        render_png(mat, args.png, scale)
     if args.svg:
-        render_svg(mat, args.svg)
+        render_svg(mat, args.svg, scale)
     if args.matrix:
         for row in mat:
             sys.stdout.write("".join("1" if v else "0" for v in row) + "\n")
@@ -541,7 +563,9 @@ def main(argv) -> int:
             sys.stderr.write("（扫不出来的话把终端字号调小一点；或者用 --png 存成图片看）\n")
         render_terminal(mat)
     if args.png or args.svg:
-        sys.stderr.write("版本 %d / 纠错 %s / %dx%d 模块\n" % (qr.version, qr.ecc, qr.size, qr.size))
+        dim = len(mat)
+        sys.stderr.write("版本 %d / 纠错 %s / %d×%d 模块（含静默区 %d）→ 图片 %d×%d px（每模块 %d px）\n"
+                         % (qr.version, qr.ecc, qr.size, qr.size, border, dim * scale, dim * scale, scale))
     return 0
 
 

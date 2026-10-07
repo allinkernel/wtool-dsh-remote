@@ -162,6 +162,33 @@ esac
 DOCKER=${DOCKER_CMD:-docker}
 DOCKER_BIN=${DOCKER%% *}
 
+# 改密码/重渲染要用的那条命令：**按检测到的模式给全参数、只给一行**。
+# 别罗列三条分支、也别用 `\\` 折行 —— 用户只复制前半行就会掉参数，然后被
+# "没有 docker compose" 指到错误方向（hazards H23）。dry-run 也会打印它，
+# 测试拿它去本机 `--dry-run` 跑一遍验收。
+mode_cmd() {
+    # 把**所有会影响渲染的参数**都给全（不然重跑一次就把端口/白名单改回去了）
+    set -- $(mode_flag) --port "$PORT" --user "$CADDY_USER" \
+        --tunnel-port "$TUNNEL_PORT" --local-port "$LOCAL_PORT" --broker-port "$BROKER_PORT"
+    for a in $ALLOW_IPS; do
+        set -- "$@" --allow-ip "$a"
+    done
+    if [ "$NO_COMPOSE" = 1 ]; then
+        printf "sh cloud/relay.sh%s --no-compose --dir %s --docker-cmd '%s' --password '<新密码>'" \
+            "$(printf ' %s' "$@")" "$DIR" "$DOCKER"
+    else
+        printf "sudo sh relay.sh%s --password '<新密码>'" "$(printf ' %s' "$@")"
+    fi
+}
+
+mode_flag() {
+    if [ "$MODE" = domain ]; then
+        printf ' --domain %s --email %s' "$DOMAIN" "$EMAIL"
+    else
+        printf ' --ip %s' "$IP"
+    fi
+}
+
 dk() { # 所有 docker 调用都走这里
     # shellcheck disable=SC2086
     $DOCKER "$@"
@@ -318,6 +345,7 @@ if [ "$DRY_RUN" = 1 ]; then
         say "    -v $DIR/data:/data -v $DIR/config:/config $CADDY_IMAGE"
     fi
     say ""
+    say "HINT-CMD: $(mode_cmd)"
     say "（dry-run 只打印 Caddyfile 到 stdout；真跑就去掉 --dry-run）"
     exit 0
 fi
@@ -425,14 +453,20 @@ URL=$url
 USER=$CADDY_USER
 PASSWORD=$CADDY_PASSWORD
 
-# 改密码三步：
-#   1) 云上：cd $DIR && sh cloud/relay.sh $pw_mode --port $PORT --password '<新密码>' \
-#            --no-compose --dir $DIR --docker-cmd '$DOCKER'
-#   2) 家里：dsh-remote tunnel-status --probe    # 看 broker / 隧道还正常
-#   3) 手机：浏览器里清掉这个站点的 basic auth（或换无痕窗口），用新密码登一次
+# 改密码（推荐：在家里一条命令就够，它会算哈希、只换下面那行的哈希、重启容器、
+#         验"旧密码被拒 + 新密码能过"，并同步这个文件）：
+#   dsh-remote passwd
+#
+# 手工等价（不装工具时用）：先 cd $DIR，再把下面**这一整行**复制过去执行
+# （别只复制半行 —— 掉参数会被报成"没有 docker compose"，见 hazards H23）：
+#   $(mode_cmd)
 PWEOF
 chmod 600 -- "$pw_file" 2>/dev/null || true
 
+say ""
+say "改密码（在家里一条命令）：dsh-remote passwd"
+say "手工等价（在云上 ${DIR} 里跑这一整行；<新密码> 自己换）："
+say "  $(mode_cmd)"
 say ""
 say "================================================================"
 say "手机收藏这个地址：$url"
@@ -456,7 +490,12 @@ say "把 $url/ 写进家里 ~/.config/dsh-remote/remote.conf 的 public_url（cl
 say ""
 say "还要做的两件事（脚本做不了）："
 say "  1. 阿里云控制台安全组：只放行 $PORT/tcp 和 22/tcp（22 只放你家出口 IP）"
-say "     —— 隧道端口 $TUNNEL_PORT 和 harness 端口 $LOCAL_PORT 绝对不要开"
-say "  2. 手机第一次打开会：basic auth 一次 → 再贴一次 dsh web 打印的带 token 地址"
-say "     （dsh-remote serve 会把那个地址存到 ~/.local/state/dsh-remote/web-url.txt）"
+say "     —— 隧道端口 $TUNNEL_PORT / token broker 端口 $BROKER_PORT / harness 端口 $LOCAL_PORT 绝对不要开"
+say "  2. 家里的 harness 要用 dsh-remote 装的 env 里的 harness 函数起（token 才有地方写，"
+say "     broker 才能把不带 token 的固定地址补成带 token 的）；老实例不用重启也行："
+say "     把 dsh-remote 装到 PATH 上，之后新起的那个实例会自动写 token"
+say ""
+say "改密码（一条命令，在家这头跑）：dsh-remote passwd"
+say "  手工等价（在云上 $DIR 里跑这一整行；<新密码> 自己换）："
+say "  $(mode_cmd)"
 say "================================================================"
