@@ -663,3 +663,165 @@ curl -sk --interface eth1 -u "dsh:$(sed -n 's/^PASSWORD=//p' relay-password.txt)
 **授权边界**：这次重渲染是**上级明确授权的一次例外**（用户的三条硬约束里"只在
 `/home/mindul` 下操作" + "特权动作只有 `sudo docker`"允许它）；**云上默认仍然是只读**，
 下次别顺手改（H12 的禁区清单不变）。
+
+**加强（2026-10-07 稍后，ADR-0015）**：根因已经堵住了 —— **`relay.sh` 现在自己写
+`$DIR/relay-password.txt`（600）**，谁重渲染谁负责，不再依赖"人手记得更新"。
+配合"不给 `--password` 就随机"的既有行为：**要保住原密码就必须显式传**，
+读文件传参前先验非空（空串会静默走随机分支 —— H21 就是这么来的）。
+判据不变：带密码打入口要拿到家里 dsh web 的 401 原文（68 字节）。
+
+---
+
+## H18. 能免密 `sudo` ≠ 能直接跑 `docker`：两条要分开探
+
+**现象（2026-10-07 真机跑 `dsh-remote server` 时撞到）**：自检里 `sudo -n true` 通过、
+`command -v docker` 也通过，紧接着却打印
+
+```
+  docker  daemon 没反应（docker info）—— 云上 systemctl status docker 看看
+自检没过
+```
+
+而那台机器上 `sudo docker info` 明明是好的（container 一直在跑）。
+
+**根因**：`mindul` **不在 docker 组**（`/var/run/docker.sock` 只有 root/docker 组能碰），
+所以裸 `docker info` 一定失败；`server` 第一版把"免密 sudo 可用"当成了"docker 可直接用"，
+于是把 `docker` 当命令去探，探到失败又把它归因成"daemon 没反应"。
+
+**修法**：分开探、按结果选命令（`bin/dsh-remote` 的 `cmd_server`）：
+
+1. `docker info` 通 → 用 `docker`；
+2. 否则 `sudo -n docker info` 通 → 用 `sudo docker`（并把这条命令传给 `relay.sh --docker-cmd`）；
+3. 都不通 → 打印 `systemctl status docker` + sudoers 那两行，停。
+
+**判据 / 复现**：
+
+```sh
+ssh <云上> 'docker info >/dev/null 2>&1; echo "docker=$?"; sudo -n docker info >/dev/null 2>&1; echo "sudo docker=$?"; id -nG'
+# 那台 2026-10-07 实测：docker=1（Permission denied）、sudo docker=0、组里没有 docker
+```
+
+**验证程度**：真机实测 1 次（第一版失败 → 改完重跑通过，日志里 `--docker-cmd 'sudo docker'`）。
+**教训**：探针要探**真正要执行的那条命令**，别探它的"上级能力"。
+
+---
+
+## H19. `relay.sh --dir` 指向一个还不存在的目录：`set -eu` 下一行就退出
+
+**现象（2026-10-07 在本机跑本地镜像时撞到）**：
+
+```
+== 落盘 /tmp/e2e/relay/Caddyfile
+cloud/relay.sh: 329: cannot create /tmp/e2e/relay/Caddyfile: Directory nonexistent
+```
+
+脚本**没有**继续，也没有把目录建出来（`mkdir -p "$DIR/logs" …` 那行在它后面）。
+
+**根因**：`--dir` 目录以前是"人先手工建好"的（云上那次就是），所以真跑路径里
+**先写 Caddyfile、后 `mkdir -p $DIR/{logs,data,config}`** 这个顺序一直没暴露：
+`set -eu` 碰到重定向失败直接退出。危险的是它**不是**无声的坏结果 —— 是"写到一半退出"，
+容器可能已经 rm 掉、Caddyfile 却是空/旧/不存在。
+
+**修法**：写之前先 `mkdir -p -- "$DIR"`（建不出来就 `die` 并说清 `--dir` 给对没有）。
+
+**判据 / 复现**：
+
+```sh
+rm -rf /tmp/x && sh cloud/relay.sh --ip 127.0.0.1 --port 9443 --tunnel-port 3090 \
+  --broker-port 3082 --local-port 3090 --password pw --no-compose --dir /tmp/x --docker-cmd docker
+# 改之前：rc≠0 + "Directory nonexistent"；改之后：rc=0 + /tmp/x/Caddyfile 与 relay-password.txt 都在
+```
+
+**验证程度**：本机实测 1 次（改完重跑通过）。云上那条路没再复现（目录一直在）。
+
+---
+
+## H20. `ssh … | tee log` 的退出码是 **tee** 的：云上部署失败会被吞掉
+
+**现象（2026-10-07 真机）**：`dsh-remote server` 跑到云上部署那步，`relay.sh` 其实
+**rc=2 挂了**（H19 那个 bug），但主命令继续往下走、还打印"手机怎么用"，
+看起来一切正常 —— 只有回头翻日志才发现密码文件被截成了 0 字节。
+
+**根因**：代码写的是
+
+```sh
+if ! ssh … "$rcmd" 2>&1 | tee "$out"; then …
+```
+
+POSIX sh 里管道的 `$?` 是**最后一个命令**（`tee`）的退出码，`ssh` 的失败被丢了。
+
+**修法**：重定向到文件、判 `$?`，再把文件打出来（或者用 shell 自己的 `PIPESTATUS`，
+但那是 bash 的，dash 没有）：
+
+```sh
+ssh … "$rcmd" >"$out" 2>&1
+rc=$?
+cat -- "$out" || true
+[ "$rc" -eq 0 ] || { warn "云上那步没成功（rc=$rc）"; return 1; }
+```
+
+回归断言：`tests/run_tests.sh` M 节里有一条"假 relay.sh rc=2 → server 必须非 0"。
+
+**验证程度**：真机踩到 1 次（随后改掉、加了用例）；本地桩上验证 1 次。
+
+---
+
+## H21. `--password ""` 会**静默**走"随机生成"分支：读空文件时最容易中
+
+**现象（2026-10-07，我自己造成的）**：想"用文件里的密码重渲染"，写成
+
+```sh
+--password "$(sed -n 's/^PASSWORD=//p' relay-password.txt)"
+```
+
+而那个文件当时已经被上一次失败的运行**截成了 0 字节**（H19）→ `sed` **成功但输出为空**
+（`|| 兜底` 不会触发）→ `relay.sh` 里 `[ -n "$CADDY_PASSWORD" ] || CADDY_PASSWORD=$(gen_password)`
+把它当成"没给"，**换了一个新密码**。结果是入口密码被换了，而人以为还是原来那个。
+
+**根因**：`sed` 读一个空文件返回 0；`$()` 得到空串与"没传参"在脚本里长得一模一样。
+
+**修法**：
+
+1. 用文件里的值之前**先验非空**：
+
+   ```sh
+   pw=$(sed -n 's/^PASSWORD=//p' "$f"); [ -n "$pw" ] || die "密码文件是空的：$f"
+   ```
+2. `relay.sh` 现在**自己写** `relay-password.txt`（ADR-0015），不再有"人手写、脚本不更新"
+   的漂移来源；
+3. 换密码这种动作，事后必须**验一次**（带密码打入口拿到家里 dsh web 的 401 原文）。
+
+**判据 / 复现**：`printf '' > /tmp/empty; x=$(sed -n 's/^PASSWORD=//p' /tmp/empty); echo "rc=$? len=${#x}"`
+→ `rc=0 len=0`（2026-10-07 实测）。
+
+**验证程度**：真机踩到 1 次；订正方式：重新用**字面量**密码渲染一遍并验通（报告里给出当前值）。
+
+---
+
+## H22. `dsh web` 没有固定 token 的开关，运行中的 token 也读不出来
+
+**现象 / 查到的事实（2026-10-07，为 ADR-0014 做调研）**：
+
+- `dsh web --help` 只有 `--host` / `--no-open` / `--port` / `--trusted-host` —— **没有**
+  `--token` / `--no-auth` 之类的开关；
+- token 是 `client-connection` 里的 `processLaunchToken`：**32 字节随机、base64url、
+  存在进程内存的 WeakMap 里**（`dsh-client-connection/lib/index.js:245-250`），
+  **不落盘**；
+- 换到的 cookie 有 30 天（`cookieMaxAgeDays` 默认 30，`.../index.js:802`），签名密钥
+  是**持久化**的（`credentialKey("client-connection","browser-session")`），
+  所以**同一个 DSH_HOME 重启后，老 cookie 仍然有效**（本机实测：旧 jar 打新实例 → 200）；
+- 想读运行中实例的 token：`/proc/<pid>/environ` 没有、`~/.dsh` 里没有、npx 日志里没有
+  （2026-10-07 逐个查过）；它只出现在**启动时那行 stdout** 里。
+
+**修法 / 结论**：只能"启动时抓"（`env.zsh`/`env.bash` 里的 `harness` 函数），
+再用家里的 broker 把它 302 出去（ADR-0014）。**没有官方开关就别硬造。**
+
+**判据 / 复现**：
+
+```sh
+dsh web --help | grep -iE 'token|auth' || echo "没有 token/auth 开关"
+grep -n 'processLaunchToken' -A 6 ~/.npm/_npx/*/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js | head
+env | grep -i DSH_WEB_URL          # 只有 http://127.0.0.1:3080（不带 token）
+```
+
+**验证程度**：源码 + CLI + 文件系统三处各查 1 次；"老 cookie 跨重启仍有效"本机实测 1 次。

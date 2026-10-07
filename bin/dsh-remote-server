@@ -1,0 +1,8 @@
+#!/bin/sh
+# dsh-remote-server —— `dsh-remote server` 的薄封装（用户先说的是这个名字，两个都能用）。
+#
+# 真正干活的是 bin/dsh-remote 里的 cmd_server；这里只负责把参数原样转过去，
+# 并且**先解软链**再找兄弟脚本（~/.local/bin/dsh-remote-server 是软链）。
+SELF=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
+exec "$SELF_DIR/dsh-remote" server "$@"

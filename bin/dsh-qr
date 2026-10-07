@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""dsh-qr —— 把一段文本画成二维码（**纯 python 标准库**，不依赖 qrencode / PIL）。
+
+为什么自己带一个：手机扫的那张码得在**装好的机器上**画出来，而 `qrencode` 不一定装了
+（本机 2026-10-07 实测没有、也没有 python 的 qrcode/segno 模块）。所以这里按
+ISO/IEC 18004 自己实现一遍（字节模式、版本 1–40、纠错 L/M/Q/H、掩码按标准罚分挑），
+输出三样东西：终端里的半块字符画、PNG（1 位灰度，zlib+struct 手写）、SVG（纯文本）。
+
+    dsh-qr "https://example.com:8443"                 # 终端里画
+    dsh-qr --ecc M --border 2 --png out.png --svg out.svg "…"
+
+**不复制第三方代码**：算法按标准写，规格表（纠错分块、对齐图案位置）是标准里的常数，
+写完之后拿 `tests/qr_test.sh` 跟一份独立实现（npm 自带的 qrcode-terminal 里那份
+Kazuhiko Arase 的 JS 实现，MIT）逐模块对过账 —— 见 tests/run_tests.sh 的 L 节。
+"""
+
+from __future__ import annotations
+
+import argparse
+import struct
+import sys
+import zlib
+
+# ---------------------------------------------------------------- 规格表（ISO/IEC 18004）
+# 纠错分块表：版本 → 等级 → 若干组 [块数, 总码字/块, 数据码字/块]（可以有两组）。
+RS_BLOCKS = {
+    1: {"L": [1, 26, 19], "M": [1, 26, 16], "Q": [1, 26, 13], "H": [1, 26, 9]},
+    2: {"L": [1, 44, 34], "M": [1, 44, 28], "Q": [1, 44, 22], "H": [1, 44, 16]},
+    3: {"L": [1, 70, 55], "M": [1, 70, 44], "Q": [2, 35, 17], "H": [2, 35, 13]},
+    4: {"L": [1, 100, 80], "M": [2, 50, 32], "Q": [2, 50, 24], "H": [4, 25, 9]},
+    5: {"L": [1, 134, 108], "M": [2, 67, 43], "Q": [2, 33, 15, 2, 34, 16], "H": [2, 33, 11, 2, 34, 12]},
+    6: {"L": [2, 86, 68], "M": [4, 43, 27], "Q": [4, 43, 19], "H": [4, 43, 15]},
+    7: {"L": [2, 98, 78], "M": [4, 49, 31], "Q": [2, 32, 14, 4, 33, 15], "H": [4, 39, 13, 1, 40, 14]},
+    8: {"L": [2, 121, 97], "M": [2, 60, 38, 2, 61, 39], "Q": [4, 40, 18, 2, 41, 19], "H": [4, 40, 14, 2, 41, 15]},
+    9: {"L": [2, 146, 116], "M": [3, 58, 36, 2, 59, 37], "Q": [4, 36, 16, 4, 37, 17], "H": [4, 36, 12, 4, 37, 13]},
+    10: {"L": [2, 86, 68, 2, 87, 69], "M": [4, 69, 43, 1, 70, 44], "Q": [6, 43, 19, 2, 44, 20], "H": [6, 43, 15, 2, 44, 16]},
+    11: {"L": [4, 101, 81], "M": [1, 80, 50, 4, 81, 51], "Q": [4, 50, 22, 4, 51, 23], "H": [3, 36, 12, 8, 37, 13]},
+    12: {"L": [2, 116, 92, 2, 117, 93], "M": [6, 58, 36, 2, 59, 37], "Q": [4, 46, 20, 6, 47, 21], "H": [7, 42, 14, 4, 43, 15]},
+    13: {"L": [4, 133, 107], "M": [8, 59, 37, 1, 60, 38], "Q": [8, 44, 20, 4, 45, 21], "H": [12, 33, 11, 4, 34, 12]},
+    14: {"L": [3, 145, 115, 1, 146, 116], "M": [4, 64, 40, 5, 65, 41], "Q": [11, 36, 16, 5, 37, 17], "H": [11, 36, 12, 5, 37, 13]},
+    15: {"L": [5, 109, 87, 1, 110, 88], "M": [5, 65, 41, 5, 66, 42], "Q": [5, 54, 24, 7, 55, 25], "H": [11, 36, 12]},
+    16: {"L": [5, 122, 98, 1, 123, 99], "M": [7, 73, 45, 3, 74, 46], "Q": [15, 43, 19, 2, 44, 20], "H": [3, 45, 15, 13, 46, 16]},
+    17: {"L": [1, 135, 107, 5, 136, 108], "M": [10, 74, 46, 1, 75, 47], "Q": [1, 50, 22, 15, 51, 23], "H": [2, 42, 14, 17, 43, 15]},
+    18: {"L": [5, 150, 120, 1, 151, 121], "M": [9, 69, 43, 4, 70, 44], "Q": [17, 50, 22, 1, 51, 23], "H": [2, 42, 14, 19, 43, 15]},
+    19: {"L": [3, 141, 113, 4, 142, 114], "M": [3, 70, 44, 11, 71, 45], "Q": [17, 47, 21, 4, 48, 22], "H": [9, 39, 13, 16, 40, 14]},
+    20: {"L": [3, 135, 107, 5, 136, 108], "M": [3, 67, 41, 13, 68, 42], "Q": [15, 54, 24, 5, 55, 25], "H": [15, 43, 15, 10, 44, 16]},
+    21: {"L": [4, 144, 116, 4, 145, 117], "M": [17, 68, 42], "Q": [17, 50, 22, 6, 51, 23], "H": [19, 46, 16, 6, 47, 17]},
+    22: {"L": [2, 139, 111, 7, 140, 112], "M": [17, 74, 46], "Q": [7, 54, 24, 16, 55, 25], "H": [34, 37, 13]},
+    23: {"L": [4, 151, 121, 5, 152, 122], "M": [4, 75, 47, 14, 76, 48], "Q": [11, 54, 24, 14, 55, 25], "H": [16, 45, 15, 14, 46, 16]},
+    24: {"L": [6, 147, 117, 4, 148, 118], "M": [6, 73, 45, 14, 74, 46], "Q": [11, 54, 24, 16, 55, 25], "H": [30, 46, 16, 2, 47, 17]},
+    25: {"L": [8, 132, 106, 4, 133, 107], "M": [8, 75, 47, 13, 76, 48], "Q": [7, 54, 24, 22, 55, 25], "H": [22, 45, 15, 13, 46, 16]},
+    26: {"L": [10, 142, 114, 2, 143, 115], "M": [19, 74, 46, 4, 75, 47], "Q": [28, 50, 22, 6, 51, 23], "H": [33, 46, 16, 4, 47, 17]},
+    27: {"L": [8, 152, 122, 4, 153, 123], "M": [22, 73, 45, 3, 74, 46], "Q": [8, 53, 23, 26, 54, 24], "H": [12, 45, 15, 28, 46, 16]},
+    28: {"L": [3, 147, 117, 10, 148, 118], "M": [3, 73, 45, 23, 74, 46], "Q": [4, 54, 24, 31, 55, 25], "H": [11, 45, 15, 31, 46, 16]},
+    29: {"L": [7, 146, 116, 7, 147, 117], "M": [21, 73, 45, 7, 74, 46], "Q": [1, 53, 23, 37, 54, 24], "H": [19, 45, 15, 26, 46, 16]},
+    30: {"L": [5, 145, 115, 10, 146, 116], "M": [19, 75, 47, 10, 76, 48], "Q": [15, 54, 24, 25, 55, 25], "H": [23, 45, 15, 25, 46, 16]},
+    31: {"L": [13, 145, 115, 3, 146, 116], "M": [2, 74, 46, 29, 75, 47], "Q": [42, 54, 24, 1, 55, 25], "H": [23, 45, 15, 28, 46, 16]},
+    32: {"L": [17, 145, 115], "M": [10, 74, 46, 23, 75, 47], "Q": [10, 54, 24, 35, 55, 25], "H": [19, 45, 15, 35, 46, 16]},
+    33: {"L": [17, 145, 115, 1, 146, 116], "M": [14, 74, 46, 21, 75, 47], "Q": [29, 54, 24, 19, 55, 25], "H": [11, 45, 15, 46, 46, 16]},
+    34: {"L": [13, 145, 115, 6, 146, 116], "M": [14, 74, 46, 23, 75, 47], "Q": [44, 54, 24, 7, 55, 25], "H": [59, 46, 16, 1, 47, 17]},
+    35: {"L": [12, 151, 121, 7, 152, 122], "M": [12, 75, 47, 26, 76, 48], "Q": [39, 54, 24, 14, 55, 25], "H": [22, 45, 15, 41, 46, 16]},
+    36: {"L": [6, 151, 121, 14, 152, 122], "M": [6, 75, 47, 34, 76, 48], "Q": [46, 54, 24, 10, 55, 25], "H": [2, 45, 15, 64, 46, 16]},
+    37: {"L": [17, 152, 122, 4, 153, 123], "M": [29, 74, 46, 14, 75, 47], "Q": [49, 54, 24, 10, 55, 25], "H": [24, 45, 15, 46, 46, 16]},
+    38: {"L": [4, 152, 122, 18, 153, 123], "M": [13, 74, 46, 32, 75, 47], "Q": [48, 54, 24, 14, 55, 25], "H": [42, 45, 15, 32, 46, 16]},
+    39: {"L": [20, 147, 117, 4, 148, 118], "M": [40, 75, 47, 7, 76, 48], "Q": [43, 54, 24, 22, 55, 25], "H": [10, 45, 15, 67, 46, 16]},
+    40: {"L": [19, 148, 118, 6, 149, 119], "M": [18, 75, 47, 31, 76, 48], "Q": [34, 54, 24, 34, 55, 25], "H": [20, 45, 15, 61, 46, 16]},}
+
+# 对齐图案的中心坐标（版本 1 没有）。
+ALIGN_POS = [
+    [],
+    [6, 18],
+    [6, 22],
+    [6, 26],
+    [6, 30],
+    [6, 34],
+    [6, 22, 38],
+    [6, 24, 42],
+    [6, 26, 46],
+    [6, 28, 50],
+    [6, 30, 54],
+    [6, 32, 58],
+    [6, 34, 62],
+    [6, 26, 46, 66],
+    [6, 26, 48, 70],
+    [6, 26, 50, 74],
+    [6, 30, 54, 78],
+    [6, 30, 56, 82],
+    [6, 30, 58, 86],
+    [6, 34, 62, 90],
+    [6, 28, 50, 72, 94],
+    [6, 26, 50, 74, 98],
+    [6, 30, 54, 78, 102],
+    [6, 28, 54, 80, 106],
+    [6, 32, 58, 84, 110],
+    [6, 30, 58, 86, 114],
+    [6, 34, 62, 90, 118],
+    [6, 26, 50, 74, 98, 122],
+    [6, 30, 54, 78, 102, 126],
+    [6, 26, 52, 78, 104, 130],
+    [6, 30, 56, 82, 108, 134],
+    [6, 34, 60, 86, 112, 138],
+    [6, 30, 58, 86, 114, 142],
+    [6, 34, 62, 90, 118, 146],
+    [6, 30, 54, 78, 102, 126, 150],
+    [6, 24, 50, 76, 102, 128, 154],
+    [6, 28, 54, 80, 106, 132, 158],
+    [6, 32, 58, 84, 110, 136, 162],
+    [6, 26, 54, 82, 110, 138, 166],
+    [6, 30, 58, 86, 114, 142, 170],]
+
+EC_LEVEL_BITS = {"L": 1, "M": 0, "Q": 3, "H": 2}
+EC_LEVELS = ("L", "M", "Q", "H")
+
+
+# ---------------------------------------------------------------- GF(256) / Reed-Solomon
+def gf_mul(x: int, y: int) -> int:
+    """GF(2^8) 乘法，本原多项式 0x11D（QR 用的那个）。"""
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z & 0xFF
+
+
+def rs_divisor(degree: int) -> "list[int]":
+    """生成多项式 (x-α^0)(x-α^1)…(x-α^(degree-1)) 的系数（最高次省略）。"""
+    result = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            result[j] = gf_mul(result[j], root)
+            if j + 1 < degree:
+                result[j] ^= result[j + 1]
+        root = gf_mul(root, 0x02)
+    return result
+
+
+def rs_remainder(data, divisor) -> "list[int]":
+    """多项式除法取余 —— 就是纠错码字。"""
+    result = [0] * len(divisor)
+    for b in data:
+        factor = b ^ result.pop(0)
+        result.append(0)
+        for i, d in enumerate(divisor):
+            result[i] ^= gf_mul(d, factor)
+    return result
+
+
+# ---------------------------------------------------------------- 码字
+def blocks_for(ver: int, ecc: str):
+    """→ [(总码字, 数据码字), …]（每块一条）。"""
+    row = RS_BLOCKS[ver][ecc]
+    out = []
+    for i in range(0, len(row), 3):
+        count, total, data = row[i], row[i + 1], row[i + 2]
+        out.extend([(total, data)] * count)
+    return out
+
+
+def num_raw_data_modules(ver: int) -> int:
+    """这一版能放数据的模块总数（标准里那个公式）。"""
+    result = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        num_align = ver // 7 + 2
+        result -= (25 * num_align - 10) * num_align - 55
+        if ver >= 7:
+            result -= 36
+    return result
+
+
+def make_data_codewords(text: str, ver: int, ecc: str) -> bytes:
+    data = text.encode("utf-8")
+    capacity = sum(d for _, d in blocks_for(ver, ecc)) * 8
+    bits: "list[int]" = []
+
+    def append(val: int, n: int) -> None:
+        for i in range(n - 1, -1, -1):
+            bits.append((val >> i) & 1)
+
+    append(0b0100, 4)  # 字节模式
+    append(len(data), 16 if ver >= 10 else 8)
+    for b in data:
+        append(b, 8)
+    append(0, min(4, capacity - len(bits)))  # 结束符
+    append(0, (-len(bits)) % 8)              # 补齐到整字节
+    pad = 0xEC
+    while len(bits) < capacity:
+        append(pad, 8)
+        pad ^= 0xEC ^ 0x11
+    return bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+
+
+def fits(text: str, ver: int, ecc: str) -> bool:
+    data_len = len(text.encode("utf-8"))
+    count_bits = 16 if ver >= 10 else 8
+    capacity = sum(d for _, d in blocks_for(ver, ecc)) * 8
+    return 4 + count_bits + data_len * 8 <= capacity
+
+
+def interleave(data_cw: bytes, ver: int, ecc: str) -> bytes:
+    blocks = blocks_for(ver, ecc)
+    ec_len = blocks[0][0] - blocks[0][1]
+    if any(t - d != ec_len for t, d in blocks):
+        raise ValueError("RS 表里各块的纠错长度不一致（表抄错了）")
+    divisor = rs_divisor(ec_len)
+    data_blocks, ec_blocks = [], []
+    k = 0
+    for _, data_len in blocks:
+        chunk = list(data_cw[k:k + data_len])
+        k += data_len
+        data_blocks.append(chunk)
+        ec_blocks.append(rs_remainder(chunk, divisor))
+    out: "list[int]" = []
+    for i in range(max(len(b) for b in data_blocks)):
+        for b in data_blocks:
+            if i < len(b):
+                out.append(b[i])
+    for i in range(ec_len):
+        for b in ec_blocks:
+            out.append(b[i])
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- 矩阵
+class QrCode:
+    def __init__(self, text: str, ecc: str = "M", mask: "int | None" = None):
+        self.text = text
+        self.ecc = ecc
+        ver = None
+        for v in range(1, 41):
+            if fits(text, v, ecc):
+                ver = v
+                break
+        if ver is None:
+            raise ValueError("内容太长，一个二维码放不下（%d 字节）" % len(text.encode("utf-8")))
+        self.version = ver
+        self.size = ver * 4 + 17
+        raw = interleave(make_data_codewords(text, ver, ecc), ver, ecc)
+        expect = num_raw_data_modules(ver) // 8
+        if len(raw) != expect:
+            raise ValueError("码字数对不上：算出 %d，标准说 %d（版本 %d）" % (len(raw), expect, ver))
+        self.modules = [[False] * self.size for _ in range(self.size)]
+        self.is_func = [[False] * self.size for _ in range(self.size)]
+        self._draw_function_patterns()
+        self._draw_codewords(raw)
+        if mask is None:
+            best_mask, best_pen = 0, None
+            for m in range(8):
+                self._apply_mask(m)
+                # 罚分要在**完整符号**上算（含格式信息位）：不画格式位就打分，
+                # 挑出来的掩码会和独立实现不一致（2026-10-07 对账时抓到的第二处）。
+                self._draw_format(m)
+                pen = self._penalty()
+                self._apply_mask(m)  # 撤销掩码（格式位下一轮会被覆盖）
+                if best_pen is None or pen < best_pen:
+                    best_mask, best_pen = m, pen
+        else:
+            best_mask = mask
+        self.mask = best_mask
+        self._apply_mask(best_mask)
+        self._draw_format(best_mask)
+
+    # ---- 画固定图案
+    def _set(self, x, y, dark, func=True):
+        self.modules[y][x] = dark
+        if func:
+            self.is_func[y][x] = True
+
+    def _draw_function_patterns(self):
+        n = self.size
+        for i in range(n):  # 定位（timing）图案
+            self._set(6, i, i % 2 == 0)
+            self._set(i, 6, i % 2 == 0)
+        for cx, cy in ((3, 3), (n - 4, 3), (3, n - 4)):  # 三个回字
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    dist = max(abs(dx), abs(dy))
+                    xx, yy = cx + dx, cy + dy
+                    # 角上那圈白边会伸到符号外面一格，只有落在符号里的才画
+                    if 0 <= xx < n and 0 <= yy < n:
+                        self._set(xx, yy, dist != 2 and dist != 4)
+        pos = ALIGN_POS[self.version - 1]  # 对齐图案
+        for i in pos:
+            for j in pos:
+                if (i == 6 and j == 6) or (i == 6 and j == n - 7) or (i == n - 7 and j == 6):
+                    continue
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        self._set(i + dx, j + dy, max(abs(dx), abs(dy)) != 1)
+        for i in range(9):  # 给格式信息留位
+            # ⚠️ (8,6) 和 (6,8) 是**定位图案**的格子，格式信息不占它们 ——
+            # 不跳过就会把这两个定时模块抹掉（拿独立实现逐模块对账时抓出来的）。
+            if i != 6:
+                self._set(8, i, False)
+                self._set(i, 8, False)
+        for i in range(8):
+            self._set(8, n - 1 - i, False)
+            self._set(n - 1 - i, 8, False)
+        self._set(8, n - 8, True)  # 固定黑点
+        if self.version >= 7:  # 版本信息
+            rem = self.version
+            for _ in range(12):
+                rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+            bits = (self.version << 12) | rem
+            for i in range(18):
+                bit = ((bits >> i) & 1) != 0
+                a, b = n - 11 + i % 3, i // 3
+                self._set(a, b, bit)
+                self._set(b, a, bit)
+
+    def _draw_codewords(self, data: bytes):
+        n = self.size
+        i = 0
+        for right in range(n - 1, 0, -2):
+            if right <= 6:
+                right -= 1
+            for vert in range(n):
+                for j in range(2):
+                    x = right - j
+                    upward = ((right + 1) & 2) == 0
+                    y = (n - 1 - vert) if upward else vert
+                    if not self.is_func[y][x] and i < len(data) * 8:
+                        self.modules[y][x] = ((data[i >> 3] >> (7 - (i & 7))) & 1) != 0
+                        i += 1
+        if i != len(data) * 8:
+            raise ValueError("数据没放完：%d/%d 位（版本 %d）" % (i, len(data) * 8, self.version))
+
+    # ---- 掩码
+    @staticmethod
+    def _mask_bit(mask: int, x: int, y: int) -> bool:
+        if mask == 0:
+            return (x + y) % 2 == 0
+        if mask == 1:
+            return y % 2 == 0
+        if mask == 2:
+            return x % 3 == 0
+        if mask == 3:
+            return (x + y) % 3 == 0
+        if mask == 4:
+            return (x // 3 + y // 2) % 2 == 0
+        if mask == 5:
+            return x * y % 2 + x * y % 3 == 0
+        if mask == 6:
+            return (x * y % 2 + x * y % 3) % 2 == 0
+        if mask == 7:
+            return ((x + y) % 2 + x * y % 3) % 2 == 0
+        raise ValueError("掩码只能是 0..7")
+
+    def _apply_mask(self, mask: int):
+        for y in range(self.size):
+            for x in range(self.size):
+                if not self.is_func[y][x] and self._mask_bit(mask, x, y):
+                    self.modules[y][x] = not self.modules[y][x]
+
+    # ---- 罚分（标准 §8.8.2 的四条）
+    def _penalty(self) -> int:
+        n = self.size
+        result = 0
+        for y in range(n):  # N1 行
+            run = 1
+            for x in range(1, n):
+                if self.modules[y][x] == self.modules[y][x - 1]:
+                    run += 1
+                else:
+                    if run >= 5:
+                        result += 3 + (run - 5)
+                    run = 1
+            if run >= 5:
+                result += 3 + (run - 5)
+        for x in range(n):  # N1 列
+            run = 1
+            for y in range(1, n):
+                if self.modules[y][x] == self.modules[y - 1][x]:
+                    run += 1
+                else:
+                    if run >= 5:
+                        result += 3 + (run - 5)
+                    run = 1
+            if run >= 5:
+                result += 3 + (run - 5)
+        for y in range(n - 1):  # N2 2x2
+            for x in range(n - 1):
+                c = self.modules[y][x]
+                if c == self.modules[y][x + 1] == self.modules[y + 1][x] == self.modules[y + 1][x + 1]:
+                    result += 3
+        for y in range(n):  # N3 像回字的三段
+            row = self.modules[y]
+            for x in range(n - 10):
+                if row[x] and not row[x + 1] and row[x + 2] and row[x + 3] and row[x + 4] and not row[x + 5] and row[x + 6] and not row[x + 7] and not row[x + 8] and not row[x + 9] and not row[x + 10]:
+                    result += 40
+                if not row[x] and not row[x + 1] and not row[x + 2] and not row[x + 3] and row[x + 4] and not row[x + 5] and row[x + 6] and row[x + 7] and row[x + 8] and not row[x + 9] and row[x + 10]:
+                    result += 40
+        for x in range(n):
+            for y in range(n - 10):
+                col = [self.modules[y + k][x] for k in range(11)]
+                if col[0] and not col[1] and col[2] and col[3] and col[4] and not col[5] and col[6] and not col[7] and not col[8] and not col[9] and not col[10]:
+                    result += 40
+                if not col[0] and not col[1] and not col[2] and not col[3] and col[4] and not col[5] and col[6] and col[7] and col[8] and not col[9] and col[10]:
+                    result += 40
+        dark = sum(1 for y in range(n) for x in range(n) if self.modules[y][x])  # N4 黑白比
+        total = n * n
+        k = (abs(dark * 20 - total * 10) + total - 1) // total - 1
+        result += k * 10
+        return result
+
+    def _draw_format(self, mask: int):
+        data = (EC_LEVEL_BITS[self.ecc] << 3) | mask
+        rem = data
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        bits = ((data << 10) | rem) ^ 0x5412
+
+        def bit(i):
+            return ((bits >> i) & 1) != 0
+
+        for i in range(6):
+            self._set(8, i, bit(i))
+        self._set(8, 7, bit(6))
+        self._set(8, 8, bit(7))
+        self._set(7, 8, bit(8))
+        for i in range(9, 15):
+            self._set(14 - i, 8, bit(i))
+        for i in range(8):
+            self._set(self.size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            self._set(8, self.size - 15 + i, bit(i))
+        self._set(8, self.size - 8, True)
+
+    # ---- 给外面用
+    def matrix(self, border: int = 2):
+        """带静默区的二维布尔表：True = 黑块。"""
+        n = self.size + border * 2
+        out = [[False] * n for _ in range(n)]
+        for y in range(self.size):
+            for x in range(self.size):
+                out[y + border][x + border] = self.modules[y][x]
+        return out
+
+
+# ---------------------------------------------------------------- 输出
+def render_terminal(mat, out=sys.stdout) -> None:
+    """半块字符画：上半个 = 前景色，下半个 = 背景色（自带色，别管终端什么配色）。"""
+    rows = len(mat)
+    if rows % 2:
+        mat = mat + [[False] * len(mat[0])]
+    lines = []
+    for y in range(0, len(mat), 2):
+        parts = []
+        for x in range(len(mat[0])):
+            top, bottom = mat[y][x], mat[y + 1][x]
+            fg = 30 if top else 37   # 黑 / 白
+            bg = 40 if bottom else 47
+            parts.append("\x1b[%d;%dm\u2580" % (fg, bg))
+        lines.append("".join(parts) + "\x1b[0m")
+    out.write("\n".join(lines) + "\n")
+
+
+def render_png(mat, path: str) -> None:
+    """1 位灰度 PNG（0 = 黑 = 码点，1 = 白 = 底）。zlib/struct 都是标准库。"""
+    n = len(mat)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    raw = bytearray()
+    for row in mat:
+        bits = 0
+        nbits = 0
+        line = bytearray()
+        for dark in row:
+            bits = (bits << 1) | (0 if dark else 1)
+            nbits += 1
+            if nbits == 8:
+                line.append(bits)
+                bits, nbits = 0, 0
+        if nbits:
+            line.append(bits << (8 - nbits))
+        raw.append(0)  # 过滤器：无
+        raw.extend(line)
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 1, 0, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+           chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+def render_svg(mat, path: str) -> None:
+    n = len(mat)
+    rects = []
+    for y, row in enumerate(mat):
+        x = 0
+        while x < n:
+            if row[x]:
+                run = 1
+                while x + run < n and row[x + run]:
+                    run += 1
+                rects.append('<rect x="%d" y="%d" width="%d" height="1"/>' % (x, y, run))
+                x += run
+            else:
+                x += 1
+    svg = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+           '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" shape-rendering="crispEdges">\n'
+           '  <rect width="100%%" height="100%%" fill="#fff"/>\n'
+           '  <g fill="#000">%s</g>\n</svg>\n' % (n, n, "".join(rects)))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(svg)
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="dsh-qr", description="把一段文本画成二维码（纯 python，无依赖）")
+    ap.add_argument("text", nargs="?", help="要编码的内容（`-` 表示从 stdin 读一行）")
+    ap.add_argument("--ecc", default="M", choices=list(EC_LEVELS), help="纠错等级（默认 M）")
+    ap.add_argument("--border", type=int, default=2, help="静默区宽度（默认 2，标准要求 ≥4 最保险）")
+    ap.add_argument("--png", help="另存一份 PNG 到这个路径")
+    ap.add_argument("--svg", help="另存一份 SVG 到这个路径")
+    ap.add_argument("--no-terminal", action="store_true", help="别往终端画")
+    ap.add_argument("--mask", type=int, choices=range(8), help="强制某个掩码（默认按标准罚分挑）")
+    ap.add_argument("--version", type=int, help="只看这一版够不够放（默认自动挑最小的一版）")
+    ap.add_argument("--matrix", action="store_true", help="打印 0/1 矩阵（测试用）")
+    args = ap.parse_args(argv)
+
+    text = args.text
+    if text is None or text == "-":
+        text = sys.stdin.readline().rstrip("\n")
+    if not text:
+        ap.error("要编码的内容是空的")
+
+    qr = QrCode(text, args.ecc, args.mask)
+    mat = qr.matrix(max(0, args.border))
+    if args.png:
+        render_png(mat, args.png)
+    if args.svg:
+        render_svg(mat, args.svg)
+    if args.matrix:
+        for row in mat:
+            sys.stdout.write("".join("1" if v else "0" for v in row) + "\n")
+    elif not args.no_terminal:
+        if sys.stdout.isatty() and not args.png and not args.svg:
+            sys.stderr.write("（扫不出来的话把终端字号调小一点；或者用 --png 存成图片看）\n")
+        render_terminal(mat)
+    if args.png or args.svg:
+        sys.stderr.write("版本 %d / 纠错 %s / %dx%d 模块\n" % (qr.version, qr.ecc, qr.size, qr.size))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

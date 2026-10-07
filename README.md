@@ -76,9 +76,18 @@ dsh-remote tunnel-status --probe                   # 体检（含云上只读检
 dsh-remote status                                  # 总览：harness / 隧道 / 推送 / 手机地址
 ```
 
-手机上：打开 `public_url` → 输一次 basic auth 的用户名密码 → 再贴一次
-`dsh web` 启动时打印的**带 token 的地址**（`dsh-remote serve` 会把它存到
-`~/.local/state/dsh-remote/web-url.txt`）→ 之后浏览器就记住了。
+手机上：打开 `public_url`（**不带 token 的固定地址**）→ 输一次 basic auth 的用户名密码
+→ 就能进。`dsh web` 自己的 token 由家里的 **token broker** 自动补上（它把 `/` 302 到
+`/?token=<当前值>`，浏览器拿到 30 天的 cookie 之后就一直直连了），所以**家里重启
+harness 也不用改手机上的链接**。
+
+要让 broker 知道"当前 token"是什么，harness 得用 `dsh-remote` 装的那两个 shell 里的
+**`harness` 函数**起（`env.zsh` / `env.bash`，它会把 token 写进
+`~/.local/state/dsh-remote/current-token.txt`）。原来那条
+`alias harness='npx @deepseek-ai/dsh web'` 删掉 —— 别名优先于函数，会把它盖住。
+
+最省事的是：**`dsh-remote server`**（或 `dsh-remote-server`）一条命令把"云上中继 +
+家里常驻隧道 + broker"装好，最后打印固定地址和一张能直接扫的二维码。
 
 ---
 
@@ -93,6 +102,9 @@ dsh-remote status                                  # 总览：harness / 隧道 /
 | `dsh-remote tunnel-uninstall` | 撤掉它（`disable --now` + 删单元文件） |
 | `dsh-remote tunnel-status` | 看单元/进程/端口/云上隧道口/公网；`--probe` 会 ssh 上云做**只读**检查 |
 | `dsh-remote systemd` | 旧名字：只生成单元不 enable（= `tunnel-install --no-enable`） |
+| `dsh-remote token-broker` | 前台跑"把不带 token 的 `/` 302 到当前 token"的小服务（常驻用 `broker-install`） |
+| `dsh-remote broker-install` / `broker-uninstall` | 把 token broker 装成 / 撤出 systemd `--user` 常驻 |
+| `dsh-remote server` | **一条命令装好**：自检 → 云上中继 → 家里常驻隧道 + broker → 起 harness → 打印固定地址 + 二维码（`dsh-remote-server` 是等价入口） |
 | `dsh-remote url` | 打印手机该收藏的地址 |
 | `dsh-remote notify-test` | 推一条测试消息 |
 | `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
@@ -308,9 +320,10 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **268**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-07 实测，合计 **363**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 27 / 子命令 E 53 / `cloud-install` F 14 /
-`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53 / **常驻隧道 J 69**。
+`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 69** /
+**token 固定地址 K 35** / **二维码 L 12** / **一条命令装好 M 46**。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 
@@ -340,6 +353,9 @@ J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`
   | `~/.config/dsh-remote` | 软链 → 上面那个 `etc/dsh-remote` |
   | `~/.local/state/dsh-remote` | 软链 → 上面那个 `var/dsh-remote` |
   | `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染，改配置就重跑它） |
+  | `~/.config/systemd/user/dsh-token-broker.service` | **token broker 单元**（`broker-install` 渲染） |
+  | `$WTOOL_PREFIX/var/dsh-remote/current-token.txt` | 当前 token（`harness` 函数写、broker 读；600，harness 退出即删） |
+  | `$WTOOL_PREFIX/var/dsh-remote/phone-qr.png` / `.svg` | `server` 打出来的二维码图片（可以直接用手机相册扫） |
   | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `dsh-remote notify-enable` 写 |
 
   家在跑的时候只有一条 ssh 进程（`dsh-remote tunnel` / systemd 单元）。

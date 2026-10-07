@@ -28,8 +28,12 @@
 | U7 | ⏸ | 真 `$HOME` 里两条 2026-09-20 的老软链 | 要用户自己重跑一次 `wtool install` 才会纠正 |
 | U8 | ⏸ | "源找不到"要不要从警告改成 `exit 1` | 现在选的是"警告 + 继续"，三个仓库口径一致 |
 | U9 | ⏸ | `main` 与 `ds_dev` 的差距要不要合 | 助手不合并、不推送，由用户定 |
+| U10 | ✅ | **手机固定地址**（不用再抄 token） | `harness` 函数抓 token + 家里 broker 302 + Caddy 两条 `not`；本机同构 Caddy 实测 302→303→200 与"换 token 后固定 URL 仍可用"（见下面 U10 节） |
+| U11 | ✅ | **一条命令装好**（`dsh-remote server` + 二维码） | 自检 → 部署 → 家里两个常驻单元 → 起 harness → 打印固定地址 + 自绘二维码；真机幂等跑通（见下面 U11 节） |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
+**"用真 token 从公网走一遍 302→200"**（要家里的 harness 用 `harness` 函数重启一次才有
+token；现在跑着的那个实例是 10-05 起的，token 只在它内存里，读不出来 —— hazards H22）；
 **"网络真断"（ServerAlive 那条路）的重连、重启机器后服务会不会自己起来**（linger 已开、
 单元已 `enable`，但没重启过机器）；真机上的安全组/防火墙/证书续期的任何验证。
 
@@ -341,6 +345,93 @@ dsh-remote tunnel-status --probe                  # 一条命令看全
 - ⬜ **重启机器后是否自动恢复没测**（linger=yes、`enabled`、`WantedBy=default.target` 都到位，
   没人重启过这台机器）。
 - ⬜ 真手机打开公网地址（带 token）仍然没验（U1 剩下的那一条）。
+
+---
+
+## ✅ U10 手机固定地址：token broker + `harness` 函数（2026-10-07 做完并实测）
+
+**要解决的问题**：`dsh web` 的 token 每个进程随机、只在内存里（官方没有固定 token /
+关鉴权的开关 —— hazards H22），所以"家里重启一次 harness，手机上那个带 token 的地址就作废"。
+用户 2026-10-07 要求：手机只访问 `https://<入口>/`（不带 token）也能进，重启 harness 后
+不用改链接。做法与取舍见 **ADR-0014**，现状见 `architecture.md` §3.2。
+
+**做了什么**：
+
+| # | 做了什么 | 在哪 |
+|---|---|---|
+| 1 | `harness` shell 函数（**zsh/bash 两份逐字等价**）：包装 `npx @deepseek-ai/dsh web`，抓启动那行的 token → `current-token.txt`（600）/ `web-url.txt`，退出时删掉 token 文件；source 时 `unalias harness` | `env.zsh` / `env.bash` |
+| 2 | `bin/dsh-token-broker`（纯 python 标准库，172 行）：只绑 `127.0.0.1:3081`，`GET /`（不带 token）与 `/go` → 302；没 token / dsh web 没在听 → 503；别的 404/405。**不代理应用流量** | 新文件 |
+| 3 | `dsh-remote token-broker` / `broker-install` / `broker-uninstall`（systemd `--user` 单元 `dsh-token-broker.service`） | `bin/dsh-remote` |
+| 4 | 隧道多一条 `-R 127.0.0.1:18081:127.0.0.1:3081`（`broker_local_port` / `broker_remote_port` 可配，设 `off` 就不要） | `bin/dsh-remote` 的 `tunnel_argv` |
+| 5 | 两份 Caddyfile 加 `@entry`（`path /` + `not query token=*` + `not header Cookie *dsh-auth-*` → broker）与 `@go`；`relay.sh` 加 `--broker-port` / `{{BROKER_PORT}}` / 自检多打一行 broker | `cloud/` |
+| 6 | `tunnel-status` 增 broker 段（单元/ token 文件 / 3081 在不在听），`--probe` 增云上 18081 的 302/503 判读 | `bin/dsh-remote` |
+
+**实测（判据全在 `journal.md` 同日条目）**：
+
+- **本机同构 Caddy**（用真 `caddy:2.11.4` 容器 + 同一份模板渲染出来的配置 + 我自己起的
+  harness 实例 3090 + 真 broker 3082）：
+  `/` 不带 token → **302** `Location: /?token=<值>` → 跟随（303 + Set-Cookie）→ **200 +
+  `<title>DeepSeek Harness</title>`**（2 次跳转）；带 cookie 再打 `/` → **200、0 次跳转**
+  （证明没有 302 死循环）；没有 token 文件 → 经 Caddy 拿到 **503** 与那句人话。
+- **换 token 后固定 URL 仍可用**（本次的核心判据）：杀掉我那台实例、用 `harness` 函数重启 →
+  token 从 `flsx0…` 变成 `ibxqL…` → 同一固定 URL **302 到新 token** → 跟随 → 200 + 标题；
+  拿旧 token 直连 → 401。老 cookie 跨重启仍然有效（签名密钥是持久的）。
+- **真公网**：`https://123.56.158.212:8443/` 带 basic auth、不带 token → **302**
+  （`server: dsh-token-broker`，即真的穿过了云上 Caddy + 那条新隧道到家里），
+  临时写个占位 token 验的；`/go` 同样 302；把 token 文件删掉 → **503**；
+  `/?token=…`（老用法）仍直连 dsh web（401 + 家里 dsh web 原文）。
+- **没验的一条**：拿**真 token** 从公网走 302→200 —— 需要用户用新的 `harness` 函数
+  重启一次 harness（那个在跑的实例是 10-05 起的，token 读不出来）。手机到手后一条命令就验完。
+
+**测试**：`sh tests/run_tests.sh` → **363 通过 0 失败**（新增 K 节 35 条 / L 节 12 条 / M 节 46 条）。
+
+---
+
+## ✅ U11 一条命令装好：`dsh-remote server` + 二维码（2026-10-07 做完并实测）
+
+**用户 2026-10-07 要的**：一条命令问清信息 → 说清要什么权限并给教程 → 自己部署 →
+配账号密码 → 本地起 harness → 给链接/二维码 → 扫码就能用。做法与取舍见 **ADR-0015**，
+现状见 `architecture.md` §3.3。
+
+**做了什么**：
+
+- 新子命令 `dsh-remote server`（`bin/dsh-remote-server` 是等价的薄封装）；
+  选项 `--host --ssh-user --ssh-port --port --web-user --password --dir --docker-cmd
+  --tunnel-port --broker-port --local-port --broker-local-port --yes --dry-run
+  --skip-deploy --skip-local --no-harness`。
+- **四类自检**（失败就打印"怎么修"并停）：免密 ssh + 远端 `id -un` 对得上；
+  `docker info` 与 `sudo -n docker info` **分开探**（H18）；对外端口没被别人占；
+  从家里 `curl` 判安全组；认出已装的 `dsh-relay`（幂等重配置）。
+- **部署复用** `cloud/relay.sh --no-compose`（不写第二套云端逻辑）；远程输出**先落文件再判 rc**
+  （H20），装完立刻从家里打一次入口当判据。
+- **家里**：`broker-install` + `tunnel-install`；`local_port` 上已经有 dsh web 就**不动它**。
+- **`bin/dsh-qr`**：自带二维码（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；
+  终端半块画 / 1 位灰度 PNG / SVG），**正确性跟 npm 那份独立实现逐模块对过账**；
+  码里编的永远是不带 token 的固定地址。
+- `relay.sh` 现在**自己写** `relay-password.txt`（600）—— H17 那个漂移的根因从源头堵住；
+  顺带修了 `--dir` 指向不存在的目录时 `set -eu` 直接退出（H19）。
+
+**实测**：
+
+- 真机（那台已经在跑的阿里云）**幂等跑通**：自检 → scp → `relay.sh`（重渲染 + 重启容器，
+  rc=0）→ 回写 `remote.conf` → 两个单元 `enable` 后 `active` → 打印固定地址 + 二维码
+  （自绘，PNG 落在 `~/.local/state/dsh-remote/phone-qr.png`）。
+- 入口判据：不带密码 **401**；带密码、不带 token → **503**（broker 说"还没有当前 token"）；
+  带密码带 token → **401 + 家里 dsh web 的原文**（老路径没坏）。
+- 云上 `relay-password.txt` 现在由脚本写成 600、内容与 Caddyfile 一致（H17 的判据）。
+- 二维码 PNG 解回来与终端那张矩阵**逐位一致**（1 位灰度、29×29 含静默区）。
+- **第一版在真机上被自检抓出两个 bug**（都不是文档问题）：把"能免密 sudo"当成"能直接用
+  docker"（H18）；`ssh … | tee` 吞掉云上失败（H20）—— 都已修 + 加了回归用例。
+
+**没验的**：从**一台全新的机器**（没有现成的阿里云中继、没有配好的 key/sudo）从零跑一遍 ——
+只在这台已经装好的机器上验了"幂等重跑"这条路；`--domain`（域名 + Let's Encrypt）也没跑过。
+
+**如实记账（提交边界）**：U10 与 U11 的代码**落在同一个提交**里。原因是两个功能在同一批
+文件里交织：`bin/dsh-remote`（隧道那条 `-R` 与 `cmd_server` 相邻）、`tests/run_tests.sh`
+（K/L/M 三节连着加）、`architecture.md` / `README.md` / `BACKLOG.md` / `hazards.md` 的改动
+还在同一个 hunk 里（`git diff` 的 hunk 边界跨了两个功能）。按功能切需要行级手术 ——
+**风险大于收益**（切坏了会留下跑不起来的中间状态），所以选择**一个提交、提交信息里分两段写清**。
+验收与判据是各自独立的，都在本文件的 U10 / U11 两节里；U3 那条提交（`2a45076`）没有被搅进来。
 
 ---
 

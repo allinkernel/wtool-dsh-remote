@@ -7,11 +7,16 @@
 #   dsh-remote tunnel-install  装成 systemd --user 常驻服务（Restart=always，断线自动重连）
 #   dsh-remote tunnel-uninstall 撤掉它（disable --now + 删单元文件）
 #   dsh-remote tunnel-status   看单元/进程/云上隧道口/公网的现状（--probe 上云只读检查）
+#   dsh-remote token-broker    前台跑"把 / 302 到当前 token"的小服务（常驻用 broker-install）
+#   dsh-remote broker-install  把 token broker 装成 systemd --user 常驻（手机固定地址靠它）
+#   dsh-remote broker-uninstall 撤掉它
 #   dsh-remote systemd         旧名字：只生成单元、不 enable（= tunnel-install --no-enable）
 #   dsh-remote url             打印手机该收藏的地址
 #   dsh-remote notify-test     推一条测试消息到手机
 #   dsh-remote notify-enable   打开"会话卡住/跑完就推手机"（写配置目录的 hooks.json + profile patch）
 #   dsh-remote notify-disable  关掉它（把 patch 里那一段删掉）
+#   dsh-remote server          一条命令装好：云上中继 + 家里常驻隧道 + token broker + harness
+#                              （问几个问题 → 自检 → 部署 → 打印手机地址 + 二维码）
 #   dsh-remote cloud-install   真装到阿里云上（传 cloud/ → 起 caddy 容器 → 记下地址）
 #   dsh-remote cloud-setup     只打印"送上去并执行"的命令，不动手
 #   dsh-remote migrate         把旧版放在 ~/.dsh 下的配置/日志搬到我们自己的目录
@@ -187,6 +192,9 @@ tunnel_conf() {
     ssh_port=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
     remote_port_v=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
     local_port_v=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    # token broker 那条反向隧道（云上 18081 → 家里 3081）。设成 off 就不要它。
+    broker_remote_port=$(conf_any broker_remote_port BROKER_REMOTE_PORT 2>/dev/null || printf '18081')
+    broker_local_port=$(conf_any broker_local_port BROKER_LOCAL_PORT 2>/dev/null || printf '3081')
     identity_key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
     case $identity_key in '~/'*) identity_key="$HOME/${identity_key#\~/}" ;; esac
     tmux_name=$(conf_any tmux_session TMUX_SESSION 2>/dev/null || printf 'dsh-tunnel')
@@ -204,7 +212,12 @@ tunnel_argv() { # 用法：tunnel_argv [--batch]（先调 tunnel_conf 设好上�
         -o StrictHostKeyChecking=accept-new \
         -p "$ssh_port"
     [ -n "$identity_key" ] && set -- "$@" -i "$identity_key"
-    set -- "$@" -R "127.0.0.1:${remote_port_v}:127.0.0.1:${local_port_v}" "${ssh_user}@${host}"
+    set -- "$@" -R "127.0.0.1:${remote_port_v}:127.0.0.1:${local_port_v}"
+    case ${broker_local_port:-off} in
+    '' | off | OFF | Off | 0) ;; # 不要 broker 那条（云上 18081 被别人占着时用）
+    *) set -- "$@" -R "127.0.0.1:${broker_remote_port}:127.0.0.1:${broker_local_port}" ;;
+    esac
+    set -- "$@" "${ssh_user}@${host}"
     printf '%s\n' "$@"
 }
 
@@ -326,6 +339,42 @@ tmux_has_session() {
     "$TMUX_BIN" has-session -t "$tmux_name" >/dev/null 2>&1
 }
 
+# 落盘一个单元：内容一样就不动（幂等）；不一样先备份成 <单元>.bak-<时间戳>。
+# 用法：unit_write <单元文件> <新内容文件>；返回 0 = 内容没变（没动它），1 = 写了新的。
+unit_write() {
+    _uf=$1
+    _new=$2
+    mkdir -p -- "$(dirname -- "$_uf")"
+    if [ -f "$_uf" ] && cmp -s -- "$_new" "$_uf"; then
+        return 0
+    fi
+    if [ -f "$_uf" ]; then
+        _bak="$_uf.bak-$(date +%Y%m%d-%H%M%S)"
+        cp -f -- "$_uf" "$_bak" && say "旧单元备份成 $_bak"
+    fi
+    mv -f -- "$_new" "$_uf" || die "写 $_uf 失败"
+    say "已写 $_uf"
+    return 1
+}
+
+# daemon-reload → enable --now；**内容变了且原本就在跑**时补一次 restart ——
+# `enable --now` 对已经在跑的单元不会重启它（单元文件改了、跑的还是旧参数，实测踩过）。
+unit_enable() {
+    _name=$1
+    _changed=${2:-0}
+    _was_active=$(systemctl_user is-active "$_name" 2>/dev/null || true)
+    systemctl_user daemon-reload || die "daemon-reload 失败"
+    if ! systemctl_user enable --now "$_name"; then
+        warn "enable --now 失败，看：systemctl --user status $_name"
+        return 1
+    fi
+    if [ "$_changed" = 1 ] && [ "$_was_active" = active ]; then
+        say "单元内容变了：restart 一次让新参数生效"
+        systemctl_user restart "$_name" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 cmd_tunnel_install() {
     _sec=3
     _rp=
@@ -437,20 +486,12 @@ cmd_tunnel_install() {
         say "  $SYSTEMCTL --user enable --now $UNIT_NAME"
         return 0
     fi
-    mkdir -p -- "$(unit_dir)"
-    if [ -f "$uf" ] && cmp -s -- "$_tmp" "$uf"; then
+    _changed=1
+    if unit_write "$uf" "$_tmp"; then
         say "单元内容没变：$uf"
         _changed=0
-        rm -f -- "$_tmp"
-    else
-        _changed=1
-        if [ -f "$uf" ]; then
-            _bak="$uf.bak-$(date +%Y%m%d-%H%M%S)"
-            cp -f -- "$uf" "$_bak" && say "旧单元备份成 $_bak"
-        fi
-        mv -f -- "$_tmp" "$uf" || die "写 $uf 失败"
-        say "已写 $uf"
     fi
+    rm -f -- "$_tmp"
 
     if [ "$_no_enable" = 1 ]; then
         say ""
@@ -461,19 +502,8 @@ cmd_tunnel_install() {
 
     say ""
     say "== daemon-reload + enable --now $UNIT_NAME"
-    # enable --now 对**已经在跑**的单元不会重启它 —— 所以内容变了要自己补一次 restart，
-    # 否则单元文件改了、真正跑的 ssh 还是旧参数（漂移）。
-    _was_active=$(systemctl_user is-active "$UNIT_NAME" 2>/dev/null || true)
     _nr_before=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
-    systemctl_user daemon-reload || die "daemon-reload 失败"
-    if ! systemctl_user enable --now "$UNIT_NAME"; then
-        warn "enable --now 失败，看：systemctl --user status $UNIT_NAME"
-        return 1
-    fi
-    if [ "$_changed" = 1 ] && [ "$_was_active" = active ]; then
-        say "单元内容变了：restart 一次让新参数生效"
-        systemctl_user restart "$UNIT_NAME" >/dev/null 2>&1 || true
-    fi
+    unit_enable "$UNIT_NAME" "$_changed" || return 1
 
     # 3) 起来之后**停 3 秒再看一遍**：Type=simple 的 active 只说明进程被 fork 出来了；
     #    认证失败 / 端口被占的 ssh 会立刻退，光看 is-active 看不出来 —— 要看 NRestarts。
@@ -500,14 +530,19 @@ cmd_tunnel_install() {
     say "linger    Linger=$_lg"
     [ "$_lg" = yes ] || say "          登录会话一结束服务就停 → loginctl enable-linger $_me"
 
-    # NRestarts 是**累计**计数器（过去失败过也留着），所以只比"这次装的前后有没有涨"
-    if [ -n "$_nr" ] && [ -n "$_nr_before" ] && [ "$_nr" != "$_nr_before" ]; then
-        warn ""
-        warn "⚠️ 这次起来之后它已经在重启了（NRestarts $_nr_before → $_nr）："
-        warn "   多半是云上 ${remote_port_v} 被别的隧道占着"
-        warn "   （ExitOnForwardFailure=yes 让 ssh 秒退 → Restart=always 无限重试，hazards H14），"
-        warn "   或者登录 / 密钥不对（auth 失败也是 3 秒一次地重试，不会自己停下 —— H16）。最近几行："
-        systemctl_user --no-pager -l status "$UNIT_NAME" 2>&1 | tail -n 12 >&2 || true
+    # NRestarts 是**累计**计数器：`systemctl restart` 会把它**清零**，所以只有"涨了"
+    # 才说明真在反复重启（拿 != 比会把清零当成异常，2026-10-07 踩过）。
+    if [ -n "$_nr" ] && [ -n "$_nr_before" ]; then
+        case $_nr in *[!0-9]*) _nr_num=0 ;; *) _nr_num=$_nr ;; esac
+        case $_nr_before in *[!0-9]*) _nr_before_num=0 ;; *) _nr_before_num=$_nr_before ;; esac
+        if [ "$_nr_num" -gt "$_nr_before_num" ]; then
+            warn ""
+            warn "⚠️ 这次起来之后它已经在重启了（NRestarts $_nr_before → $_nr）："
+            warn "   多半是云上 ${remote_port_v} 被别的隧道占着"
+            warn "   （ExitOnForwardFailure=yes 让 ssh 秒退 → Restart=always 无限重试，hazards H14），"
+            warn "   或者登录 / 密钥不对（auth 失败也是 3 秒一次地重试，不会自己停下 —— H16）。最近几行："
+            systemctl_user --no-pager -l status "$UNIT_NAME" 2>&1 | tail -n 12 >&2 || true
+        fi
     fi
 }
 
@@ -625,19 +660,51 @@ cmd_tunnel_status() {
     say "linger    Linger=$(linger_state)"
     [ "$(linger_state)" = yes ] || say "          no 的话登录会话一结束服务就停：loginctl enable-linger $_me"
 
+    # token broker（手机固定地址靠它把 / 302 到当前 token）
+    buf=$(broker_unit_file)
+    say "broker    单元 $buf$([ -f "$buf" ] || printf '（没装：dsh-remote broker-install）')"
+    if [ -f "$buf" ]; then
+        _bs=$(systemctl_user is-active "$BROKER_UNIT_NAME" 2>/dev/null || true)
+        [ -n "$_bs" ] || _bs=未知
+        _be=$(systemctl_user is-enabled "$BROKER_UNIT_NAME" 2>/dev/null || true)
+        [ -n "$_be" ] || _be=未知
+        say "          状态 is-active=$_bs  is-enabled=$_be"
+    fi
+    _tf=$(token_file)
+    if [ -s "$_tf" ]; then
+        say "          token 文件有（$(wc -c <"$_tf" | tr -d ' ') 字节，$(date -r "$_tf" '+%m-%d %H:%M' 2>/dev/null || printf '?' 修改)）—— harness 正在跑"
+    else
+        say "          token 文件没有（$_tf）—— 用 env 里的 harness 函数起一次 dsh web 就会有"
+    fi
+    if port_listening "$broker_local_port"; then
+        say "          本机 127.0.0.1:${broker_local_port} 在听 ✓"
+    else
+        say "          本机 127.0.0.1:${broker_local_port} 没在听（broker 没跑？）"
+    fi
+
     if [ "$_probe" = 1 ]; then
         say ""
         say "== --probe：上云只读看一眼（ss / curl，不改云上任何东西）"
         _opts="-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -p $ssh_port"
         [ -n "$identity_key" ] && _opts="$_opts -i $identity_key"
+        # 远端脚本走 stdin（sh -s）：比把一整串塞进 ssh 的参数里少一层引号地狱
         # shellcheck disable=SC2086
-        _out=$(ssh $_opts "${ssh_user}@${host}" \
-            "ss -ltn | grep '127.0.0.1:${remote_port_v}' || echo '（云上 ${remote_port_v} 没有监听）'; curl -s -o /dev/null -w 'http_code=%{http_code}\n' --max-time 8 http://127.0.0.1:${remote_port_v}/" 2>&1)
+        _out=$(ssh $_opts "${ssh_user}@${host}" sh -s <<EOF 2>&1
+ss -ltn | grep '127.0.0.1:${remote_port_v}' || echo '（云上 ${remote_port_v} 没有监听）'
+printf 'http_code=%s\n' "\$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:${remote_port_v}/)"
+printf 'broker_http_code=%s\n' "\$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:${broker_remote_port}/)"
+EOF
+        )
         printf '%s\n' "$_out" | sed 's/^/  /'
         case $_out in
-        *http_code=401*) say "  判据    云上在听，且请求穿到了家里的 dsh web（它自己还要 token，所以回 401 原文）✓" ;;
-        *http_code=000*) warn "  判据    云上端口没通（隧道断了 / 云上没在听）" ;;
-        *) say "  判据    自己看上面的 http_code（401 = 到家里了；其它码看 hazards H11）" ;;
+        *http_code=401*) say "  判据    dsh web：云上在听，请求穿到了家里的 dsh web（它自己还要 token，所以回 401 原文）✓" ;;
+        *http_code=000*) warn "  判据    dsh web：云上那个端口没通（隧道断了 / 云上没在听）" ;;
+        *) say "  判据    dsh web：自己看 http_code（401 = 到家里了；其它码看 hazards H11）" ;;
+        esac
+        case $_out in
+        *broker_http_code=302*) say "  判据    broker：不带 token 的入口 302 到当前 token ✓（手机收藏的固定地址就是它）" ;;
+        *broker_http_code=503*) say "  判据    broker：503 —— 家里 harness 还没用 env 里的 harness 函数起过（没 token），或 broker 没装" ;;
+        *broker_http_code=*) say "  判据    broker：自己看 broker_http_code（302 = 好；503 = 没 token；000 = 隧道那条没通）" ;;
         esac
 
         _pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
@@ -649,6 +716,179 @@ cmd_tunnel_status() {
             say "  公网    $_pub → HTTP $_code（不带密码应 401 = Caddy 在挡）"
         fi
     fi
+}
+
+# --------------------------------------------- token broker（手机固定地址那半）
+# 背景：`dsh web` 的 token 是**每个进程随机、只在内存里**的（没有"固定 token / 关鉴权"
+# 的官方开关，2026-10-07 查过 `dsh web --help` 与 dsh-client-connection 源码）。
+# 于是：`harness` 函数（env.zsh / env.bash）把启动时打印的 token 写进状态文件，
+# 家里这个 broker 把「不带 token 的 / 请求」302 到 `/?token=<当前值>`，
+# Caddy 只在这一种请求上把流量给它 —— 手机收藏的固定地址就永远能用（ADR-0014）。
+# **broker 只做重定向，不代理任何应用流量**（SSE/WebSocket 一律 Caddy 直连 dsh web）。
+BROKER_UNIT_NAME=dsh-token-broker.service
+broker_unit_file() { printf '%s/%s' "$(unit_dir)" "$BROKER_UNIT_NAME"; }
+token_file() { printf '%s' "${DSH_REMOTE_TOKEN_FILE:-$STATE_DIR/current-token.txt}"; }
+
+broker_unit_body() { # 渲染 broker 单元（ExecStart 是绝对路径的 python3 + 本脚本）
+    _py=${DSH_REMOTE_PYTHON:-$(command -v python3 2>/dev/null || printf '')}
+    [ -n "$_py" ] || die "PATH 里没有 python3（broker 是 python3 写的，单元里要绝对路径）"
+    _bin=$SELF_DIR/dsh-token-broker
+    [ -f "$_bin" ] || die "找不到 $_bin（wtool install 过吗？）"
+    tunnel_conf # 拿 broker_local_port / local_port_v
+    case $broker_local_port in '' | off | OFF | Off | 0) die "broker_local_port=off：那就别装 broker" ;; esac
+    cat <<EOF
+[Unit]
+Description=DSH token broker（把不带 token 的入口 302 到当前 token）
+Documentation=file:$PROJ_DIR/README.md
+# 0 = 无限重试（同 dsh-tunnel.service；这个键属于 [Unit]）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$(sd_quote "$_py") $(sd_quote "$_bin") --port $(sd_quote "$broker_local_port") --web-port $(sd_quote "$local_port_v") --token-file $(sd_quote "$(token_file)")
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-token-broker
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+cmd_token_broker() { # 前台跑 broker（常驻用 broker-install；这条留着手工调试）
+    _port=
+    _web=
+    _tf=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --port)
+            _port=${2:-}
+            shift 2
+            ;;
+        --web-port)
+            _web=${2:-}
+            shift 2
+            ;;
+        --token-file)
+            _tf=${2:-}
+            shift 2
+            ;;
+        *) die "token-broker 不认识的参数：$1（--port / --web-port / --token-file）" ;;
+        esac
+    done
+    command -v python3 >/dev/null 2>&1 || die "PATH 里没有 python3"
+    tunnel_conf
+    [ -n "$_port" ] && broker_local_port=$_port
+    [ -n "$_web" ] && local_port_v=$_web
+    [ -n "$_tf" ] || _tf=$(token_file)
+    say "token broker：http://127.0.0.1:${broker_local_port}/ → 302 /?token=（token 文件 $(token_file)）"
+    say "（云上那条反向隧道：127.0.0.1:${broker_remote_port} → 这里；Caddy 只把「不带 token 的 /」给它）"
+    exec python3 "$SELF_DIR/dsh-token-broker" \
+        --port "$broker_local_port" --web-port "$local_port_v" --token-file "$_tf"
+}
+
+cmd_broker_install() {
+    _dry=0
+    _no_enable=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --no-enable)
+            _no_enable=1
+            shift
+            ;;
+        --dry-run)
+            _dry=1
+            shift
+            ;;
+        *) die "broker-install 不认识的参数：$1（--no-enable / --dry-run）" ;;
+        esac
+    done
+    tunnel_conf
+    uf=$(broker_unit_file)
+    say "token broker  127.0.0.1:${broker_local_port}（云上 127.0.0.1:${broker_remote_port} → 这里，走同一条 ssh）"
+    say "token 文件    $(token_file)（由 env.zsh / env.bash 里的 harness 函数写）"
+    say "单元          $uf（Restart=always，RestartSec=3）"
+    say ""
+    if [ "$_dry" = 0 ] && [ "$_no_enable" = 0 ] && ! systemd_user_ok; then
+        warn "systemctl --user 连不上用户管理器（systemd --user 没在跑）。"
+        warn "  loginctl enable-linger $(id -un)    # 没登录时也跑用户服务（本机实测不需要 sudo）"
+        die "什么都没动"
+    fi
+    _tmp=$(mktemp) || die "mktemp 失败"
+    broker_unit_body >"$_tmp" || {
+        rm -f -- "$_tmp"
+        die "渲染 broker 单元失败"
+    }
+    if [ "$_dry" = 1 ]; then
+        say "== --dry-run：单元内容如下（一个字节都没写）"
+        cat -- "$_tmp"
+        rm -f -- "$_tmp"
+        say ""
+        say "真跑时会执行："
+        say "  $SYSTEMCTL --user daemon-reload"
+        say "  $SYSTEMCTL --user enable --now $BROKER_UNIT_NAME"
+        return 0
+    fi
+    _changed=1
+    if unit_write "$uf" "$_tmp"; then
+        say "单元内容没变：$uf"
+        _changed=0
+    fi
+    rm -f -- "$_tmp"
+    if [ "$_no_enable" = 1 ]; then
+        say ""
+        say "--no-enable：只写了单元。自己来："
+        say "  systemctl --user daemon-reload && systemctl --user enable --now $BROKER_UNIT_NAME"
+        return 0
+    fi
+    say ""
+    say "== daemon-reload + enable --now $BROKER_UNIT_NAME"
+    unit_enable "$BROKER_UNIT_NAME" "$_changed" || return 1
+
+    sleep 2
+    _state=$(systemctl_user is-active "$BROKER_UNIT_NAME" 2>/dev/null || true)
+    [ -n "$_state" ] || _state=未知
+    _enabled=$(systemctl_user is-enabled "$BROKER_UNIT_NAME" 2>/dev/null || true)
+    [ -n "$_enabled" ] || _enabled=未知
+    _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${broker_local_port}/" 2>/dev/null || printf '000')
+    say ""
+    say "== 判据"
+    say "服务      is-active=$_state  is-enabled=$_enabled"
+    say "本机      curl -s -D - http://127.0.0.1:${broker_local_port}/   # 有 token → 302；没 token → 503"
+    say "现在      HTTP $_code$([ "$_code" = 503 ] && printf '（还没有 token：先在家里跑一次 harness）')"
+    say "日志      journalctl --user -u $BROKER_UNIT_NAME -n 20 -f"
+    say "云上      ssh ${ssh_user}@${host} \"curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${broker_remote_port}/\"   # 应 302/503"
+    say "体检      dsh-remote tunnel-status --probe"
+}
+
+cmd_broker_uninstall() {
+    _dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --dry-run)
+            _dry=1
+            shift
+            ;;
+        *) die "broker-uninstall 不认识的参数：$1（--dry-run）" ;;
+        esac
+    done
+    uf=$(broker_unit_file)
+    say "撤销单元  $uf"
+    if [ "$_dry" = 1 ]; then
+        say "（--dry-run：会 disable --now、删单元文件、daemon-reload；一个字节都没动）"
+        return 0
+    fi
+    if systemd_user_ok; then
+        systemctl_user disable --now "$BROKER_UNIT_NAME" >/dev/null 2>&1 || true
+        systemctl_user daemon-reload >/dev/null 2>&1 || true
+        say "已 disable --now（服务停了、开机不再自启）"
+    else
+        warn "systemctl --user 连不上（用户管理器没在跑）：只删文件"
+    fi
+    rm -f -- "$uf" && say "已删 $uf"
+    say "token 文件 $(token_file) 留着（harness 函数还在写它）"
 }
 
 cmd_systemd() { # 旧名字：保留，等价 tunnel-install --no-enable（以前就是"只生成不 enable"）
@@ -995,6 +1235,375 @@ EOF
     return 1
 }
 
+# ------------------------------------------------- 一条命令装好（server）
+# `dsh-remote server`：问清"云上哪台、用什么账号" → 自检（ssh / sudo / docker / 安全组）
+# → 云上部署（复用 cloud/relay.sh 的用户空间模式）→ 家里装 token broker + 常驻隧道
+# → 起 harness（自动捕获 token）→ 打印固定地址 + 二维码。
+# 每一步都能单独重跑（幂等）；参数给全 + --yes 就完全不用交互（测试也走这条路）。
+derive_password() { # 20 位随机，只用字母数字（要塞进远程命令行，别带引号风险）
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 48 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-20
+    else
+        LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 20
+    fi
+}
+
+server_ask() { # server_ask <提示> <默认值>：--yes 或 stdin 不是终端时直接取默认值
+    _q=$1
+    _d=${2:-}
+    if [ "${srv_yes:-0}" = 1 ] || [ ! -t 0 ]; then
+        printf '%s' "$_d"
+        return 0
+    fi
+    if [ -n "$_d" ]; then
+        printf '%s [%s]: ' "$_q" "$_d" >&2
+    else
+        printf '%s: ' "$_q" >&2
+    fi
+    IFS= read -r _a || _a=
+    [ -n "$_a" ] || _a=$_d
+    printf '%s' "$_a"
+}
+
+server_tutorial() {
+    _tu=${ssh_user:-<云上用户名>}
+    _th=${host:-<云上公网 IP>}
+    _tp=${port:-8443}
+    cat <<EOF
+
+== 先在阿里云那台配好三件事（一次就够；配完把这条命令重跑一遍）
+
+① 免密登录（家里 → 云上）
+   家里这把钥匙：~/.ssh/id_ed25519.pub（没有就 ssh-keygen -t ed25519 生成一把）
+     ssh-copy-id -i ~/.ssh/id_ed25519.pub ${_tu}@${_th}
+   验收：ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 ${_tu}@${_th} true && echo ok
+   ⚠️ "能 ssh 上去"不算数：要**不问密码**，而且钥匙得是写进配置的那把 ——
+      不带 -i 的前台 ssh 会偷偷换别的钥匙试，systemd 单元里带 -i 就直接 Permission denied
+      （2026-10-07 实测踩过，见 docs/hazards.md H16）
+
+② 免密 sudo（中继是一个 docker 容器；只放开 docker 这一条就够）
+   在云上执行：
+     echo "\$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/docker" | sudo tee /etc/sudoers.d/90-dsh-remote
+     sudo chmod 440 /etc/sudoers.d/90-dsh-remote
+   验收：ssh ${_tu}@${_th} 'sudo -n docker info >/dev/null && echo ok'
+   （那台已经免密 sudo 了的话，这步跳过）
+
+③ 安全组（控制台里点，工具碰不了）：放行 ${_tp}/tcp
+   来源最好填你家出口 IP；先 0.0.0.0/0 也能用（入口有 TLS + basic auth 挡着，但越窄越好）
+   验收：装完之后在家里 curl -k https://${_th}:${_tp}/ → 401（一直超时 = 没放行）
+
+⚠️ 不许碰云上的 nginx / 80 / 443；我们只用 ${_tp} 这一个口子。
+EOF
+}
+
+server_qr() { # server_qr <url>
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "$1" 2>/dev/null || warn "qrencode 画不出来（不影响用）"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1 && [ -f "$SELF_DIR/dsh-qr" ]; then
+        say "（没装 qrencode，用自带的 dsh-qr 画；这张码也能扫）"
+        python3 "$SELF_DIR/dsh-qr" --ecc M --border 2 \
+            --png "$STATE_DIR/phone-qr.png" --svg "$STATE_DIR/phone-qr.svg" "$1" ||
+            warn "二维码画不出来（不影响用：地址在上面）"
+        say "  二维码图片：$STATE_DIR/phone-qr.png（SVG 同名 .svg）—— 打不开就自己打开图片"
+    else
+        warn "没有 qrencode 也没有 python3/dsh-qr：二维码画不出来，手输地址吧"
+    fi
+}
+
+conf_set() { # conf_set <键> <值>：文件里有就替换，没有就追加（顺手建目录）
+    _k=$1
+    _v=$2
+    mkdir -p -- "$(dirname -- "$CONF")"
+    if [ -f "$CONF" ] && grep -q "^[[:space:]]*$_k[[:space:]]*=" "$CONF"; then
+        sed -i "s|^[[:space:]]*$_k[[:space:]]*=.*|$_k=$_v|" "$CONF"
+    else
+        printf '%s=%s\n' "$_k" "$_v" >>"$CONF"
+    fi
+}
+
+cmd_server() {
+    srv_host=
+    srv_ssh_user=
+    srv_ssh_port=
+    srv_port=
+    srv_web_user=
+    srv_password=
+    srv_dir=
+    srv_docker=
+    srv_yes=0
+    srv_dry=0
+    srv_skip_deploy=0
+    srv_skip_local=0
+    srv_no_harness=0
+    srv_tunnel_port=
+    srv_broker_port=
+    srv_local_port=
+    srv_broker_local=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --host) srv_host=${2:-}; shift 2 ;;
+        --ssh-user) srv_ssh_user=${2:-}; shift 2 ;;
+        --ssh-port) srv_ssh_port=${2:-}; shift 2 ;;
+        --port) srv_port=${2:-}; shift 2 ;;
+        --web-user) srv_web_user=${2:-}; shift 2 ;;
+        --password) srv_password=${2:-}; shift 2 ;;
+        --dir) srv_dir=${2:-}; shift 2 ;;
+        --docker-cmd) srv_docker=${2:-}; shift 2 ;;
+        --tunnel-port) srv_tunnel_port=${2:-}; shift 2 ;;
+        --broker-port) srv_broker_port=${2:-}; shift 2 ;;
+        --local-port) srv_local_port=${2:-}; shift 2 ;;
+        --broker-local-port) srv_broker_local=${2:-}; shift 2 ;;
+        --yes) srv_yes=1; shift ;;
+        --dry-run) srv_dry=1; shift ;;
+        --skip-deploy) srv_skip_deploy=1; shift ;;
+        --skip-local) srv_skip_local=1; shift ;;
+        --no-harness) srv_no_harness=1; shift ;;
+        *) die "server 不认识的参数：$1（dsh-remote help）" ;;
+        esac
+    done
+
+    # 1) 收集输入（命令行给过就不问；--yes 一律用默认值）
+    say "== 收集信息（不想被问就在命令行给全，或者加 --yes）"
+    host=${srv_host:-$(conf_any cloud_host CLOUD_HOST 2>/dev/null || printf '')}
+    host=$(server_ask "阿里云那台的公网 IP / 域名" "$host")
+    [ -n "$host" ] || {
+        server_tutorial
+        die "没有 host"
+    }
+    ssh_user=${srv_ssh_user:-$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf '%s' "$(id -un)")}
+    ssh_user=$(server_ask "云上登录用户（免密 ssh 的那个）" "$ssh_user")
+    ssh_port=${srv_ssh_port:-$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')}
+    ssh_port=$(server_ask "云上 ssh 端口" "$ssh_port")
+    port=${srv_port:-8443}
+    port=$(server_ask "对外端口（手机访问的）" "$port")
+    web_user=${srv_web_user:-$(conf_any web_user WEB_USER 2>/dev/null || printf 'dsh')}
+    web_user=$(server_ask "手机登录用的用户名" "$web_user")
+    password=${srv_password:-}
+    if [ -z "$password" ]; then
+        if [ "$srv_yes" = 1 ] || [ ! -t 0 ]; then
+            password=$(derive_password)
+        else
+            printf '手机登录用的密码（回车 = 自动生成 20 位随机）: ' >&2
+            IFS= read -r password || password=
+            [ -n "$password" ] || password=$(derive_password)
+        fi
+    fi
+    case $password in
+    *[!A-Za-z0-9_.@%+=:-]*) die "密码里别用引号/空格这类字符（要塞进远程命令行）：$password" ;;
+    esac
+    remote_dir=${srv_dir:-/home/mindul/dsh-relay}
+    tunnel_port=${srv_tunnel_port:-$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')}
+    local_port=${srv_local_port:-$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')}
+    broker_port=${srv_broker_port:-$(conf_any broker_remote_port BROKER_REMOTE_PORT 2>/dev/null || printf '18081')}
+    broker_local=${srv_broker_local:-$(conf_any broker_local_port BROKER_LOCAL_PORT 2>/dev/null || printf '3081')}
+    identity=$(conf_any identity IDENTITY 2>/dev/null || printf '')
+    case $identity in '~/'*) identity="$HOME/${identity#\~/}" ;; esac
+
+    say ""
+    say "云上        ${ssh_user}@${host}:${ssh_port}（目录 $remote_dir）"
+    say "对外        https://${host}:${port}/   用户名 ${web_user}（密码下面打）"
+    say "家里        dsh web 127.0.0.1:${local_port}；token broker 127.0.0.1:${broker_local}"
+    say "隧道        云上 ${tunnel_port} → 家里 ${local_port}；云上 ${broker_port} → 家里 ${broker_local}"
+
+    # 2) 自检（每条都带"怎么修"）
+    say ""
+    say "== 自检"
+    _ssh_opts="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -p $ssh_port"
+    [ -n "$identity" ] && _ssh_opts="$_ssh_opts -i $identity"
+    _ssh_opts_ci="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -p $ssh_port"
+    srv_ssh() { # srv_ssh <远端命令…>
+        # shellcheck disable=SC2086
+        ssh $_ssh_opts "$ssh_user@$host" "$@"
+    }
+    if srv_ssh true 2>/dev/null; then
+        _who=$(srv_ssh 'id -un' 2>/dev/null)
+        if [ "$_who" = "$ssh_user" ]; then
+            say "  ssh     免密登录 ✓（远端 id -un = $_who）"
+        else
+            warn "  ssh     登进去了，但远端用户是 $_who（≠ $ssh_user）—— 配置里身份对不上，先弄对"
+            server_tutorial
+            die "自检没过"
+        fi
+    else
+        warn "  ssh     免密登录 ✗（家里 → ${ssh_user}@${host}:${ssh_port}）"
+        server_tutorial
+        die "自检没过（上面三条照做，再重跑）"
+    fi
+    # 免密 sudo 和「直接能用 docker」是两件事：那台阿里云上 mindul 免密 sudo 有、
+    # 但**不在 docker 组**，所以每条 docker 都要 `sudo docker`（2026-10-07 实测，
+    # 第一版把两者混为一谈，真机上直接判成"docker daemon 没反应" —— 见 hazards H18）。
+    if ! srv_ssh 'command -v docker >/dev/null 2>&1' 2>/dev/null; then
+        warn "  docker  云上没有 docker —— 装它属于改系统，工具不代劳。"
+        warn "          阿里云 Ubuntu：sudo apt update && sudo apt install -y docker.io（自己来）"
+        server_tutorial
+        die "自检没过"
+    fi
+    if srv_ssh 'docker info >/dev/null 2>&1' 2>/dev/null; then
+        say "  docker  daemon 在跑，当前用户直接能用 ✓（命令：docker）"
+        srv_docker=${srv_docker:-docker}
+    elif srv_ssh 'sudo -n docker info >/dev/null 2>&1' 2>/dev/null; then
+        say "  docker  daemon 在跑；这个用户不在 docker 组 → 用「sudo docker」✓"
+        srv_docker=${srv_docker:-sudo docker}
+    else
+        warn "  docker  daemon 没反应（docker info 和 sudo -n docker info 都不行）"
+        warn "          云上 systemctl status docker 看看；sudo 没放开就照下面配"
+        server_tutorial
+        die "自检没过"
+    fi
+    _occ=$(srv_ssh "ss -ltn 2>/dev/null | awk '{print \$4}' | grep -c '[:.]${port}\$'" 2>/dev/null || printf '0')
+    _own=$(srv_ssh "$srv_docker ps --filter name=dsh-relay --format '{{.Names}}' 2>/dev/null" 2>/dev/null || printf '')
+    if [ "${_occ:-0}" -gt 0 ] && [ -z "$_own" ]; then
+        warn "  端口    ${port} 已经被别的东西占着（不是我们的 dsh-relay）"
+        warn "          换一个：--port 8444（记得安全组也放行同一个）"
+        die "自检没过"
+    fi
+    if [ -n "$_own" ]; then
+        say "  端口    ${port} 上是我们的 dsh-relay（已经装过 → 这次只重配置）✓"
+    else
+        say "  端口    ${port} 现在空着 ✓"
+    fi
+    _code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "https://${host}:${port}/" 2>/dev/null || printf '000')
+    case $_code in
+    401 | 200 | 403) say "  安全组  从家里能连上 https://${host}:${port}/（HTTP $_code）✓" ;;
+    *) warn "  安全组  从家里连不上（HTTP $_code）—— 控制台里放行 ${port}/tcp（见上面的教程③）"
+       warn "          装完再验也一样：curl -k https://${host}:${port}/ 要 401" ;;
+    esac
+
+    if [ "$srv_dry" = 1 ]; then
+        say ""
+        say "== --dry-run：只打印要做的事，一个字节都不写"
+        say "  ① scp -r ${identity:+-i $identity }cloud/ ${ssh_user}@${host}:${remote_dir}"
+        say "  ② ssh … \"cd ${remote_dir} && sh cloud/relay.sh --ip ${host} --port ${port} \\"
+        say "        --tunnel-port ${tunnel_port} --broker-port ${broker_port} --local-port ${local_port} \\"
+        say "        --user ${web_user} --password '<生成/给的那个>' --no-compose --dir ${remote_dir} --docker-cmd '${srv_docker}'\""
+        say "  ③ 写 $CONF：cloud_host / cloud_user / cloud_ssh_port / remote_port / local_port / broker_* / public_url"
+        say "  ④ dsh-remote broker-install（单元 $(broker_unit_file)）"
+        say "  ⑤ dsh-remote tunnel-install（单元 $(unit_file)）"
+        say "  ⑥ 起 harness（127.0.0.1:${local_port}，token 自动捕获）→ 打印 https://${host}:${port}/ + 二维码"
+        return 0
+    fi
+
+    # 3) 云上部署（复用 relay.sh 的用户空间模式；幂等）
+    if [ "$srv_skip_deploy" = 1 ]; then
+        say ""
+        say "== 云上部署：--skip-deploy，跳过"
+    else
+        say ""
+        say "== 云上部署（scp cloud/ → relay.sh --no-compose；可重复跑）"
+        _scp_opts="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -P $ssh_port"
+        [ -n "$identity" ] && _scp_opts="$_scp_opts -i $identity"
+        # shellcheck disable=SC2086
+        if ! scp -r $_scp_opts "$PROJ_DIR/cloud" "$ssh_user@$host:$remote_dir"; then
+            die "scp 失败（目录 $remote_dir 建得出来吗？$ssh_user@$host:$ssh_port 通吗？）"
+        fi
+        _out="$STATE_DIR/server-install.log"
+        mkdir -p -- "$STATE_DIR"
+        _rcmd="cd $remote_dir && sh cloud/relay.sh --ip $host --port $port --tunnel-port $tunnel_port --broker-port $broker_port --local-port $local_port --user $web_user --password '$password' --no-compose --dir $remote_dir --docker-cmd '$srv_docker'"
+        # ⚠️ 别写 `srv_ssh … | tee` 再判 $?：管道里拿到的是 **tee** 的退出码，
+        # 云上失败会被吞掉（2026-10-07 真机跑时踩到，relay.sh rc=2 却报成功）。
+        say "（云上在跑，输出等它跑完一起打）"
+        srv_ssh "$_rcmd" >"$_out" 2>&1
+        _rc=$?
+        cat -- "$_out" || true
+        if [ "$_rc" -ne 0 ]; then
+            warn "云上那步没成功（rc=$_rc；完整输出在 $_out）"
+            return 1
+        fi
+        say "（完整输出：$_out）"
+    fi
+
+    if [ "$srv_skip_deploy" = 1 ]; then
+        :
+    else
+        _chk=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "https://${host}:${port}/" 2>/dev/null || printf '000')
+        case $_chk in
+        401) say "入口判据   https://${host}:${port}/ → 401（basic auth 在挡）✓" ;;
+        302) say "入口判据   https://${host}:${port}/ → 302（broker 在补 token）✓" ;;
+        000) warn "入口判据   从家里连不上 https://${host}:${port}/ —— 多半是安全组没放行 ${port}/tcp" ;;
+        *) warn "入口判据   返回 $_chk（预期 401）—— 云上 docker logs dsh-relay 看看" ;;
+        esac
+    fi
+
+    # 4) 把这几样写进 remote.conf（下次不用再填）
+    conf_set cloud_host "$host"
+    conf_set cloud_user "$ssh_user"
+    conf_set cloud_ssh_port "$ssh_port"
+    conf_set remote_port "$tunnel_port"
+    conf_set local_port "$local_port"
+    conf_set broker_remote_port "$broker_port"
+    conf_set broker_local_port "$broker_local"
+    conf_set public_url "https://${host}:${port}"
+    say "已写 $CONF（cloud_host / public_url / broker_* …）"
+
+    # 5) 家里：broker + 常驻隧道（两个 systemd --user 单元）
+    if [ "$srv_skip_local" = 1 ]; then
+        say ""
+        say "== 家里：--skip-local，跳过 broker-install / tunnel-install"
+    else
+        say ""
+        say "== 家里 1/2：token broker"
+        cmd_broker_install || return 1
+        say ""
+        say "== 家里 2/2：常驻隧道（含 broker 那条 -R）"
+        cmd_tunnel_install --remote-port "$tunnel_port" --local-port "$local_port" || return 1
+    fi
+
+    _url="https://${host}:${port}"
+
+    # 6) 起 harness（前台；token 由 env 里的 harness 函数捕获给 broker）
+    say ""
+    if [ "$srv_no_harness" = 1 ]; then
+        say "== harness：--no-harness，不启动。自己起："
+        say "   harness --no-open          # 用的是 dsh-remote 装的 env 里的那个函数"
+        say "   （那个函数会把 token 写进 $(token_file)，broker 就是靠它补 token 的）"
+    elif port_listening "$local_port"; then
+        say "== harness：127.0.0.1:${local_port} 上已经有实例在跑 —— **不动它**（重启会打断正在跑的会话）"
+        if [ -s "$(token_file)" ]; then
+            say "   token 已经捕获过 ✓ → 手机那条固定地址现在就能用"
+        else
+            warn "   但当前这个实例不是用 env 里的 harness 函数起的 → broker 手里还没有 token，"
+            warn "   手机打开固定地址会看到 503「还没有当前 token」。"
+            warn "   等这个实例用完、你重新用 harness 起一次（或者 dsh-remote serve）就会自动好。"
+        fi
+    else
+        say "== 起 harness（前台；token 会被自动捕获；Ctrl-C 退出）"
+        say "   地址：http://127.0.0.1:${local_port}/"
+        say ""
+        say "================================================================"
+        say "手机怎么用（三步）："
+        say "  1) 浏览器打开（或扫下面的二维码）：$_url"
+        say "  2) 自签证书警告 → 继续访问（有域名+真证书的话没这一步）"
+        say "  3) 弹出 basic auth：用户名 ${web_user}，密码 ${password}"
+        say "     进去之后 dsh web 自己的 token 由家里的 broker 自动补上 —— 以后不用再抄地址"
+        say "================================================================"
+        server_qr "$_url"
+        say ""
+        _hs=$(command -v bash >/dev/null 2>&1 && printf 'bash' || printf 'sh')
+        exec "$_hs" -c ". '$PROJ_DIR/env.$_hs'; harness --no-open --port $local_port"
+    fi
+
+    # 7) 收尾：打印用法（跑到这儿说明 harness 没被这个进程接管）
+    say ""
+    say "================================================================"
+    say "手机怎么用（三步）："
+    say "  1) 浏览器打开（或扫下面的二维码）：$_url"
+    say "  2) 自签证书警告 → 继续访问（有域名+真证书的话没这一步）"
+    say "  3) 弹出 basic auth：用户名 ${web_user}，密码 ${password}"
+    say "     （这三样也写在云上 ${remote_dir}/relay-password.txt，600）"
+    say "================================================================"
+    server_qr "$_url"
+    say ""
+    say "改密码 / 停 / 看日志："
+    say "  改密码：云上 cd ${remote_dir} && sh cloud/relay.sh --ip ${host} --port ${port} --password '<新密码>' --no-compose --dir ${remote_dir} --docker-cmd '${srv_docker}'"
+    say "  停中继：ssh ${ssh_user}@${host} '${srv_docker} rm -f dsh-relay'"
+    say "  看日志：ssh ${ssh_user}@${host} '${srv_docker} logs --tail 50 dsh-relay'"
+    say "  家里体检：dsh-remote tunnel-status --probe"
+    say "  撤家里：dsh-remote tunnel-uninstall && dsh-remote broker-uninstall"
+    say "  别忘了安全组只放 ${port}/tcp：${tunnel_port} / ${broker_port} / 云上 ssh 之外都别开"
+}
+
 cmd_log() {
     for f in "$STATE_DIR/notify.log" "$STATE_DIR/web.log"; do
         [ -f "$f" ] || continue
@@ -1027,6 +1636,18 @@ tunnel-status)
     shift
     cmd_tunnel_status "$@"
     ;;
+token-broker)
+    shift
+    cmd_token_broker "$@"
+    ;;
+broker-install)
+    shift
+    cmd_broker_install "$@"
+    ;;
+broker-uninstall)
+    shift
+    cmd_broker_uninstall "$@"
+    ;;
 systemd)
     shift
     cmd_systemd "$@"
@@ -1035,6 +1656,10 @@ url) cmd_url ;;
 notify-test) cmd_notify_test ;;
 notify-enable) cmd_notify_enable ;;
 notify-disable) cmd_notify_disable ;;
+server)
+    shift
+    cmd_server "$@"
+    ;;
 cloud-install)
     shift
     cmd_cloud_install "$@"

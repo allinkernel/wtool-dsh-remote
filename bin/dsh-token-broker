@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""dsh-token-broker —— 把"不带 token 的入口请求"302 到当前 token 的地址。
+
+**它只做重定向，绝不代理应用流量**：手机上的会话界面、SSE、WebSocket 一律由 Caddy
+直连家里 `dsh web`（`127.0.0.1:3080`）那条路，broker 不碰。它唯一的存在理由是
+`dsh web` 的 token **每个进程随机生成、只在内存里**（`processLaunchToken`，32 字节
+base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关）—— 手机每次重启后都得
+重新抄一遍带 token 的地址。家里这个服务读 `harness` 函数捕获下来的 token 文件，
+把 `https://<入口>/` 302 到 `/?token=<当前值>`，于是手机收藏的固定地址永远能用。
+
+用法（一般不用手敲，由 `dsh-remote broker-install` 装成 systemd 单元）：
+
+    dsh-token-broker [--port 3081] [--token-file <文件>] [--web-port 3080]
+                     [--host 127.0.0.1]
+
+路由（只有这几条，别的都不做）：
+
+    GET  /      没有 token 参数  → 302 Location: /?token=<当前 token>
+    GET  /go    任何时候        → 302 Location: /?token=<当前 token>
+                                （cookie 过期 / 换过 token 之后的"重进一次"入口）
+    带 token 参数的请求          → 400（那种请求该直接打 dsh web，不该走这儿）
+    其它路径                    → 404；其它方法 → 405
+    读不到 token 文件           → 503（**绝不** 302 到空 token）
+    dsh web 的端口连不上        → 503（宁可说"没在跑"，也别把人送去一个死 token）
+
+只绑 `127.0.0.1`（云上是靠 SSH 反向隧道 `-R 127.0.0.1:18081:127.0.0.1:3081`
+把它接出去的，安全组里不开这个端口）。日志一行一条到 stdout（systemd 收进 journald）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, urlsplit
+
+DEFAULT_PORT = 3081
+DEFAULT_WEB_PORT = 3080
+DEFAULT_HOST = "127.0.0.1"
+
+# 只有这两条路径会被 302：`/`（手机收藏的固定地址）和 `/go`（重进入口）。
+REDIRECT_PATHS = ("/", "/go")
+
+
+def read_token(path: str) -> "str | None":
+    """读 token 文件（每次请求都重读：harness 重启换 token 要立刻生效）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def web_port_open(port: int, host: str = DEFAULT_HOST, timeout: float = 0.5) -> bool:
+    """dsh web 的端口在不在听 —— 决定"302 到 token"还是"503 明确说没在跑"。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "dsh-token-broker"
+    sys_version = ""
+
+    # 默认的访问日志走 stderr；我们走 stdout（journald 一样收，顺序更好读）
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        sys.stdout.write("%s %s\n" % (self.address_string(), fmt % args))
+        sys.stdout.flush()
+
+    def _respond(self, code: int, text: str, headers=()) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for name, value in headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _handle(self) -> None:
+        parts = urlsplit(self.path)
+        path = parts.path or "/"
+        has_token = "token=" in parts.query
+
+        if path not in REDIRECT_PATHS:
+            self._respond(404, "dsh-token-broker: 这个端口只做 / 和 /go 的重定向\n")
+            return
+        if has_token and path != "/go":
+            self._respond(400, "dsh-token-broker: 带 token 的请求请直接打 dsh web（这儿只补 token）\n")
+            return
+
+        token = read_token(self.server.token_file)  # type: ignore[attr-defined]
+        if token is None:
+            self._respond(
+                503,
+                "dsh-token-broker: 还没有当前 token（%s 不存在或为空）。\n"
+                "先在家里跑 harness（dsh web），它启动时会把 token 写进去。\n"
+                % self.server.token_file,  # type: ignore[attr-defined]
+            )
+            return
+
+        web_port = self.server.web_port  # type: ignore[attr-defined]
+        if not web_port_open(web_port):
+            self._respond(
+                503,
+                "dsh-token-broker: dsh web 没在 127.0.0.1:%d 上听（token 文件在也没用）。\n"
+                "先在家里跑 harness（dsh web）。\n" % web_port,
+            )
+            return
+
+        location = "/?token=%s" % quote(token, safe="")
+        self._respond(302, "去 %s\n" % location, (("Location", location),))
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._respond(405, "dsh-token-broker: 只认 GET / HEAD\n", (("Allow", "GET, HEAD"),))
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dsh-token-broker",
+        description="把不带 token 的入口 302 到当前 token（只重定向，不代理）",
+    )
+    ap.add_argument("--host", default=DEFAULT_HOST, help="绑定地址（默认只绑回环 %s）" % DEFAULT_HOST)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("DSH_REMOTE_BROKER_PORT", DEFAULT_PORT)),
+                    help="监听端口（默认 %d）" % DEFAULT_PORT)
+    ap.add_argument("--web-port", type=int, default=DEFAULT_WEB_PORT,
+                    help="dsh web 的端口，用来判它到底在不在跑（默认 %d）" % DEFAULT_WEB_PORT)
+    ap.add_argument("--token-file", default=os.environ.get("DSH_REMOTE_TOKEN_FILE", ""),
+                    help="token 文件（harness 函数写的那个）")
+    args = ap.parse_args(argv)
+
+    if not args.token_file:
+        state = os.environ.get(
+            "DSH_REMOTE_STATE_DIR",
+            os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "dsh-remote"),
+        )
+        args.token_file = os.path.join(state, "current-token.txt")
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.token_file = args.token_file       # type: ignore[attr-defined]
+    server.web_port = args.web_port           # type: ignore[attr-defined]
+    server.daemon_threads = True
+    sys.stdout.write(
+        "dsh-token-broker: http://%s:%d/ → 302 /?token=（token 文件：%s；dsh web 端口：%d）\n"
+        % (args.host, args.port, args.token_file, args.web_port)
+    )
+    sys.stdout.flush()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

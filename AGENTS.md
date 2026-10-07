@@ -97,6 +97,8 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 | **不跑 docker** | `tests/relay-e2e.sh` / `tests/caddy-validate.sh` 要 docker，**只写清怎么人工跑，不代跑**；`tests/run_tests.sh` 在**装了 docker 的机器上**它的 D 节会经 `relay.sh --dry-run` 调一次 `caddy validate`（见 hazards H8） |
 | **真机安装要用户点头** | 本项目天生装在真机上才有用（手机连的就是这台机器），但用户级规矩（2026-10-04）是"wtool 的项目只在容器 / 影子家装、测"—— 助手不得自行 `wtool install tools/dsh-remote` |
 | **钩子桥未证实会触发** | 不许把"会话卡住会推手机"写成已有能力；复查用 `dsh-remote check-hooks`（ADR-006、hazards H3） |
+| **token 是密钥** | `current-token.txt` / `web-url.txt` / `phone-qr.*` 都是运行期状态（600，在 `$WTOOL_PREFIX/var/dsh-remote/` 下），**不进仓库**；二维码里**不编 token**（ADR-0014） |
+| **云上写只限 `/home/mindul/dsh-relay/**`，特权动作只限 `sudo docker run/restart/ps/logs/rm`（限 `dsh-relay`）** | 用户三条硬约束；不许 apt / 改 `/etc` / 动安全组 / 碰 nginx 与 80/443 |
 
 ---
 
@@ -137,17 +139,19 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 268 条（以跑出来的 PASS 行为准），秒级
+sh tests/run_tests.sh         # 363 条（以跑出来的 PASS 行为准），秒级
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
                               #   J 节用 DSH_REMOTE_UNIT_DIR + systemctl/tmux 桩，不碰真 unit / 真 tmux
+                              #   K/L/M 节：broker 起真进程（只绑回环）、dsh-qr 比对向量、server 用假 ssh/scp
 sh tests/caddy-validate.sh    # 3 条，要 docker（caddy:2 镜像，本地没有会去拉）—— 人工跑
 sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再自己撤 —— 人工跑
 ```
 
 `run_tests.sh` 逐节（2026-10-07 实测）：A 语法 10 / B `env.*` 等价 6 /
 C `dsh-notify` 22 / D Caddyfile 渲染 27 / E 子命令 53 / F `cloud-install` 14 /
-G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 / J 常驻隧道 69 = **268**。
+G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 55 / J 常驻隧道 69 /
+K token 固定地址 35 / L 二维码 12 / M 一条命令装好 46 = **363**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
 
 ⚠️ 两个要 docker 的脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码）：
@@ -163,7 +167,7 @@ G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 / J 常驻隧道 69 
 
 ## 已知缺口（别当成已经有能力）
 
-**完整的"还剩什么"在 `BACKLOG.md` 的 U1–U9**；这里只列最容易被误当能力的：
+**完整的"还剩什么"在 `BACKLOG.md` 的 U1–U11**；这里只列最容易被误当能力的：
 
 - **hook 桥还没被证实会触发**（2026-09-21 实测：profile patch 挂上了，但
   `SessionStart`/`Stop`/`PreToolUse` 一个都没触发）。在证实之前，
@@ -171,8 +175,12 @@ G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 / J 常驻隧道 69 
   一次性复查命令（触发 → 0，没触发 → 1）。细节见 ADR-006 / `architecture.md` §9。
 - **真机端到端只走通了一部分**（2026-10-07）：真阿里云中继 + 公网 8443 → 家里
   `dsh web` 走通了（带 basic auth 拿到家里 401 原文）；常驻隧道 `kill -9` 后
-  **3.2s** 回来（实测，见 U3）。**还没验的**：真手机带 token 打开、真 Let's Encrypt、
-  "网络真断"那条重连路、重启机器后会不会自动恢复。
+  **3.2s** 回来（实测，见 U3）；手机固定地址那条链路（`/` 302 → 带 token → cookie → 200）
+  在**本机同构 Caddy** 上实测、"换 token 后固定 URL 仍可用"也实测过（U10），
+  **但拿真 token 从公网走完整一遍还没做** —— 要先让家里的 harness 用新的
+  `harness` 函数重启一次（现在跑着的那个实例的 token 只在它内存里，读不出来，H22）。
+  **还没验的还有**：真手机扫码、真 Let's Encrypt、"网络真断"那条重连路、
+  重启机器后会不会自动恢复、从**一台全新机器**从零跑 `dsh-remote server`。
 - 真阿里云的安全组/防火墙、手机浏览器实测都**没有自动测**；`cloud-install` 只用假
   ssh/scp 验过参数拼装。
 - **常驻隧道要 `loginctl enable-linger`** 才能跨登录会话/开机活着（本机 2026-10-07

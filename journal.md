@@ -294,3 +294,92 @@ README §2/§3/§6/§7、本项目 AGENTS.md 条数与缺口。
 **没做的（如实记）**：真手机带 token 打开；"网络真断"（ServerAlive 那条路）的重连；
 重启机器后服务会不会自己起来（linger 已开、单元已 enable，但没重启过机器）；
 真 Let's Encrypt；安全组规则原文。
+
+---
+
+## 2026-10-07（下午，续）手机固定地址：token broker + `harness` 函数（ADR-0014）
+
+**要解决**：`dsh web` 的 token 每个进程随机、只在内存里（查过 CLI 与源码：没有固定 token /
+关鉴权的开关，也不落盘 —— hazards H22），家里一重启 harness，手机上带 token 的地址就作废。
+
+**做了什么**（都在这条流水里，代码现状见 `architecture.md` §3.2）：
+
+- `env.zsh` / `env.bash` 各加一个**逐字等价**的 `harness` 函数：包装
+  `npx @deepseek-ai/dsh web "$@"`，把启动那行 `dsh web: http://…/?token=…` 的 token
+  写进 `$STATE_DIR/current-token.txt`、完整 URL 写进 `web-url.txt`（都 600），
+  并把 `public_url` 打出来；退出时删掉 token 文件。source 时 `unalias harness`
+  （别名优先于函数，用户原来那条 alias 会盖住它）。
+  测试里先用假 `npx` 跑通 bash/zsh 两份，再拿**真实例**验：token 抓对了。
+- `bin/dsh-token-broker`（172 行，纯 python 标准库）：只绑 `127.0.0.1:3081`，
+  `GET /`（不带 token）与 `/go` → 302 `/?token=<当前值>`；没 token / dsh web 没在听 → 503；
+  别的一律 404/405。**不代理任何应用流量**。
+- `bin/dsh-remote` 加 `token-broker` / `broker-install` / `broker-uninstall`；
+  `tunnel_argv` 多一条 `-R 127.0.0.1:18081:127.0.0.1:3081`；`tunnel-status` 增 broker 段。
+- 两份 Caddyfile 加 `@entry`（`path /` + `not query token=*` + `not header Cookie *dsh-auth-*`
+  → broker）与 `@go`；`relay.sh` 加 `--broker-port`（默认 18081）/`{{BROKER_PORT}}`，
+  自检多打一行 broker。
+
+**怎么验的（判据）**：
+
+- **本机同构 Caddy**：`sh cloud/relay.sh --ip 127.0.0.1 --port 9443 --tunnel-port 3090
+  --broker-port 3082 --local-port 3090 --password testpw-e2e --no-compose --dir /tmp/e2e/relay
+  --docker-cmd docker` 起真 `caddy:2.11.4` 容器（同一份模板渲染出来的配置），
+  家里用 `harness` 函数起自己的实例（3090，独立 `DSH_HOME=/tmp/e2e/dsh`）+ 真 broker（3082）：
+  - `curl -sk -u dsh:testpw-e2e -D - https://127.0.0.1:9443/` → **302**
+    `location: /?token=flsx0…`、`server: dsh-token-broker`；
+  - 跟随（新 cookie jar）→ `final=200 redirects=2` + `<title>DeepSeek Harness</title>`；
+  - 带 cookie 再打 `/` → **200、0 次跳转**（证明 `not header Cookie` 那条真的防住了死循环）；
+  - 带 token 直连（老用法）→ `303 ./` + `Set-Cookie: dsh-auth-…`；
+  - `/go` → 302；把 token 文件挪走 → **503**（经 Caddy，body 是 broker 那句人话）。
+- **换 token 后固定 URL 仍可用**（核心判据）：杀掉我的实例、用 `harness` 函数重启 →
+  token `flsx0…` → `ibxqL…` → 同一固定 URL **302 指到新 token** → 跟随 → 200 + 标题；
+  旧 token 直连 → **401**；**旧 cookie 仍然有效**（签名密钥存在 DSH_HOME 里，跨重启不变）。
+- **真公网**（`curl -sk --interface eth1 -u dsh:<pw> https://123.56.158.212:8443/`）：
+  不带 token → **302**（`server: dsh-token-broker`，真的穿过了云上 Caddy + 新隧道到家里；
+  用临时占位 token 验的，验完删掉）；`/go` 同样 302；删掉 token 文件 → **503**；
+  `/?token=…` 仍直连 dsh web（401 + 家里原文）。
+- 家里两个单元：`dsh-token-broker.service` + `dsh-tunnel.service`（含两条 `-R`）都
+  `active`/`enabled`；云上 `ss -ltn` 看到 `127.0.0.1:18081`，云上直接 `curl` 它 →
+  **503**（broker 手里还没 token：用户那个实例是 10-05 起的，token 读不出来）。
+
+**没做的**：拿**真 token** 从公网走一遍 302→200 —— 得等用户用新的 `harness` 函数重启一次
+harness（不能动他正在用的那个进程）；真手机扫码。
+
+**顺带修/记的坑**：H22（没有固定 token 开关、token 读不出来）、H17 的加强（`relay.sh`
+现在自己写 `relay-password.txt`；`--password ""` 会静默走随机分支）。
+
+---
+
+## 2026-10-07（下午，续二）一条命令装好：`dsh-remote server` + 自绘二维码（ADR-0015）
+
+**用户要的**：一条命令问清信息 → 说明要什么权限 + 给教程 → 自己部署 → 配账号密码 →
+起 harness → 给链接/二维码 → 扫码就能用。
+
+**做了什么**：`bin/dsh-remote` 加 `server`（`bin/dsh-remote-server` 是等价的薄封装）；
+`bin/dsh-qr` 是自带的二维码实现（纯 python：字节模式、版本 1–40、纠错 L/M/Q/H、
+8 种掩码按标准罚分挑；终端半块画 / 1 位灰度 PNG / SVG）；`relay.sh` 自己写密码文件、
+`--dir` 不存在时先建目录；`scripts/install.sh` 把 `dsh-token-broker` 和
+`dsh-remote-server` 也铺进 `$WTOOL_PREFIX/bin`。
+
+**怎么验的**：
+
+- `bin/dsh-qr`：跟 npm 自带 `qrcode-terminal` 里那份 Kazuhiko Arase 的 JS 实现**逐模块对账**
+  （同一版本 + 同一掩码下矩阵逐字一致；向量进了 L 节）。对账过程抓出我自己两个 bug：
+  ① 预留格式位时把 (8,6)/(6,8) 两个定位模块抹了；② 挑掩码时没把格式位画上去就打罚分。
+  另外确认那份 JS 实现对**非 ASCII 是坏的**（`charCodeAt` 截 8 位），我们按 UTF-8 走
+  （用"把 UTF-8 字节伪装成 latin-1 喂给它"的办法对上了账）。
+- `server`：M 节 46 条离线用例（假 ssh/scp/curl）覆盖四类自检失败的指引、`--dry-run`
+  一个字节不写、`--yes` 全参跑通、部署失败必须非 0、薄封装等价。
+- **真机幂等跑通**（那台已经在跑的阿里云）：自检 → scp → `relay.sh`（重渲染 + 重启容器，
+  rc=0）→ 回写 `remote.conf` → 两个单元 → 打印固定地址 + 二维码（PNG 落在
+  `~/.local/state/dsh-remote/phone-qr.png`；解回来与终端矩阵逐位一致）。
+  入口判据：不带密码 401；带密码不带 token 503（broker 还没 token）；
+  带密码带 token 401 + 家里 dsh web 原文。
+- **真机抓出两个 bug**（都修了 + 加了回归）：① 把"能免密 sudo"当成"能直接用 docker"，
+  而那台 `mindul` 不在 docker 组 → 误报"daemon 没反应"（H18）；
+  ② `ssh … | tee` 拿的是 tee 的退出码 → 云上 `relay.sh` rc=2 被吞、密码文件被截成 0
+  字节而我以为成了（H20/H21）。修完重跑：`relay-password.txt` 601 字节、600、
+  内容与 Caddyfile 一致。
+
+**没做的**：从**一台全新机器**从零跑一遍（只验了"已装好之后的幂等重跑"）；
+`--domain`（域名 + Let's Encrypt）没跑过；真手机扫码没验（要用户拿手机）。

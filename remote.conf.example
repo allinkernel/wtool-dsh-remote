@@ -25,6 +25,15 @@ remote_port=18080
 # 家里 harness 的端口（dsh web 听的）
 local_port=3080
 
+# ---------------------------------------------- token broker（手机固定地址那条）
+# `dsh web` 的 token 每个进程随机、只在内存里，手机每次重启后都要重抄地址。
+# 家里这个 302 小服务（`dsh-remote broker-install` 装成 dsh-token-broker.service）
+# 把「不带 token 的 /」重定向到 /?token=<当前值>，手机只要收藏
+# https://<入口>/ 就行。它只做重定向，不代理会话流量（见 docs/adr/0014-*.md）。
+# 设成 off 就不要这条转发（云上那个端口被别人占着时用）。
+broker_local_port=3081
+broker_remote_port=18081
+
 # 断线重连间隔（秒）——**只给前台 `dsh-remote tunnel` 用**。
 # 常驻（`tunnel-install`）不用这个值，它由 systemd 的 RestartSec 决定
 # （命令行 `--restart-sec`，默认 3）。

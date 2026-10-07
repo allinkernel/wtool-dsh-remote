@@ -22,3 +22,63 @@ export DSH_REMOTE_DIR
 # 伞覆盖（设了它两个目录都在它下面）。
 export DSH_REMOTE_CONF_DIR=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}
 export DSH_REMOTE_STATE_DIR=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
+
+# --------------------------------------------------------------- harness 函数
+# `harness` = 起 dsh web，并把它启动时打印的 token 捕获下来。
+#
+# 为什么要包一层：`dsh web` 的 token 是**每个进程随机、只在内存里**的（32 字节
+# base64url；`dsh web --help` 和 harness 源码里都没有"固定 token / 关鉴权"的开关，
+# 2026-10-07 查过 dsh-client-connection 的 processLaunchToken）。手机要访问的固定
+# 地址靠家里的 token broker（`dsh-remote broker-install`，默认 127.0.0.1:3081）
+# 302 到当前 token —— 所以 token 必须落到一个文件里，就是下面这个函数干的。
+#
+#   $DSH_REMOTE_STATE_DIR/current-token.txt   只有 token 一行（600）—— broker 的数据源
+#   $DSH_REMOTE_STATE_DIR/web-url.txt         带 token 的完整地址（600，和 `dsh-remote serve` 同一份）
+#
+# 退出时删掉 current-token.txt：宁可让 broker 回 503「还没起」，也别 302 到一个死 token。
+# 参数原样透传（`harness --no-open` / `harness --port 3090` 都行）。
+#
+# ⚠️ **别名优先于函数**：如果你（或旧文档）写过 `alias harness='npx @deepseek-ai/dsh web'`，
+# 先 `unalias harness` —— 本文件在 source 时也会替你 unalias 一次。
+# 想在后台起、不占用终端，用 `dsh-remote serve`（它同样把 token 存进 web-url.txt，
+# 但它在后台跑、不接管当前终端）。
+harness() {
+    unalias harness 2>/dev/null || true
+    if ! command -v npx >/dev/null 2>&1; then
+        printf 'harness：PATH 里没有 npx（这套用法是 npx @deepseek-ai/dsh web）\n' >&2
+        return 127
+    fi
+    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub
+    _hr_state=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
+    _hr_tok=$_hr_state/current-token.txt
+    _hr_url=$_hr_state/web-url.txt
+    _hr_conf=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}/remote.conf
+    mkdir -p -- "$_hr_state" 2>/dev/null
+
+    npx @deepseek-ai/dsh web "$@" 2>&1 | while IFS= read -r _hr_line; do
+        case $_hr_line in
+        *'dsh web: http'*)
+            # 那行长这样：dsh web: http://127.0.0.1:3080/?token=XXXX (LAN: …)
+            # 按空格切成词，取**第一个** http URL —— 别用贪婪的 `.*\(...\)`：
+            # 那会抓到行尾那个 LAN 地址（实测踩过）。
+            _hr_u=$(printf '%s\n' "$_hr_line" | tr ' ' '\n' |
+                sed -n '/^http:\/\/.*[?&]token=/p' | head -n 1)
+            case $_hr_u in
+            *token=*)
+                printf '%s\n' "${_hr_u##*token=}" >"$_hr_tok" && chmod 600 -- "$_hr_tok" 2>/dev/null
+                printf '%s\n' "$_hr_u" >"$_hr_url" && chmod 600 -- "$_hr_url" 2>/dev/null
+                printf '[dsh-remote] 已捕获 token → %s\n' "$_hr_tok"
+                _hr_pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+                if [ -n "$_hr_pub" ]; then
+                    printf '[dsh-remote] 手机固定地址：%s（broker 会补 token；收藏这个就行）\n' "$_hr_pub"
+                fi
+                ;;
+            esac
+            ;;
+        esac
+        printf '%s\n' "$_hr_line"
+    done
+
+    rm -f -- "$_hr_tok"
+    printf '[dsh-remote] harness 退出，token 文件已清掉（broker 现在回 503）\n'
+}

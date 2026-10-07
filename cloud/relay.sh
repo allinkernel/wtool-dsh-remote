@@ -25,6 +25,8 @@
 #   sh relay.sh --domain dsh.example.com --install-docker   # 顺手把 docker 装上
 #   # 用户空间模式（没有 root / 没有 compose 插件）：
 #   sh relay.sh --ip 47.98.1.2 --no-compose --dir ~/dsh-relay --docker-cmd 'sudo docker'
+#     可选：--tunnel-port 18080（dsh web 那条）、--broker-port 18081（token broker 那条）、
+#           --local-port 3080（家里 dsh web 的端口，只用来改写 Host/Origin）
 #
 # 可重复跑：每次重新渲染 Caddyfile（旧的备份）、recreate 容器、再自检。
 # 密码不给 --password 就每次重新随机。
@@ -38,6 +40,9 @@ set -eu
 
 TUNNEL_PORT=18080
 LOCAL_PORT=3080
+# token broker 那条反向隧道（云上 18081 → 家里 3081）：Caddy 只把「不带 token 的 /」
+# 转给它，由它 302 到 /?token=<当前值>（ADR-0014）。
+BROKER_PORT=18081
 CADDY_USER=dsh
 CADDY_PASSWORD=
 DOMAIN=
@@ -87,6 +92,10 @@ while [ $# -gt 0 ]; do
     --tunnel-port)
         TUNNEL_PORT=${2:-}
         shift 2
+        ;;
+    --broker-port)
+        BROKER_PORT=${2:-}
+        shift 2 || die "--broker-port 后面要跟端口"
         ;;
     --local-port)
         LOCAL_PORT=${2:-}
@@ -273,6 +282,7 @@ render() {
         -e "s|{{HASH}}|$HASH|g" \
         -e "s|{{TUNNEL_PORT}}|$TUNNEL_PORT|g" \
         -e "s|{{LOCAL_PORT}}|$LOCAL_PORT|g" \
+        -e "s|{{BROKER_PORT}}|$BROKER_PORT|g" \
         "$TMPL" |
         sed -e "/{{ALLOW_BLOCK}}/r $allow_file" -e "/{{ALLOW_BLOCK}}/d"
 }
@@ -313,6 +323,10 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 say "== 落盘 $DIR/Caddyfile"
+# `--dir` 给的目录可能还不存在（用户空间模式第一次跑、或者换了新目录）：
+# 不先建就是 `set -eu` 下一行 "cannot create …/Caddyfile: Directory nonexistent"
+# 直接退出（2026-10-07 实测踩到；云上那次是目录早被手工建好了才没暴露）。
+mkdir -p -- "$DIR" || die "建不了目录 $DIR（--dir 给对了吗？）"
 if [ -f "$DIR/Caddyfile" ]; then
     cp -f -- "$DIR/Caddyfile" "$DIR/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
 fi
@@ -379,16 +393,52 @@ esac
 if command -v curl >/dev/null 2>&1; then
     back=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$TUNNEL_PORT/" 2>/dev/null || printf '000')
     case $back in
-    000) warn "  隧道那头还没连上（家里 dsh-remote tunnel 起了吗？）—— 还没起就是正常的" ;;
-    *) say "  隧道出口：$back ✓（家里的 harness 已经在后面了）" ;;
+    000) warn "  隧道出口连不上（家里 dsh-remote tunnel-install 装了吗？）—— 还没装就是正常的" ;;
+    *) say "  隧道出口：$back ✓（家里的 dsh web 已经在后面了）" ;;
+    esac
+    # token broker 那条（手机固定地址靠它 302 到当前 token）：302 = 好、503 = 家里还没
+    # 用 harness 函数起过（没 token）、000 = 那条反向隧道没通。都只是提示，不算失败。
+    brok=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$BROKER_PORT/" 2>/dev/null || printf '000')
+    case $brok in
+    302) say "  token broker：302 ✓（不带 token 的 / 会被送到当前 token）" ;;
+    503) warn "  token broker：503 —— 家里 harness 还没用 env 里的 harness 函数起过（没有 token）" ;;
+    000) warn "  token broker：那条反向隧道没通（家里 dsh-remote broker-install 装了吗）" ;;
+    *) warn "  token broker：返回 $brok，预期 302（有 token）或 503（没 token）" ;;
     esac
 fi
+
+# 把"地址 + 用户名 + 密码"**落一份到 $DIR/relay-password.txt（600）**：
+# 以前这文件是人手写的、脚本不更新，于是不给 --password 重跑一次就两边漂移
+# （Caddyfile 是新密码、文件还是旧的 → 文件里的值过不了 basic auth，hazards H17）。
+# 现在脚本自己写，谁重渲染谁负责，漂移从源头没了。
+pw_file="$DIR/relay-password.txt"
+# 给"改密码"那三行提示用的模式参数（domain 模式和 ip 模式的命令行不一样）
+if [ "$MODE" = domain ]; then
+    pw_mode="--domain $DOMAIN --email $EMAIL"
+else
+    pw_mode="--ip $IP"
+fi
+umask 077
+cat >"$pw_file" <<PWEOF
+# dsh-remote 中继入口（由 relay.sh 每次渲染时重写；别手改，改密码就带 --password 重跑）
+URL=$url
+USER=$CADDY_USER
+PASSWORD=$CADDY_PASSWORD
+
+# 改密码三步：
+#   1) 云上：cd $DIR && sh cloud/relay.sh $pw_mode --port $PORT --password '<新密码>' \
+#            --no-compose --dir $DIR --docker-cmd '$DOCKER'
+#   2) 家里：dsh-remote tunnel-status --probe    # 看 broker / 隧道还正常
+#   3) 手机：浏览器里清掉这个站点的 basic auth（或换无痕窗口），用新密码登一次
+PWEOF
+chmod 600 -- "$pw_file" 2>/dev/null || true
 
 say ""
 say "================================================================"
 say "手机收藏这个地址：$url"
 say "用户名：$CADDY_USER"
 say "密码：  $CADDY_PASSWORD"
+say "（这三样也写在 $pw_file，600）"
 say ""
 say "中继器 = 一个 caddy 容器（host 网络）"
 if [ "$NO_COMPOSE" = 1 ]; then

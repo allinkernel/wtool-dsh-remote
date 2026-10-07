@@ -30,6 +30,32 @@
 	}
 
 {{ALLOW_BLOCK}}
+	# ---------------------------------------------------------------- token 重定向
+	# 手机收藏的固定地址（https://<入口>/，不带 token）交给家里的 token broker，
+	# 由它 302 到 /?token=<当前值>（token 每个进程随机、只在内存里，只有家里知道；
+	# 见 docs/adr/0014-*.md）。两条 not 缺一不可：
+	#   not query token=*            带 token 的请求要直连 dsh web；
+	#   not header Cookie *dsh-auth-* 已经换到 cookie 的浏览器也要直连 dsh web ——
+	#     dsh web 用 token 换一个 30 天的签名 cookie，之后 / 不再需要 token。
+	#     不排除 cookie 就是死循环：/ → broker → /?token → (set-cookie, 303 ./) → / → …
+	@entry {
+		path /
+		not query token=*
+		not header Cookie *dsh-auth-*
+	}
+	reverse_proxy @entry 127.0.0.1:{{BROKER_PORT}} {
+		header_up Host 127.0.0.1:{{LOCAL_PORT}}
+	}
+
+	# /go：任何时候都 302 到 /?token=<当前值> —— cookie 过期（默认 30 天）或者家里
+	# 换过 token 之后的"重进一次"入口。手机用户只需要再点一下这个地址。
+	@go path /go
+	reverse_proxy @go 127.0.0.1:{{BROKER_PORT}} {
+		header_up Host 127.0.0.1:{{LOCAL_PORT}}
+	}
+
+	# 其余请求（会话界面 / SSE / WebSocket / 带 token 或带 cookie 的 /）
+	# 一律直连家里的 dsh web —— broker 不参与主链路。
 	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
 		# 同域名模式：把 Host/Origin 伪装成回环，绕过 dsh web 的浏览器信任围栏，
 		# 这样不用重启 harness。安全完全压在 basic auth + TLS 上。

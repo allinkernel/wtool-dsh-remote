@@ -606,6 +606,10 @@ done
 run_install_a >"$TMP/i-a2.out" 2>&1
 check "重复 install 退出 0" "0" "$?"
 check_link "重复 install 后还是同一条软链" "$inst/prefix/bin/dsh-remote" "$proj/bin/dsh-remote"
+check_link "token broker 也装上了（dsh-token-broker）" \
+    "$inst/prefix/bin/dsh-token-broker" "$proj/bin/dsh-token-broker"
+check_link "server 的薄封装也装上了（dsh-remote-server）" \
+    "$inst/prefix/bin/dsh-remote-server" "$proj/bin/dsh-remote-server"
 check_not_contains "重复 install 不重复复制样板" "配置样板：" "$(cat "$TMP/i-a2.out")"
 check_not_contains "重复 install 没有'找不到源文件'" "找不到源文件" "$(cat "$TMP/i-a2.out")"
 
@@ -664,7 +668,7 @@ d_out=$(cat "$TMP/i-d.out")
 check_contains "警告里点名了缺的源（命令）" "$d_missing/bin/dsh-remote" "$d_out"
 check_contains "警告里说了去哪儿找" "找的地方：$d_missing" "$d_out"
 check_contains "警告里说明来源是 WTOOL_PROJECT_DIR" "来自 WTOOL_PROJECT_DIR" "$d_out"
-check_contains "末尾交代跳过了几条" "有 4 条源没找到" "$d_out"
+check_contains "末尾交代跳过了几条" "有 6 条源没找到" "$d_out"   # 4 条命令 + 2 张样板
 if [ ! -e "$inst/d/prefix" ] && [ ! -e "$inst/d/xdg-conf" ] && [ ! -e "$inst/d/xdg-state" ]; then
     ok "一个字节都没写：\$WTOOL_PREFIX / 配置 / 日志落点都没被建"
 else
@@ -702,7 +706,7 @@ fi
 d2_out=$(cat "$TMP/i-d2.out")
 check_contains "警告里点名缺的样板" "$d_fake/notify.conf.example" "$d2_out"
 check_contains "警告里点名缺的命令" "$d_fake/bin/dsh-notify" "$d2_out"
-check_contains "末尾交代跳过了 3 条" "有 3 条源没找到" "$d2_out"
+check_contains "末尾交代跳过了 5 条" "有 5 条源没找到" "$d2_out"   # 缺 3 条命令 + 2 张样板
 
 # ---- E --uninstall：撤掉自己铺的软链，实体（配置/日志）留着
 run_install_a --uninstall >"$TMP/i-e.out" 2>&1
@@ -892,8 +896,10 @@ check_contains "status：点名还在抢端口的旧 tmux 会话" "会话 dsh-j-
 mkdir -p "$TMP/jssh"
 cat >"$TMP/jssh/ssh" <<'STUB'
 #!/bin/sh
+# 远端脚本现在走 stdin（ssh … sh -s），所以把 stdin 也记进日志再回结果
+cat >>"$J_LOG"
 printf 'SSH: %s\n' "$*" >>"$J_LOG"
-printf 'LISTEN 0 128 127.0.0.1:18099 0.0.0.0:*\nhttp_code=401\n'
+printf 'LISTEN 0 128 127.0.0.1:18099 0.0.0.0:*\nhttp_code=401\nbroker_http_code=302\n'
 STUB
 chmod +x "$TMP/jssh/ssh"
 : >"$J_LOG"
@@ -941,6 +947,324 @@ check_contains "install 把旧版单元 disable 掉（它会抢同一个端口�
 
 # ---- 真 $HOME 的 systemd 单元没被这一节碰过
 check "真 \$HOME 的 systemd 单元指纹没变" "$unit_fp_before" "$(real_unit_fp)"
+
+# ------------------------------------------- K token 重定向（固定地址那半）
+printf 'K. token 重定向：harness 捕获 / broker 302 / Caddy 路由\n'
+
+# ① Caddyfile 模板：入口 matcher 的两个 not 缺一不可（少一个就是 302 死循环）
+#    —— 真的死循环在本地同构 Caddy 上验过，见 journal（这一节只做静态断言）
+for tmpl in Caddyfile.ip Caddyfile.domain; do
+    tc=$(cat "$proj/cloud/$tmpl")
+    check_contains "$tmpl：入口 matcher 认 path /" "path /" "$tc"
+    check_contains "$tmpl：排除带 token 的请求（否则 /?token → 303 ./ → / 死循环）" "not query token=*" "$tc"
+    check_contains "$tmpl：排除已换到 cookie 的请求（dsh web 换 cookie 后 303 回 /）" "not header Cookie *dsh-auth-*" "$tc"
+    check_contains "$tmpl：broker 那条走占位符 BROKER_PORT" "{{BROKER_PORT}}" "$tc"
+    check_contains "$tmpl：/go 是重进入口" "@go path /go" "$tc"
+    check_contains "$tmpl：其余请求仍直连 dsh web" "reverse_proxy 127.0.0.1:{{TUNNEL_PORT}}" "$tc"
+done
+rl=$(cat "$proj/cloud/relay.sh")
+check_contains "relay.sh：渲染时替换 BROKER_PORT" 's|{{BROKER_PORT}}|$BROKER_PORT|g' "$rl"
+check_contains "relay.sh：--broker-port 可配" "--broker-port)" "$rl"
+check_contains "relay.sh：broker 端口默认 18081" "BROKER_PORT=18081" "$rl"
+check_contains "relay.sh：自检也看 broker 那条" "token broker：302" "$rl"
+
+# ② harness 函数（env.zsh / env.bash）：把 dsh web 打印的 token 抓下来、退出时清掉
+wait_for_file() {
+    _i=0
+    while [ "$_i" -lt 50 ]; do
+        [ -s "$1" ] && return 0
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+mkdir -p "$TMP/kbin" "$TMP/kstate" "$TMP/kconf"
+cat >"$TMP/kbin/npx" <<'STUB'
+#!/bin/sh
+echo "booting the web profile…"
+echo "dsh web: http://127.0.0.1:3080/?token=Tok-123_abc (LAN: http://10.0.0.2:3080/?token=Tok-123_abc)"
+sleep 1
+STUB
+chmod +x "$TMP/kbin/npx"
+printf 'public_url=https://entry.example:8443\n' >"$TMP/kconf/remote.conf"
+for shname in bash zsh; do
+    if ! command -v "$shname" >/dev/null 2>&1; then
+        ok "没有 $shname，跳过它那份 env"
+        continue
+    fi
+    envf="$proj/env.$shname"
+    [ -f "$envf" ] || envf="$proj/env.bash"
+    rm -f "$TMP/kstate/current-token.txt" "$TMP/kstate/web-url.txt"
+    PATH="$TMP/kbin:$PATH" DSH_REMOTE_STATE_DIR="$TMP/kstate" DSH_REMOTE_CONF_DIR="$TMP/kconf" \
+        "$shname" -c ". '$envf'; harness --no-open" >"$TMP/k-$shname.out" 2>&1 &
+    kpid=$!
+    if wait_for_file "$TMP/kstate/current-token.txt"; then
+        ok "$shname：harness 把 token 写进 current-token.txt"
+    else
+        bad "$shname：harness 把 token 写进 current-token.txt" "$(cat "$TMP/k-$shname.out")"
+    fi
+    check "$shname：抓到的是行首那个 token（不是后面 LAN 那个）" "Tok-123_abc" \
+        "$(cat "$TMP/kstate/current-token.txt" 2>/dev/null)"
+    check "$shname：web-url.txt 记的是回环那个地址" "http://127.0.0.1:3080/?token=Tok-123_abc" \
+        "$(cat "$TMP/kstate/web-url.txt" 2>/dev/null)"
+    check_contains "$shname：把手机固定地址打出来了（读 remote.conf 的 public_url）" \
+        "https://entry.example:8443" "$(cat "$TMP/k-$shname.out")"
+    wait "$kpid" 2>/dev/null
+    if [ ! -e "$TMP/kstate/current-token.txt" ]; then
+        ok "$shname：退出后 token 文件清掉了（broker 会回 503，而不是 302 到死 token）"
+    else
+        bad "$shname：退出后 token 文件清掉了（broker 会回 503，而不是 302 到死 token）"
+    fi
+done
+
+# ③ broker 本体：起真进程（python3 + 一个真在听的假 dsh web）
+k_wport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+k_bport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+python3 -m http.server "$k_wport" --bind 127.0.0.1 >/dev/null 2>&1 &
+k_wpid=$!
+python3 "$proj/bin/dsh-token-broker" --port "$k_bport" --web-port "$k_wport" \
+    --token-file "$TMP/k-tok.txt" >"$TMP/k-broker.log" 2>&1 &
+k_bpid=$!
+k_i=0
+while [ "$k_i" -lt 30 ]; do
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$k_bport/" && break
+    sleep 0.1
+    k_i=$((k_i + 1))
+done
+check "broker：没有 token 文件 → 503（不 302 到空 token）" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/")"
+printf 'Tok-456\n' >"$TMP/k-tok.txt"
+k_hdr=$(curl -s -D - -o /dev/null --max-time 5 "http://127.0.0.1:$k_bport/")
+check_contains "broker：有 token → 302" "302" "$k_hdr"
+check_contains "broker：Location 指向当前 token" "Location: /?token=Tok-456" "$k_hdr"
+check "broker：/go 也 302（cookie 过期后的重进入口）" "302" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/go")"
+check "broker：别的路径 404（它只做重定向）" "404" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/api/x")"
+check "broker：POST 405" "405" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --max-time 5 "http://127.0.0.1:$k_bport/")"
+if command -v ss >/dev/null 2>&1; then
+    check_contains "broker：只绑回环（不是 0.0.0.0）" "127.0.0.1:$k_bport" \
+        "$(ss -ltn 2>/dev/null | awk '{print $4}' | grep -F ":$k_bport" | head -n 1)"
+else
+    ok "没有 ss，跳过「只绑回环」那条"
+fi
+kill "$k_wpid" 2>/dev/null
+sleep 0.3
+check "broker：dsh web 没在听 → 503（宁可说没跑，也别送去死 token）" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/")"
+kill "$k_bpid" 2>/dev/null
+wait "$k_bpid" 2>/dev/null
+check_contains "broker：启动时把监听地址和 token 文件打出来" \
+    "dsh-token-broker: http://127.0.0.1:$k_bport/" "$(cat "$TMP/k-broker.log")"
+
+# ------------------------------------------------- L 二维码（手机扫的那个）
+printf 'L. 二维码：dsh-qr（矩阵对账 / PNG / SVG / 终端画 / 太长要报错）\n'
+# 那些 sha256 是**和一份独立实现对过账**的：npm 自带的 qrcode-terminal 里那份
+# Kazuhiko Arase 的 JS 实现（MIT），逐模块比过（见 journal 2026-10-07）。
+# 只在"同一版本 + 同一掩码"下比 —— 两边挑掩码的罚分规则不一样（它那份是老式
+# 启发式，不是 ISO §8.8.2），所以先定掩码再对矩阵；能对上就说明**编码/纠错/
+# 交织/摆位/格式位**全对。
+qrbin="$proj/bin/dsh-qr"
+qr_hash() { # 文本 纠错 → border=0 矩阵的 sha256
+    python3 "$qrbin" --ecc "$2" --border 0 --matrix --no-terminal "$1" 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+check "dsh-qr：'hi'（v1/M）矩阵与独立实现逐字一致" \
+    "b0b09bb15298d7c3e024c7f0193f0c90f8311f7244cc72884d453e04157289e1" "$(qr_hash "hi" M)"
+check "dsh-qr：入口 URL（v3/M）矩阵一致" \
+    "b5296439fc3fa8fe56843913c64115719a2686dabebc66829a3ede6fdd7c478b" "$(qr_hash "https://123.56.158.212:8443/" M)"
+check "dsh-qr：/go 那个 URL（v3/Q）矩阵一致" \
+    "e5454b351f541519f1e89f33d65ae67f2bd1d7f0921370743ed8ad0225f4b396" "$(qr_hash "https://123.56.158.212:8443/go" Q)"
+check "dsh-qr：短 URL（v2/L）矩阵一致" \
+    "66ce90bbf75bfb5a82ecf74a96fc791ab909b2cd33be661312046f1306b29728" "$(qr_hash "https://123.56.158.212:8443" L)"
+check "dsh-qr：200 字节（v10/M）矩阵一致" \
+    "f83a5f24178f5fe17d23c7d9c8e84a80ad26413329140183816b46da79ca33f9" "$(qr_hash "$(python3 -c 'print("A"*200)')" M)"
+check "dsh-qr：500 字节（v15/L）矩阵一致" \
+    "f3fa4a69a926b46f5fc7aff557a30362f9da3456213e76674c5acaf2bea9f424" "$(qr_hash "$(python3 -c 'print("B"*500)')" L)"
+# 中文/emoji：那份 JS 实现对非 ASCII 是**坏的**（charCodeAt 截成 8 位，不做 UTF-8），
+# 所以这里只做"能编出来 + 尺寸对"的自检，不和它比。
+zh=$(python3 "$qrbin" --ecc M --border 0 --matrix --no-terminal "中文测试：手机扫码进会话 🎉" 2>/dev/null)
+check "dsh-qr：中文/emoji 能编出来（v3 = 29 模块）" "29" "$(printf '%s\n' "$zh" | wc -l | tr -d ' ')"
+# 太长要**报错**，不能悄悄截断
+python3 "$qrbin" --ecc H --border 0 --matrix --no-terminal "$(python3 -c 'print("Z"*3000)')" >/dev/null 2>"$TMP/l-err.txt"
+l_rc=$?
+if [ "$l_rc" -ne 0 ] && grep -q '放不下' "$TMP/l-err.txt"; then
+    ok "dsh-qr：内容太长时报错（不偷偷截断）"
+else
+    bad "dsh-qr：内容太长时报错（不偷偷截断）" "rc=$l_rc $(cat "$TMP/l-err.txt")"
+fi
+# 终端画：半块字符 + 自带颜色（别管终端什么配色）
+python3 "$qrbin" --ecc M --border 2 "hi" >"$TMP/l-term.txt" 2>/dev/null
+check "dsh-qr：终端画是半块字符（(21+4+1)/2 = 13 行）" "13" "$(wc -l <"$TMP/l-term.txt" | tr -d ' ')"
+check_contains "dsh-qr：终端画自带前景/背景色（ESC 序列）" "$(printf '\033')[3" "$(head -1 "$TMP/l-term.txt")"
+# PNG / SVG 落盘（PNG 是 1 位灰度、手写的 zlib+struct）
+python3 "$qrbin" --ecc M --border 4 --no-terminal --png "$TMP/l.png" --svg "$TMP/l.svg" "hi" >/dev/null 2>&1
+l_png=$(python3 -W ignore -c '
+import struct, sys
+with open(sys.argv[1], "rb") as fh:
+    d = fh.read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "PNG 签名不对"
+w, h, depth, ctype = struct.unpack(">IIBB", d[16:26])
+assert (depth, ctype) == (1, 0), (depth, ctype)
+print("%dx%d" % (w, h))
+' "$TMP/l.png" 2>&1)
+check "dsh-qr：PNG 是 1 位灰度、尺寸 21+8=29" "29x29" "$l_png"
+check_contains "dsh-qr：SVG 是纯文本、带 viewBox" 'viewBox="0 0 29 29"' "$(cat "$TMP/l.svg")"
+
+# ------------------------------------------------- M server（一条命令装好）
+printf 'M. dsh-remote server：自检失败给指引 / --dry-run 不写 / 全参非交互跑通\n'
+# 全程用假的 ssh / scp / curl + 临时 unit 目录：不碰真云、不碰真 unit、不碰真 conf
+mstub="$TMP/mstub"
+mkdir -p "$mstub"
+cat >"$mstub/ssh" <<'STUB'
+#!/bin/sh
+printf 'SSH: %s\n' "$*" >>"$M_LOG"
+cmd=
+for a in "$@"; do cmd=$a; done
+case $cmd in
+*"id -un"*) printf '%s\n' "${M_REMOTE_USER:-alice}"; exit 0 ;;
+*"sudo -n true"*) [ "${M_SUDO:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"sudo -n docker info"*) [ "${M_SUDO_DOCKER:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"docker info"*) [ "${M_DOCKER:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"command -v docker"*) [ "${M_HAS_DOCKER:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"ss -ltn"*) printf '%s\n' "${M_OCC:-0}"; exit 0 ;;
+*"ps --filter name=dsh-relay"*) printf '%s\n' "${M_OWN:-}" ; exit 0 ;;
+*"relay.sh"*) printf '== 假 relay.sh 输出\n'; exit "${M_DEPLOY_RC:-0}" ;;
+esac
+exit 0
+STUB
+cat >"$mstub/scp" <<'STUB'
+#!/bin/sh
+printf 'SCP: %s\n' "$*" >>"$M_LOG"
+STUB
+cat >"$mstub/curl" <<'STUB'
+#!/bin/sh
+printf 'CURL: %s\n' "$*" >>"$M_LOG"
+printf '%s' "${M_CURL_CODE:-401}"
+STUB
+chmod +x "$mstub/ssh" "$mstub/scp" "$mstub/curl"
+mconf="$TMP/m-remote.conf"
+printf 'cloud_host=203.0.113.7\ncloud_user=alice\ncloud_ssh_port=22\nremote_port=18080\nlocal_port=3080\npublic_url=\n' >"$mconf"
+export M_LOG="$TMP/m.log" M_SUDO=1 M_DOCKER=1 M_SUDO_DOCKER=1 M_HAS_DOCKER=1 M_OCC=0 M_OWN= M_REMOTE_USER=alice M_CURL_CODE=401 M_DEPLOY_RC=0
+: >"$M_LOG"
+# mrun：把假命令 + 临时落点钉住，跑真的 bin/dsh-remote
+mrun() {
+    PATH="$mstub:$PATH" DSH_REMOTE_CONF="$mconf" DSH_REMOTE_UNIT_DIR="$TMP/munits" \
+        DSH_REMOTE_SYSTEMCTL="$jstub/systemctl" DSH_REMOTE_TMUX="$jstub/tmux" \
+        DSH_REMOTE_STATE_DIR="$TMP/mstate" "$remote" "$@"
+}
+mset() { M_SUDO=1 M_DOCKER=1 M_SUDO_DOCKER=1 M_HAS_DOCKER=1 M_OCC=0 M_OWN= M_REMOTE_USER=alice M_CURL_CODE=401 M_DEPLOY_RC=0; }
+mbase_args="server --host 203.0.113.7 --ssh-user alice --ssh-port 22 --port 9443 --web-user dsh --dir /home/mindul/dsh-relay"
+
+# ① --dry-run：只打印计划，一个字节都不写
+: >"$M_LOG"
+rm -rf "$TMP/munits" "$TMP/mstate"
+mkdir -p "$TMP/mstate"
+mset
+mrun $mbase_args --password dryrunpw123 --yes --dry-run >"$TMP/m1.out" 2>&1
+check "server --dry-run 退出 0" "0" "$?"
+m1=$(cat "$TMP/m1.out")
+check_contains "dry-run 里说要 scp cloud/" "cloud/" "$m1"
+check_contains "dry-run 里说要 relay.sh --no-compose" "--no-compose" "$m1"
+check_contains "dry-run 里带上了 broker 端口" "--broker-port 18081" "$m1"
+check_contains "dry-run 里说要装 broker 单元" "dsh-token-broker.service" "$m1"
+check_contains "dry-run 里说要打二维码/地址" "二维码" "$m1"
+check "dry-run 没 scp（没碰云）" "0" "$(grep -c SCP "$M_LOG" || true)"
+check "dry-run 没装单元" "" "$(ls -A "$TMP/munits" 2>/dev/null)"
+check "dry-run 没改 remote.conf" "public_url=" "$(grep '^public_url=' "$mconf")"
+
+# ② ssh 自检失败：教怎么配 key
+M_SUDO=0 M_DOCKER=0 M_SUDO_DOCKER=0
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m2.out" 2>&1
+check "ssh 自检失败 → 非 0" "1" "$?"
+check_contains "ssh 失败时给出 ssh-copy-id 的修法" "ssh-copy-id" "$(cat "$TMP/m2.out")"
+check_contains "ssh 失败时点明「不问密码」才算数" "不问密码" "$(cat "$TMP/m2.out")"
+
+# ③ 不在 docker 组（docker info 不行）但 `sudo -n docker` 行 → 自动改用 sudo docker
+mset
+M_DOCKER=0 M_SUDO_DOCKER=1
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m3.out" 2>&1
+check "不在 docker 组但 sudo docker 行 → 退出 0" "0" "$?"
+check_contains "认出来要用 sudo docker" "用「sudo docker」" "$(cat "$TMP/m3.out")"
+check_contains "dry-run 里的 docker 命令也是 sudo docker" "--docker-cmd 'sudo docker'" "$(cat "$TMP/m3.out")"
+
+# ③b 两种 docker 都不行 → 非 0 + 给出配 sudo 的办法
+mset
+M_DOCKER=0 M_SUDO_DOCKER=0
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m3b.out" 2>&1
+check "docker daemon 不可用 → 非 0" "1" "$?"
+check_contains "给出只放开 docker 的做法" "NOPASSWD: /usr/bin/docker" "$(cat "$TMP/m3b.out")"
+
+# ④ 云上没有 docker：说清「工具不代劳 + 该装什么」
+mset
+M_HAS_DOCKER=0
+
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m4.out" 2>&1
+check "没 docker → 非 0" "1" "$?"
+check_contains "没 docker 时给出装法（但不代跑）" "apt install -y docker.io" "$(cat "$TMP/m4.out")"
+
+# ⑤ 端口被别人的东西占着
+mset
+M_OCC=1 M_OWN=
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m5.out" 2>&1
+check "端口被别人占 → 非 0" "1" "$?"
+check_contains "端口被占时建议换一个" "已经被别的东西占着" "$(cat "$TMP/m5.out")"
+
+# ⑥ 远端用户和配置里写的不是一个人 → 拦下来（身份对不上是 H16 那类坑）
+mset
+M_REMOTE_USER=bob
+mrun $mbase_args --password pw --yes --dry-run >"$TMP/m6.out" 2>&1
+check "远端用户和 --ssh-user 不一致 → 非 0" "1" "$?"
+check_contains "不一致时点明身份对不上" "身份对不上" "$(cat "$TMP/m6.out")"
+
+# ⑦ 密码里有空格 → 直接拒（要塞进远程命令行）
+mset
+mrun $mbase_args --password "bad pw" --yes --dry-run >"$TMP/m7.out" 2>&1
+check "密码里有空格 → 非 0" "1" "$?"
+check_contains "拒绝时说清为什么" "别用引号" "$(cat "$TMP/m7.out")"
+
+# ⑧ 全参非交互（--yes）：部署 + 家里两个单元 + 回写 conf；harness 不让它起
+mset
+: >"$M_LOG"
+rm -rf "$TMP/munits"
+mkdir -p "$TMP/munits"
+mrun $mbase_args --password GoodPass123 --yes --no-harness >"$TMP/m8.out" 2>&1
+check "server --yes --no-harness 退出 0" "0" "$?"
+m8=$(cat "$TMP/m8.out")
+mlog=$(cat "$M_LOG")
+check_contains "部署：scp 了 cloud/ 目录" "SCP: " "$mlog"
+check_contains "部署：远程命令用 --no-compose" "--no-compose" "$mlog"
+check_contains "部署：远程命令带 broker 端口" "--broker-port 18081" "$mlog"
+check_contains "部署：远程命令带对外端口 9443" "--port 9443" "$mlog"
+check_contains "部署：远程命令带用户名" "--user dsh" "$mlog"
+check_contains "部署：远程命令带密码（哈希由 relay.sh 算）" "--password 'GoodPass123'" "$mlog"
+check_contains "部署：docker 命令按自检结果传" "--docker-cmd 'docker'" "$mlog"
+check_contains "家里：装了 broker 单元" "dsh-token-broker.service" "$(ls "$TMP/munits")"
+check_contains "家里：装了隧道单元" "dsh-tunnel.service" "$(ls "$TMP/munits")"
+check_contains "回写了 cloud_host" "cloud_host=203.0.113.7" "$(cat "$mconf")"
+check_contains "回写了 public_url" "public_url=https://203.0.113.7:9443" "$(cat "$mconf")"
+check_contains "回写了 broker 端口" "broker_remote_port=18081" "$(cat "$mconf")"
+check_contains "打印了手机地址" "https://203.0.113.7:9443" "$m8"
+check_contains "打印了怎么改密码" "改密码" "$m8"
+check_contains "--no-harness 时给出手动起法" "harness --no-open" "$m8"
+
+# ⑧b 云上部署失败（relay.sh 非 0）：必须报错，不能吞 ——
+#     `ssh … | tee` 拿到的是 tee 的退出码，真机第一版就是这么"成功"过去的
+mset
+M_DEPLOY_RC=2
+mrun $mbase_args --password pw --yes --no-harness >"$TMP/m8b.out" 2>&1
+check "云上部署失败 → 非 0" "1" "$?"
+check_contains "部署失败时说清 rc" "云上那步没成功" "$(cat "$TMP/m8b.out")"
+
+# ⑨ 薄封装 dsh-remote-server 走同一条路
+mset
+PATH="$mstub:$PATH" DSH_REMOTE_CONF="$mconf" DSH_REMOTE_UNIT_DIR="$TMP/munits" \
+    DSH_REMOTE_SYSTEMCTL="$jstub/systemctl" DSH_REMOTE_TMUX="$jstub/tmux" \
+    DSH_REMOTE_STATE_DIR="$TMP/mstate" "$proj/bin/dsh-remote-server" \
+    --host 203.0.113.7 --ssh-user alice --port 9443 --web-user dsh --password pw --yes --dry-run >"$TMP/m9.out" 2>&1
+check "dsh-remote-server（薄封装）退出 0" "0" "$?"
+check_contains "薄封装走的是同一条路（打印计划）" "--no-compose" "$(cat "$TMP/m9.out")"
+check_contains "薄封装也用 cloud_host 作默认" "203.0.113.7" "$(cat "$TMP/m9.out")"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"

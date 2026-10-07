@@ -57,7 +57,10 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 1048 | 家里这头的主命令（17 个子命令） |
+| `bin/dsh-remote` | 1673 | 家里这头的主命令（22 个子命令） |
+| `bin/dsh-token-broker` | 172 | **token 重定向小服务**（纯 python 标准库；只做 302，不代理，见 §3.2） |
+| `bin/dsh-qr` | 549 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
+| `bin/dsh-remote-server` | 8 | `dsh-remote server` 的薄封装（用户先说的是这个名字，两个入口等价） |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
 | `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
@@ -69,7 +72,7 @@
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 31 | 隧道配置样板 |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 949 | 268 条（2026-10-07 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/run_tests.sh` | 1271 | **362 条**（2026-10-07 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
@@ -105,6 +108,10 @@
    （默认只认回环 / 本机 LAN / `--trusted-host`）就认这个请求，**不用重启 harness**。
    会话界面是流式的：`flush_interval -1` + `read_timeout 0`。
 5. 18080 是**云上 sshd 的 `-R` 监听口**，只绑 `127.0.0.1`（安全组里没有它）。
+   同一条 ssh 上还有 18081 → 家里的 **token broker**（只做 302，见 §3.2）：
+   `dsh web` 的 token 每个进程随机、只在内存里，所以手机收藏的固定地址
+   `https://<入口>/`（不带 token）由 Caddy 交给 broker，broker 302 到
+   `/?token=<当前值>`；拿 token 换到 30 天的签名 cookie 之后，`/` 就直连 dsh web 了。
 6. 隧道另一头是家里的一条 **systemd `--user` 常驻服务** `dsh-tunnel.service`：
    `ssh -N -T … -R 127.0.0.1:18080:127.0.0.1:3080 <云上用户>@<云上主机>`
    （由 `dsh-remote tunnel-install` 渲染 + `enable --now`，见 §3.1）。
@@ -120,7 +127,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：17 个子命令的真实行为
+## 3. `bin/dsh-remote`：22 个子命令的真实行为
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -152,6 +159,10 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 | `notify-test` | 调 `dsh-notify --test`，再提示失败细节看 `$STATE_DIR/notify.log` | 0 |
 | `notify-enable` | ①`mkdir -p $CONF_DIR $DSH_HOME/profiles/web` ②把 `hooks/claude-hooks.json` 里的 `__DSH_NOTIFY__` 换成 `$NOTIFY` 写进 `$CONF_DIR/hooks.json`（模板不在就 `die`）③`$DSH_HOME/profiles/web/cordis.patch.yml` 不存在就先建一个 `# 注释` + `[]` ④里面没有 `# >>> dsh-remote notify` 标记时：先备份成 `$pf.bak-dsh-remote`，文件里**整行是 `[]`** 就把 `[]` 换成那段块（YAML 里两个顶层值会打架），否则直接追加 ⑤打印验证命令 `dsh --profile web --dump-config \| grep -A3 hooks-claude-code`。**幂等**（标记在就跳过） | 0 / 1 |
 | `notify-disable` | 用 `awk` 把 `# >>> dsh-remote notify` 到 `# <<< dsh-remote notify` 之间那段删掉；删完如果只剩注释/空行，补回一行 `[]`（profile 的空 patch 层会让 boot 失败）。`hooks.json` 留着不删 | 0 / 1 |
+| `server` | **一条命令装好**（2026-10-07 加，ADR-0015）：问/收参数（`--host` `--ssh-user` `--ssh-port` `--port` `--web-user` `--password` `--dir` `--docker-cmd` `--tunnel-port` `--broker-port` `--local-port` `--broker-local-port`；`--yes` 全默认、`--dry-run` 只打印、`--skip-deploy` / `--skip-local` / `--no-harness` 分段跑）→ **自检**（免密 ssh + 远端 `id -un` 必须等于 `--ssh-user`；`docker info` 与 `sudo -n docker info` **分开探**；对外端口没被别人占；从家里 `curl` 看安全组；认出已装的 `dsh-relay`）→ **云上部署**（`scp -r cloud/` + `relay.sh --no-compose` 用户空间模式，失败**不再被管道吞掉**）→ 写回 `remote.conf` → 家里 `broker-install` + `tunnel-install` → `local_port` 没人听才用 `harness` 函数起 harness → 打印固定地址 + 二维码 + 改密码/停/看日志三条命令 | 0 / 1 |
+| `token-broker` | **前台**跑 broker（`--port` / `--web-port` / `--token-file` 可覆盖）；常驻用 `broker-install`。它自己 `exec python3 bin/dsh-token-broker` | 循环 / 1 |
+| `broker-install` | 渲染并装 `~/.config/systemd/user/dsh-token-broker.service`（`ExecStart=<python3> <PROJ_DIR>/bin/dsh-token-broker --port <broker_local_port> --web-port <local_port> --token-file <token_file>`；`Restart=always` / `RestartSec=3` / `StartLimitIntervalSec=0` / journald）→ `daemon-reload` → `enable --now` → 停 2 秒打印判据（含 `curl http://127.0.0.1:<port>/` 的 302/503 判读）。`--no-enable` / `--dry-run` | 0 / 1 |
+| `broker-uninstall` | `disable --now` + 删单元 + `daemon-reload`；token 文件留着（`harness` 函数还在写） | 0 |
 | `cloud-setup` | **只打印**要人在云上敲的 scp / ssh 命令（值从 `remote.conf` 取，缺的用 `<你的阿里云公网 IP>` / `root` / `18080` / `3080` 占位），末尾提醒安全组只开 22 + 443/8443，**绝不要开 18080 和 3080** | 0 |
 | `cloud-install` | 见 §4（这是唯一会碰云上那台机器的子命令） | 0 / 1 |
 | `migrate` | 把旧版放在 `$DSH_HOME` 下的 `remote.conf` / `notify.conf` / `hooks.json` 搬到 `$CONF_DIR`，`notify.log` / `web.log` / `web-url.txt` 搬到 `$STATE_DIR`（目标已存在就不覆盖），顺手删掉 `$DSH_HOME/*.example`；搬了东西就提醒重跑 `notify-enable` 更新 patch 里的路径 | 0 |
@@ -242,6 +253,73 @@ WantedBy=default.target
 和它自己的 `enable` 软链；`systemctl --user daemon-reload` / `enable --now` /
 `disable --now` / `restart`。**不碰 `/etc/systemd`**、不碰系统级 unit。
 
+### 3.2 手机固定地址：`harness` 函数 + token broker + Caddy 两条路由（2026-10-07 加）
+
+**要解决的问题**：`dsh web` 的 token 是**每个进程随机、只在内存里**的
+（`processLaunchToken`，32 字节 base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关 ——
+hazards H22），所以"家里重启一次 harness，手机上的地址就作废"。做法见 ADR-0014：
+
+```
+手机 → https://<入口>/（不带 token，Caddy 先过 basic auth）
+        │  Caddy @entry：path / 且没有 token 参数 且 没有 dsh-auth-* cookie
+        ▼
+      云上 127.0.0.1:18081 ──（同一条 ssh 的第二条 -R）──▶ 家里 127.0.0.1:3081
+        │                                                     dsh-token-broker
+        │  302 Location: /?token=<当前值>                      读 current-token.txt
+        ▼
+      再打 https://<入口>/?token=… → Caddy 直连 18080 → 家里 dsh web
+        │  303 ./  +  Set-Cookie: dsh-auth-<authority>=…（30 天）
+        ▼
+      之后 / 带 cookie → Caddy 的 @entry 不匹配 → 直连 dsh web → 200（0 次跳转）
+```
+
+- **`harness` 函数**（`env.zsh` / `env.bash`，两份逐字等价）：包装
+  `npx @deepseek-ai/dsh web "$@"`，把 stdout 里 `dsh web: http://…/?token=…` 的
+  token 写进 `$STATE_DIR/current-token.txt`、完整 URL 写进 `web-url.txt`（都 600），
+  并把 `remote.conf` 里的 `public_url` 打出来提示"收藏这个"；**退出时删掉 token 文件**。
+  文件在 source 时还会 `unalias harness`（别名优先于函数，用户原来那条 alias 会盖住它）。
+- **`bin/dsh-token-broker`**（`dsh-remote broker-install` 装成 `dsh-token-broker.service`）：
+  只绑 `127.0.0.1:3081`；`GET /`（不带 token）与 `GET /go` → 302 `/?token=<当前值>`；
+  读不到 token 文件、或 `dsh web` 端口没在听 → **503 + 一句人话**；别的路径 404 / 方法 405。
+  **不代理任何应用流量**（SSE/WebSocket 走 Caddy 直连那条路）。
+- **Caddy 那两条 `not` 缺一不可**（`path /` + `not query token=*` +
+  `not header Cookie *dsh-auth-*`）：少第一条，带 token 的请求会被反复 302；
+  少第二条就是死循环（`/` → broker → `/?token` → 303 `./` → `/` → broker → …）。
+  两条路由的原文见 §6。
+- `tunnel-status` 会把 broker 单元状态、token 文件有没有、`127.0.0.1:3081` 在不在听
+  一起打出来；`--probe` 还会在云上只读地打一次 `127.0.0.1:18081/`（302 = 好、503 = 没 token）。
+
+### 3.3 一条命令装好：`dsh-remote server`（2026-10-07 加）
+
+`dsh-remote server` = **自检 → 云上部署 → 家里常驻 → 起 harness → 打印地址和二维码**，
+决策与否决见 ADR-0015。实际行为：
+
+- **问什么**：`--host`（云上 IP/域名）、`--ssh-user`、`--ssh-port`、`--port`（对外）、
+  `--web-user`、`--password`（回车 = 随机 20 位字母数字）；命令行给了就不问，
+  `--yes` 或"stdin 不是终端"时全用默认值（默认值优先取 `remote.conf`，`ssh_user` 缺省 `$USER`）。
+  密码里出现引号/空格会**直接拒**（要塞进远程命令行）。
+- **自检**（任一条不过就打印"怎么修"并停）：免密 ssh + 远端 `id -un` 必须等于 `--ssh-user`；
+  `docker info` 与 `sudo -n docker info` **分开探**（H18）；对外端口没被别人的东西占；
+  从家里 `curl -sk https://<host>:<port>/` 看安全组（401/302 = 通，000 = 大概没放行）；
+  `sudo docker ps --filter name=dsh-relay` 认出"已经装过"。
+- **部署**：`scp -r cloud/ → ssh 'cd <dir> && sh cloud/relay.sh --no-compose …'`；
+  远程输出**先落文件再判 rc**（管道 + `tee` 会把失败吞掉，H20）。装完立刻再打一次入口
+  （401 = basic auth 在挡 / 302 = broker 在补 token）。
+- **家里**：`broker-install` + `tunnel-install`（两个 systemd 单元；ADR-0013/0014）。
+- **harness**：`local_port` 上已经有人在听 → **不动它**，只报告"token 有没有被捕获"；
+  否则 `exec <shell> -c ". env.<shell>; harness --no-open --port <local_port>"`
+  （用 `env.*` 里那个函数，token 才会被 broker 看见）。
+- **二维码**：有 `qrencode` 就用它，否则 `python3 bin/dsh-qr --ecc M --border 2
+  --png $STATE_DIR/phone-qr.png --svg $STATE_DIR/phone-qr.svg <固定 URL>`；
+  码里编的**永远是不带 token 的固定地址**。
+- `bin/dsh-remote-server` 是它的薄封装（三行 `exec`），两个名字等价。
+
+`bin/dsh-qr` 是**自带**的二维码实现（纯 python，不依赖 qrencode / PIL / pip）：
+字节模式、版本 1–40 自动挑、纠错 L/M/Q/H、8 种掩码按 ISO/IEC 18004 §8.8.2 的罚分挑，
+输出终端半块字符画（自带前景/背景色）、1 位灰度 PNG（`zlib`+`struct` 手写）、纯文本 SVG。
+规格表（纠错分块、对齐图案位置）是标准常数；**正确性拿一份独立实现逐模块对过账**
+（npm 自带 `qrcode-terminal` 里 Kazuhiko Arase 的 JS 实现，MIT），回归向量在 §10 的 L 节。
+
 ---
 
 ## 4. `cloud-install`：会碰云上那台机器的唯一子命令
@@ -298,7 +376,7 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 | 证书 | Let's Encrypt（ACME；`--email` 不给我就默认 `admin@<域名>`） | `tls internal` 自签（Caddy 自己的 CA） |
 | 适用 | 有域名且**大陆机器已备案** | 没域名 / 没备案（或机器在境外） |
 
-参数：`--email` `--port` `--tunnel-port`（默认 18080）`--local-port`（默认 3080）
+参数：`--email` `--port` `--tunnel-port`（默认 18080）`--broker-port`（默认 18081，token broker 那条，ADR-0014）`--local-port`（默认 3080）
 `--user`（basic auth 用户名，默认 `dsh`）`--password`（不给就每次随机 20 位）
 `--allow-ip`（可多次）`--install-docker` `--no-compose` `--dir` `--docker-cmd`
 `--dry-run` `-h`（`--help` 用 awk 打到头部注释块结束，**不写死行号**）。
@@ -318,13 +396,15 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
    真跑时 < 2.8 就 `die`（`basic_auth` 指令要 ≥ 2.8），dry-run 时只 `warn`，
    认不出（空串）也只 `warn`。
 3. **渲染**：`sed` 把 `{{DOMAIN}} {{EMAIL}} {{IP}} {{PORT}} {{USER}} {{HASH}}
-   {{TUNNEL_PORT}} {{LOCAL_PORT}}` 替换掉；`{{ALLOW_BLOCK}}` 那一行换成
+   {{TUNNEL_PORT}} {{BROKER_PORT}} {{LOCAL_PORT}}` 替换掉；`{{ALLOW_BLOCK}}` 那一行换成
    一个临时文件的内容（两行：`@notme not remote_ip <一串>` + `respond @notme "forbidden" 403`）。
    渲染完还要 `grep -E '\{\{[A-Z_]+\}\}'` 兜底：有没替换的占位符就列出**行号**并 `die`。
 4. **dry-run**：把 Caddyfile 打到 **stdout**（进度/报告全走 stderr，见 ADR-0011），
    有 docker 时 `mkdir -p $DIR` 后写一份 `Caddyfile.dryrun` 用 `caddy validate` 真验一遍
    再删掉；用户空间模式还会把"真跑时会执行的那条 `docker run …`"打到 stderr，然后 exit 0。
-5. **真跑**：旧的 `$DIR/Caddyfile` 备份成 `Caddyfile.bak-<时间戳>` → 落盘新的 →
+5. **真跑**：`mkdir -p -- "$DIR"`（**不存在的 `--dir` 也能用** —— 以前不建，
+   `set -eu` 下一行 "cannot create …Caddyfile: Directory nonexistent" 就退出，
+   hazards H19）→ 旧的 `$DIR/Caddyfile` 备份成 `Caddyfile.bak-<时间戳>` → 落盘新的 →
    `mkdir -p $DIR/{logs,data,config}` → 起容器（compose 模式 `docker compose up -d`；
    用户空间模式 `rm -f` 再 `docker run -d`）→ 最多 20s 等 `dsh-relay` 出现在 `ps` 里
    → `sleep 2` 再打一次 ps；`ufw` 处于 active 才 `ufw allow <PORT>/tcp`
@@ -332,9 +412,13 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 6. **自检**：域名模式 `curl -sk --resolve <域名>:<PORT>:127.0.0.1 https://<域名>:<PORT>/`，
    IP 模式 `curl -sk -H "Host: <IP>:<PORT>" https://127.0.0.1:<PORT>/`；
    **401 = 对**（basic auth 在挡），000 = 连不上，其它码 = basic_auth 没生效。
-   再探一下 `http://127.0.0.1:18080/`：000 就是"家里的隧道还没起"（第一次跑正常），
-   非 0 说明家里那半已经在后面了。
-7. **结尾打印**（stderr）：手机地址、用户名、密码，看状态/看日志/撤掉三条命令
+   再探 `http://127.0.0.1:<TUNNEL_PORT>/`（000 = 家里的隧道还没起，第一次跑正常）
+   和 `http://127.0.0.1:<BROKER_PORT>/`（**302 = broker 好、503 = 家里还没有 token**、
+   000 = broker 那条隧道没起）。
+7. **写 `$DIR/relay-password.txt`（600）**：`URL=` / `USER=` / `PASSWORD=` + "改密码三步"。
+   **脚本自己写**，谁重渲染谁负责 —— 以前是人手写、脚本不更新，重跑一次就漂移
+   （hazards H17；加强说明也在那一条）。
+8. **结尾打印**（stderr）：手机地址、用户名、密码（并说清三样也写在那个 600 的文件里），看状态/看日志/撤掉三条命令
    （按模式给 `docker compose -f …` 或 `$DOCKER …`），以及脚本做不了的两件事
    （安全组只放 22 + 对外端口；手机第一次要 basic auth 一次 + 贴一次带 token 的地址）。
 
@@ -354,6 +438,22 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
     encode zstd gzip
     basic_auth { {{USER}} {{HASH}} }
     {{ALLOW_BLOCK}}                      # 没给 --allow-ip 时整行消失
+    # ① 不带 token 的入口 → 家里的 token broker（它 302 到 /?token=<当前值>）
+    #    两条 not 缺一不可，少一条就是 302 死循环（ADR-0014）
+    @entry {
+        path /
+        not query token=*
+        not header Cookie *dsh-auth-*
+    }
+    reverse_proxy @entry 127.0.0.1:{{BROKER_PORT}} {
+        header_up Host 127.0.0.1:{{LOCAL_PORT}}
+    }
+    # ② /go = 重进入口（cookie 过期 / 换过 token 之后点一下）
+    @go path /go
+    reverse_proxy @go 127.0.0.1:{{BROKER_PORT}} {
+        header_up Host 127.0.0.1:{{LOCAL_PORT}}
+    }
+    # ③ 其余（带 token / 带 cookie 的 /、会话、SSE、WebSocket）直连 dsh web
     reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
         header_up Host   127.0.0.1:{{LOCAL_PORT}}
         header_up Origin http://127.0.0.1:{{LOCAL_PORT}}
@@ -365,7 +465,8 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 }
 ```
 
-`cloud/Caddyfile.ip` 只有四处不同：没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
+两条模板的站点块**逐字一样**（都用 `{{BROKER_PORT}}`；broker 那条是 2026-10-07 加的，
+ADR-0014）；`cloud/Caddyfile.ip` 只有四处不同：没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
 多一行 `tls internal`，以及全局块里多一行 **`default_sni {{IP}}`**。
 最后这行是**必须的**：浏览器连 `https://<IP>:8443` 时**不发 SNI**
 （RFC 6066 不允许 SNI 放 IP 字面量），没有它 Caddy 选不出证书、握手直接
@@ -525,7 +626,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **268 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 53 / **J 69**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、**常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）** |
+| `tests/run_tests.sh` | **363 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / **K 35** / **L 12** / **M 46**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -540,7 +641,20 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 - 两个 docker 脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码，不是通过）。
   此前是 `exit 0` —— 放进 CI / `&&` 链里空跑也算绿，属于假绿。
 
-`run_tests.sh` 的 I 节（53 条）是 2026-10-04 那次修复的回归测试，五个场景：
+`run_tests.sh` 的 **K / L / M 三节（2026-10-07 加，共 93 条）**：
+
+- **K（token 重定向）**：Caddyfile 两份模板都必须有 `path /` + `not query token=*` +
+  `not header Cookie *dsh-auth-*` + `{{BROKER_PORT}}` + `@go`；`relay.sh` 里的
+  `{{BROKER_PORT}}` 替换与 `--broker-port`；`harness` 函数在 **bash 和 zsh 两份**里
+  各用假 `npx` 抓一次 token（写文件 → 退出时删掉，抓的是行首那个不是 LAN 那个）；
+  **broker 起真进程**（python3）验 302/404/405/503 与"只绑回环"。
+- **L（二维码）**：`dsh-qr` 的矩阵 sha256 与独立实现（npm 那份 JS）对过账的向量、
+  中文/emoji 能编、太长必须报错、终端半块画、PNG 头与尺寸、SVG 文本。
+- **M（`server`）**：假 ssh/scp/curl + 临时 unit 目录，验"四类自检失败都给指引"、
+  `--dry-run` 一个字节不写、`--yes` 全参跑通（部署命令拼装 / 回写 conf / 装两个单元 /
+  打印地址）、**部署失败必须非 0**（H20 的回归）、`dsh-remote-server` 薄封装等价。
+
+`run_tests.sh` 的 I 节（55 条）是 2026-10-04 那次修复的回归测试，五个场景：
 ①引擎调用（`WTOOL_PROJECT_DIR`，引擎内部那格故意埋一份假的可执行文件）
 ②手工跑按 `$0` 自推（cwd 在别处 / 相对路径）
 ③换 `WTOOL_HOME`（落点跟它走，真 `$HOME` 一个东西都不多）
@@ -591,6 +705,9 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `DSH_REMOTE_SYSTEMCTL` | dsh-remote | 换 `systemctl`（默认 `systemctl`，调用时永远带 `--user`；测试用桩） |
 | `DSH_REMOTE_TMUX` | dsh-remote | 换 `tmux`（默认 `tmux`；只在检测/停旧会话时用 —— 测试用桩，**别拿真 tmux 试**） |
 | `DSH_REMOTE_SSH` | dsh-remote | 换写进单元 `ExecStart` 的 ssh 绝对路径（默认 `command -v ssh`） |
+| `DSH_REMOTE_TOKEN_FILE` | dsh-remote、broker | token 文件路径，默认 `$STATE_DIR/current-token.txt` |
+| `DSH_REMOTE_PYTHON` | dsh-remote | 写进 broker 单元的 python3 绝对路径（默认 `command -v python3`） |
+| `DSH_REMOTE_BROKER_PORT` | dsh-token-broker | broker 监听端口（默认 3081；一般由 `broker-install` 用 `--port` 传） |
 
 ---
 
@@ -608,6 +725,10 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `~/.local/state/dsh-remote` | 软链 → `$WTOOL_PREFIX/var/dsh-remote` |
 | `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染；旁边可能留 `.bak-<时间戳>`）。由 systemd 自己读，**不在** `$WTOOL_PREFIX` 里 —— systemd 只认 `$XDG_CONFIG_HOME/systemd/user` |
 | `~/.config/systemd/user/default.target.wants/dsh-tunnel.service` | `enable` 建的软链（`disable` 会撤） |
+| `~/.config/systemd/user/dsh-token-broker.service` | **token broker 单元**（`broker-install` 渲染；同目录可能留 `.bak-<时间戳>`） |
+| `$WTOOL_PREFIX/var/dsh-remote/current-token.txt` | **当前 token**（`harness` 函数写，broker 读；只存 token 一行，600，harness 退出即删） |
+| `$WTOOL_PREFIX/var/dsh-remote/web-url.txt` | 带 token 的完整地址（`harness` 函数 / `dsh-remote serve` 都写这一份） |
+| `$WTOOL_PREFIX/var/dsh-remote/phone-qr.png` / `.svg` | `server` 打出来的二维码图片（没装 `qrencode` 时用 `dsh-qr` 生成） |
 | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `notify-enable` 写 |
 
 云上（`relay.sh` 装出来的）：`/opt/dsh-relay/`（脚本 + 两个模板 + `docker-compose.yml`
