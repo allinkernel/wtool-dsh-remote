@@ -4,17 +4,27 @@
 #
 # 它只做云上这一半；家那一半（隧道 + 推送）在 bin/dsh-remote。
 #
-# 宿主上唯一需要的是 **docker**（+ compose 插件）。Caddy 自己不装、不落盘：
-#   * 密码哈希    docker run --rm caddy:2 caddy hash-password
+# 宿主上唯一需要的是 **docker**。Caddy 自己不装、不落盘：
+#   * 密码哈希    docker run --rm caddy:2.11.4 caddy hash-password
 #   * 反代服务    docker compose up -d（network_mode: host）
-#   * 证书/状态   两个命名卷 caddy-data / caddy-config
+#   * 证书/状态   data/ 与 config/ 两个目录（命名卷或宿主目录，取决于哪种模式）
 #
-# 用法（在云上，root；relay.sh 和 Caddyfile.* / docker-compose.yml 放同一个目录）：
+# 两种跑法：
+#   ① compose 模式（默认）：要 root + docker compose 插件，落盘在本目录，
+#      卷用 docker 命名卷。命令见下面几行。
+#   ② **用户空间模式**（`--no-compose`）：不用 compose、不用 root，
+#      直接用 `docker run` 起容器、用 `--dir` 指定的宿主目录装数据。
+#      宿主上 docker 要 sudo 时再加 `--docker-cmd 'sudo docker'`
+#      （2026-10-07 真阿里云那台就是这样：没 compose 插件、也不在 docker 组）。
+#
+# 用法（在云上；relay.sh 和 Caddyfile.* / docker-compose.yml 放同一个目录）：
 #   sh relay.sh --domain dsh.example.com --email me@example.com
 #   sh relay.sh --ip 47.98.1.2                       # 没域名/没备案：8443 + 自签
 #   sh relay.sh --ip 47.98.1.2 --port 8443 --allow-ip 1.2.3.4/32
 #   sh relay.sh --domain dsh.example.com --dry-run    # 只渲染 + 校验，不起服务
 #   sh relay.sh --domain dsh.example.com --install-docker   # 顺手把 docker 装上
+#   # 用户空间模式（没有 root / 没有 compose 插件）：
+#   sh relay.sh --ip 47.98.1.2 --no-compose --dir ~/dsh-relay --docker-cmd 'sudo docker'
 #
 # 可重复跑：每次重新渲染 Caddyfile（旧的备份）、recreate 容器、再自检。
 # 密码不给 --password 就每次重新随机。
@@ -37,7 +47,15 @@ PORT=
 ALLOW_IPS=
 DRY_RUN=0
 INSTALL_DOCKER=0
-CADDY_IMAGE=${CADDY_IMAGE:-caddy:2}
+NO_COMPOSE=0
+RELAY_DIR=
+DOCKER_CMD=
+# **钉住的 tag**，不是浮动的 caddy:2：2026-10-07 实测阿里云的 mirror 会把 `caddy:2`
+# 兑成 4 年前的 v2.4.6，而 v2.4.6 没有 `basic_auth` 指令 → 容器起来就崩
+# （`unrecognized directive: basic_auth`）。钉住才能保证"本机 validate 过的那份
+# 配置 = 云上真跑的那份"。要换版本用 CADDY_IMAGE=... 覆盖。
+CADDY_IMAGE=${CADDY_IMAGE:-caddy:2.11.4}
+CONTAINER_NAME=dsh-relay
 
 # 所有进度/报告都走 stderr：**stdout 只留给机器能用的东西**
 # （--dry-run 时就是渲染好的 Caddyfile，可以直接重定向成文件）。
@@ -90,12 +108,27 @@ while [ $# -gt 0 ]; do
         INSTALL_DOCKER=1
         shift
         ;;
+    --no-compose)
+        NO_COMPOSE=1
+        shift
+        ;;
+    --dir)
+        RELAY_DIR=${2:-}
+        shift 2 || die "--dir 后面要跟目录"
+        ;;
+    --docker-cmd)
+        # 本机 docker 要 sudo 就传 'sudo docker'（按空格拆开用）
+        DOCKER_CMD=${2:-}
+        shift 2 || die "--docker-cmd 后面要跟命令"
+        ;;
     --dry-run)
         DRY_RUN=1
         shift
         ;;
     -h | --help)
-        sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+        # 打到头部注释块结束为止（同 dsh-remote 的 usage：**别写死行号**，
+        # 头部一改就会多打/少打 —— hazards H10 那个坑）
+        awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) die "不认识的参数：$1（--help）" ;;
@@ -107,7 +140,23 @@ done
 
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 COMPOSE_FILE="$SELF_DIR/docker-compose.yml"
-[ -f "$COMPOSE_FILE" ] || die "找不到 $COMPOSE_FILE（cloud/ 目录要整个传上来）"
+# 落盘目录：compose 模式固定在本目录（compose 文件在这儿）；
+# 用户空间模式可以用 --dir 指到别处（比如 ~/dsh-relay）
+DIR=${RELAY_DIR:-$SELF_DIR}
+case $DIR in
+'~/'*) DIR="$HOME/${DIR#\~/}" ;;
+esac
+[ "$NO_COMPOSE" = 1 ] || [ -f "$COMPOSE_FILE" ] || die "找不到 $COMPOSE_FILE（cloud/ 目录要整个传上来）"
+
+# 用哪条 docker：默认 `docker`，`--docker-cmd 'sudo docker'` 给"不在 docker 组"的机器用。
+# 下面 $DOCKER 故意不加引号按空格拆开（SC2086）。
+DOCKER=${DOCKER_CMD:-docker}
+DOCKER_BIN=${DOCKER%% *}
+
+dk() { # 所有 docker 调用都走这里
+    # shellcheck disable=SC2086
+    $DOCKER "$@"
+}
 
 if [ -n "$DOMAIN" ]; then
     MODE=domain
@@ -121,18 +170,20 @@ else
 fi
 [ -f "$TMPL" ] || die "找不到模板 $TMPL"
 
-if [ "$DRY_RUN" != 1 ] && [ "$(id -u)" != 0 ]; then
-    die "要用 root 跑（装 docker、写 /opt/dsh-relay、起容器）；加 sudo"
+if [ "$DRY_RUN" != 1 ] && [ "$NO_COMPOSE" != 1 ] && [ "$(id -u)" != 0 ]; then
+    die "要用 root 跑（装 docker、写 $SELF_DIR、起容器）；加 sudo，
+   或者用用户空间模式：--no-compose --dir <目录> [--docker-cmd 'sudo docker']"
 fi
 
 # ---------------------------------------------------------------- docker
 compose() { # 兼容 docker compose（插件）和 docker-compose（老包）
-    if docker compose version >/dev/null 2>&1; then
-        docker compose "$@"
+    if dk compose version >/dev/null 2>&1; then
+        dk compose "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
         docker-compose "$@"
     else
-        die "没有 docker compose（插件或独立包都行），装上再来：apt install docker-compose-v2"
+        die "没有 docker compose（插件或独立包都行）。两条路：装上它，
+   或者用用户空间模式（不用 compose）：--no-compose --dir <目录> --docker-cmd 'sudo docker'"
     fi
 }
 
@@ -149,17 +200,21 @@ install_docker() {
     systemctl enable --now docker >/dev/null 2>&1 || true
 }
 
-if ! command -v docker >/dev/null 2>&1; then
+if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then
     if [ "$INSTALL_DOCKER" = 1 ] && [ "$DRY_RUN" != 1 ]; then
         install_docker
     elif [ "$DRY_RUN" = 1 ]; then
-        say "（dry-run：本机没有 docker，密码哈希用占位符）"
+        say "（dry-run：本机没有 $DOCKER_BIN，密码哈希用占位符）"
     else
-        die "没有 docker。两条路：sh $0 ... --install-docker  或者自己 apt install docker.io docker-compose-v2"
+        die "没有 $DOCKER_BIN（--docker-cmd 给的是「$DOCKER」）。两条路：sh $0 ... --install-docker
+   或者自己装好 docker；要 sudo 就用 --docker-cmd 'sudo docker'"
     fi
 fi
 HAS_DOCKER=0
-command -v docker >/dev/null 2>&1 && HAS_DOCKER=1
+command -v "$DOCKER_BIN" >/dev/null 2>&1 && HAS_DOCKER=1
+if [ "$NO_COMPOSE" = 1 ]; then
+    say "== 用户空间模式（--no-compose）：落盘目录 $DIR，容器名 $CONTAINER_NAME，docker 命令「$DOCKER」"
+fi
 
 # ---------------------------------------------------------------- 密码
 gen_password() {
@@ -173,10 +228,26 @@ gen_password() {
 
 if [ "$HAS_DOCKER" = 1 ]; then
     # 哈希在容器里算 —— 宿主上不装 caddy 也能算，顺便保证版本一致
-    if ! HASH=$(docker run --rm "$CADDY_IMAGE" caddy hash-password --plaintext "$CADDY_PASSWORD" 2>/dev/null); then
+    if ! HASH=$(dk run --rm "$CADDY_IMAGE" caddy hash-password --plaintext "$CADDY_PASSWORD" 2>/dev/null); then
         [ "$DRY_RUN" = 1 ] || die "算密码哈希失败（镜像 $CADDY_IMAGE 拉得下来吗？docker pull $CADDY_IMAGE）"
         HASH='$2a$14$DRYRUNPLACEHOLDERDRYRUNPLACEHOLDERDRYRUNPLACEHOLDER'
     fi
+    # 镜像版本自检：浮动 tag 在国内 mirror 上可能是几年前的旧镜像（hazards H13）。
+    # basic_auth 指令要 Caddy ≥ 2.8，太老的话容器会起来就崩、无限重启 —— 这里先拦下来。
+    ver=$(dk run --rm "$CADDY_IMAGE" caddy version 2>/dev/null | awk '{print $1}')
+    case $ver in
+    v2.[89]* | v2.1[0-9]* | v3.* | v[4-9].*) : ;; # 够新
+    '') warn "认不出 $CADDY_IMAGE 里 caddy 的版本，自己确认一下：docker run --rm $CADDY_IMAGE caddy version" ;;
+    *)
+        if [ "$DRY_RUN" = 1 ]; then
+            warn "$CADDY_IMAGE 里的 caddy 是 $ver（basic_auth 要 ≥ 2.8，真跑会被拦下）"
+        else
+            die "$CADDY_IMAGE 里的 caddy 是 $ver，太老：basic_auth 指令要 ≥ 2.8。
+   换个镜像：CADDY_IMAGE=caddy:2.11.4 sh $0 ...
+   （国内 mirror 会把浮动的 caddy:2 兑成很老的镜像，见 docs/hazards.md H13）"
+        fi
+        ;;
+    esac
 else
     HASH='$2a$14$DRYRUNPLACEHOLDERDRYRUNPLACEHOLDERDRYRUNPLACEHOLDER'
 fi
@@ -219,38 +290,71 @@ if [ "$DRY_RUN" = 1 ]; then
     say ""
     say "== 校验（dry-run）"
     if [ "$HAS_DOCKER" = 1 ]; then
-        printf '%s\n' "$rendered" >"$SELF_DIR/Caddyfile.dryrun"
-        docker run --rm -v "$SELF_DIR:/c:ro" "$CADDY_IMAGE" \
+        mkdir -p -- "$DIR"
+        printf '%s\n' "$rendered" >"$DIR/Caddyfile.dryrun"
+        dk run --rm -v "$DIR:/c:ro" "$CADDY_IMAGE" \
             caddy validate --config /c/Caddyfile.dryrun --adapter caddyfile >&2 &&
             say "Caddyfile 校验通过（在 $CADDY_IMAGE 里验的）"
-        rm -f -- "$SELF_DIR/Caddyfile.dryrun"
+        rm -f -- "$DIR/Caddyfile.dryrun"
     else
         say "本机没有 docker，跳过校验"
+    fi
+    if [ "$NO_COMPOSE" = 1 ]; then
+        say ""
+        say "== 真跑（--no-compose）时会执行："
+        say "  $DOCKER rm -f $CONTAINER_NAME        # 已存在就先撤（可重复跑）"
+        say "  $DOCKER run -d --name $CONTAINER_NAME --restart unless-stopped --network=host \\"
+        say "    -v $DIR/Caddyfile:/etc/caddy/Caddyfile:ro -v $DIR/logs:/var/log/caddy \\"
+        say "    -v $DIR/data:/data -v $DIR/config:/config $CADDY_IMAGE"
     fi
     say ""
     say "（dry-run 只打印 Caddyfile 到 stdout；真跑就去掉 --dry-run）"
     exit 0
 fi
 
-say "== 落盘 $SELF_DIR/Caddyfile"
-if [ -f "$SELF_DIR/Caddyfile" ]; then
-    cp -f -- "$SELF_DIR/Caddyfile" "$SELF_DIR/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
+say "== 落盘 $DIR/Caddyfile"
+if [ -f "$DIR/Caddyfile" ]; then
+    cp -f -- "$DIR/Caddyfile" "$DIR/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)"
 fi
-printf '%s\n' "$rendered" >"$SELF_DIR/Caddyfile"
-mkdir -p -- "$SELF_DIR/logs"
+printf '%s\n' "$rendered" >"$DIR/Caddyfile"
+mkdir -p -- "$DIR/logs" "$DIR/data" "$DIR/config"
 
-say "== 起容器（docker compose up -d）"
-cd -- "$SELF_DIR"
-compose up -d || die "compose up 失败：docker compose logs --tail 50"
+if [ "$NO_COMPOSE" = 1 ]; then
+    # 用户空间模式：不用 compose，直接 docker run（宿主目录当数据卷）。
+    # 先 rm -f 再 run —— 可重复跑，且不用管上一次是不是同一份配置。
+    say "== 起容器（$DOCKER run -d --name $CONTAINER_NAME；host 网络）"
+    dk rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    $DOCKER run -d --name "$CONTAINER_NAME" --restart unless-stopped --network=host \
+        -v "$DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
+        -v "$DIR/logs:/var/log/caddy" \
+        -v "$DIR/data:/data" \
+        -v "$DIR/config:/config" \
+        "$CADDY_IMAGE" >/dev/null ||
+        die "$DOCKER run 失败：$DOCKER logs --tail 50 $CONTAINER_NAME"
+else
+    say "== 起容器（docker compose up -d）"
+    cd -- "$SELF_DIR"
+    compose up -d || die "compose up 失败：docker compose logs --tail 50"
+fi
 
 i=0
 while [ "$i" -lt 20 ]; do
-    if compose ps 2>/dev/null | grep -q "dsh-relay"; then break; fi
+    # 注意：这里必须写成 if/then（`… && break` 在 set -e 下 grep 没命中就直接退出脚本）
+    if [ "$NO_COMPOSE" = 1 ]; then
+        if dk ps --filter "name=$CONTAINER_NAME" --format '{{.Names}}' 2>/dev/null | grep -q "$CONTAINER_NAME"; then break; fi
+    else
+        if compose ps 2>/dev/null | grep -q "$CONTAINER_NAME"; then break; fi
+    fi
     sleep 1
     i=$((i + 1))
 done
 sleep 2
-compose ps >&2 || true
+if [ "$NO_COMPOSE" = 1 ]; then
+    dk ps --filter "name=$CONTAINER_NAME" >&2 || true
+else
+    compose ps >&2 || true
+fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
@@ -269,7 +373,7 @@ else
 fi
 case $probe in
 401) say "  https 入口：401（basic auth 在挡着）✓" ;;
-000) warn "  https 入口连不上（docker compose logs 看看；端口 $PORT 起来了吗）" ;;
+000) warn "  https 入口连不上（$DOCKER logs 看看；端口 $PORT 起来了吗）" ;;
 *) warn "  https 入口返回 $probe，预期 401 —— 看看 basic_auth 有没有生效" ;;
 esac
 if command -v curl >/dev/null 2>&1; then
@@ -286,10 +390,17 @@ say "手机收藏这个地址：$url"
 say "用户名：$CADDY_USER"
 say "密码：  $CADDY_PASSWORD"
 say ""
-say "中继器 = 一个 caddy 容器（host 网络）+ 两个命名卷："
-say "  docker compose -f $SELF_DIR/docker-compose.yml ps      看状态"
-say "  docker compose -f $SELF_DIR/docker-compose.yml logs -f 看日志"
-say "  docker compose -f $SELF_DIR/docker-compose.yml down    撤掉（卷留着）"
+say "中继器 = 一个 caddy 容器（host 网络）"
+if [ "$NO_COMPOSE" = 1 ]; then
+    say "  数据在宿主目录 $DIR/{data,config,logs}（--no-compose 模式，没有命名卷）"
+    say "  $DOCKER ps --filter name=$CONTAINER_NAME              看状态"
+    say "  $DOCKER logs -f $CONTAINER_NAME                       看日志"
+    say "  $DOCKER rm -f $CONTAINER_NAME                         撤掉（数据目录留着）"
+else
+    say "  docker compose -f $SELF_DIR/docker-compose.yml ps      看状态"
+    say "  docker compose -f $SELF_DIR/docker-compose.yml logs -f 看日志"
+    say "  docker compose -f $SELF_DIR/docker-compose.yml down    撤掉（卷留着）"
+fi
 say ""
 say "把 $url/ 写进家里 ~/.config/dsh-remote/remote.conf 的 public_url（cloud-install 会自动写）。"
 say ""

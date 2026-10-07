@@ -59,10 +59,12 @@ dsh-remote notify-test                   # 结果：手机收到一条「🔔 ds
 # 2. 打开"卡住就推我"的钩子
 dsh-remote notify-enable      # 写 ~/.config/dsh-remote/hooks.json + profile patch；web profile 的 patchReload 是 live，正常情况下不用重启
 
-# 3. 阿里云那台（一条命令：传脚本 → 拉 caddy:2 镜像起容器 → 生成随机密码 → 自检 → 把地址记回配置）
+# 3. 阿里云那台（一条命令：传脚本 → 拉 caddy 镜像起容器 → 生成随机密码 → 自检 → 把地址记回配置）
 dsh-remote cloud-install --domain dsh.example.com --email me@example.com
 #   没域名/没备案：dsh-remote cloud-install --ip <公网IP> --port 8443
 #   只想看它要做什么：加 --dry-run（宿主要 docker；加 --install-docker 才会顺手装 docker）
+#   ⚠️ 那台没有 docker compose 插件 / 不在 docker 组（比如 2026-10 的阿里云那台）时，
+#      cloud-install 里的 `sudo sh relay.sh` 走不通 —— 见 §4 的"用户空间模式"。
 
 # 4. 反向隧道（先在 tmux 里前台跑一次，确认通了再装 systemd）
 cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
@@ -197,6 +199,31 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 **`cloud/relay.sh --dry-run` 的 stdout 就是 Caddyfile 本体**，
 进度和报告都走 stderr，方便直接重定向成文件去 `caddy validate`。
 
+**2026-10-07 第一次真装到阿里云，撞到三件"本机永远测不到"的事**（细节见
+`docs/hazards.md` H13 和 ADR-012）：
+
+1. **IP 模式必须加 `default_sni`**。手机访问 `https://<IP>:8443` 时**不发 SNI**
+   （RFC 6066 不允许 SNI 里放 IP），Caddy 没有 SNI 就选不出证书，握手直接
+   `internal error` —— 也就是说那份模板**设计上就跑不通**，只是此前从没真装过。
+   现在 `Caddyfile.ip` 的全局块有 `default_sni {{IP}}`。
+2. **镜像 tag 要钉住**。那台机器配了国内 mirror，`caddy:2` 被兑成 **4 年前的 v2.4.6**
+   （没有 `basic_auth` 指令）→ 容器起来就崩、无限重启；而 `--dry-run` 的
+   `caddy validate` 用的是本机镜像，**"本机验过了"完全掩盖了这件事**。
+   现在默认写死 `caddy:2.11.4`，`relay.sh` 还会先问一下镜像里的版本。
+3. **那台没有 docker compose 插件、docker 还要 sudo**，而 `relay.sh` 原来同时要
+   root 和 compose —— 一条路都走不通。现在有**用户空间模式**（不要 root、不要 compose）：
+
+   ```sh
+   # 在云上（relay.sh 和 Caddyfile.* 放同一个目录；--dir 是数据/配置的落点）
+   sh relay.sh --ip <公网IP> --port 8443 --no-compose \
+       --dir ~/dsh-relay --docker-cmd 'sudo docker'
+   ```
+
+   它做的事完全一样（渲染 → 起容器 → 自检 → 打印手机地址和密码），
+   只是用 `docker run -d --name dsh-relay --network=host` 顶替 `docker compose up -d`，
+   数据落在 `--dir` 的 `{Caddyfile,logs,data,config}` 里（普通目录，好备份）。
+   ⚠️ **重跑一次会换新密码**（不给 `--password` 时每次随机），手机上要重输一次。
+
 **安装脚本为什么不自己拼路径？** `scripts/install.sh` 的"源"问引擎的
 `WTOOL_PROJECT_DIR` 要（手跑时按 `$0` 自推项目目录），"落点"从
 `WTOOL_HOME` / `WTOOL_PREFIX` 推。写死 `~/.wtool/wtool-work-dir/links/...`
@@ -245,9 +272,9 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 185 条（以输出为准），不联网、不碰真 $HOME
+sh tests/run_tests.sh        # 199 条（以输出为准），不联网、不碰真 $HOME
                              #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
-                             #   跑一次 docker run … caddy validate（要求 caddy:2 已在本地）
+                             #   跑几次 docker run …（第一次会把 caddy:2.11.4 拉下来，约 50MB）
 sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
 sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密码错 / 撤干净），要 docker，人工跑
 ```
@@ -275,8 +302,8 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **185**）：语法 A 10 / `env` 两份 B 6 /
-`dsh-notify` C 22 / Caddyfile 渲染 D 21 / 子命令 E 45 / `cloud-install` F 14 /
+逐节条数（2026-10-07 实测，合计 **199**）：语法 A 10 / `env` 两份 B 6 /
+`dsh-notify` C 22 / Caddyfile 渲染 D 27 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**

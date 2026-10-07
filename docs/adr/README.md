@@ -25,6 +25,7 @@
 | 9 | [我们自己的配置/日志不放 `~/.dsh`](0009-config-state-not-in-dsh-home.md) | |
 | 10 | [`dsh-notify` 的退出码永远是 0](0010-notify-always-exit-zero.md) | |
 | 11 | [`relay.sh` 的 stdout 只放 Caddyfile，进度/报告全走 stderr](0011-relay-stdout-is-caddyfile.md) | |
+| 12 | [IP 模式在真机上要三处硬化：`default_sni`、钉住的镜像 tag、无 compose 的用户空间模式](0012-ip-mode-hardening-on-real-host.md) | 2026-10-07 第一次真阿里云部署时定 |
 
 > **1–11 是同一条线（2026-09-20 的初版 `13734e3` + 2026-10-04 的修复）**，
 > 2026-10-07 补记成 ADR。当时只写了 `README.md` 的"为什么这么设计"一节和代码注释，

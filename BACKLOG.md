@@ -13,14 +13,14 @@
 ## 🔴 仍未做 / 未验证（一览，2026-10-07 盘点）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 185 通过 0 失败，2026-10-07 复跑两轮），
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 199 通过 0 失败，2026-10-07 复跑两轮），
 > 但**真机端到端从头到尾没跑过**。下表是"还剩什么"的全集，展开在后面的小节里。
 
 | # | 状态 | 事项 | 一句话 |
 |---|---|---|---|
-| U1 | ⬜ | **真机端到端从未跑过** | 真阿里云 + 真手机这条链路一次都没走通；下面 U2–U5 是它的拆解 |
-| U2 | ⏸ | **云端落地步骤**（阿里云那台怎么装） | `relay.sh --domain/--ip`、安全组、域名备案 —— 要用户拍 |
-| U3 | ⬜ | **隧道常驻 / 断线重连** | systemd 单元只生成不 enable；本机没 autossh；重连时长没测过 |
+| U1 | 🟡 | **真机端到端**（往下拆成 U2/U3/U5） | 2026-10-07 中继在真阿里云上**装成并验到"经 Caddy 打到家里的 dsh web"**；还差安全组放行 + 真手机打开 |
+| U2 | 🟡 | **云端落地步骤** | IP 模式已在真机跑通（`--no-compose` 用户空间模式）；**安全组 8443 仍未放行**（用户自己在控制台点，见下） |
+| U3 | 🟡 | **隧道常驻 / 断线重连** | 2026-10-07 在家里用 tmux 起了 `ssh -N -R`，从云上验到 18080 通；**常驻/重连时长仍未做**（本机没 autossh） |
 | U4 | ⏸ | **钩子桥未证实会触发** | `check-hooks` 复查：触发 → 0，没触发 → 1；两条出路要用户选 |
 | U5 | ⬜ | **要 docker 的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；**假绿已修**（没 docker → `exit 77`），但"要不要让 D 节也显式挡 docker"仍待定 |
 | U6 | ✅ | **三个代码小瑕疵**（2026-10-07 已修） | `status` 提示指错路径 / `help` 输出越界 / docker 测试假绿 —— 三条都改完，见下面 U6 那一节 |
@@ -31,6 +31,40 @@
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
 隧道常驻（要人自己 enable 或挂 tmux）；隧道断线重连时长的任何数字；
 真机上的安全组/防火墙/证书续期的任何验证。
+
+---
+
+## 🟡 2026-10-07 中继第一次真装到阿里云（装成了；安全组还差一步）
+
+**在哪台**：`ssh mindul@123.56.158.212`（Ubuntu 26.04、`sudo -n` 免密、docker 有但要 `sudo`、
+**没有 compose 插件**、80 被 nginx 占着）。服务器事实与用户三条硬约束记在
+`harness/dsh-conf/AGENTS.md` 的「阿里云中继服务器」一节（提交 `0406ddd`）。
+
+**怎么装的**（每一步都是在真机上跑的）：
+
+| # | 做了什么 | 结果 |
+|---|---|---|
+| 1 | `mkdir -p /home/mindul/dsh-relay/{data,config,logs}`（700） | 文件只在 `/home/mindul/dsh-relay/`，符合用户约束 |
+| 2 | 本机 `sh cloud/relay.sh --ip 123.56.158.212 --port 8443 --password <20位> --dry-run` | 渲染 + **本机镜像里 `caddy validate` 通过**；stdout 就是 Caddyfile |
+| 3 | `sudo docker run -d --name dsh-relay --network=host … caddy:2` | ❌ **失败**：mirror 给的 `caddy:2` 是 v2.4.6，`unrecognized directive: basic_auth`，容器无限重启 |
+| 4 | 查出根因（镜像 4 年前）→ 改代码：钉 `caddy:2.11.4` + `Caddyfile.ip` 加 `default_sni` + `relay.sh` 加 `--no-compose/--dir/--docker-cmd` | 见 ADR-012、hazards H13；本机 `sh tests/run_tests.sh` → **199 通过 0 失败** |
+| 5 | 再试 `caddy:2.11.4` | ❌ **还是失败**：不是配置错，是**没有 SNI 就选不出证书**（`internal error`）→ 第 4 步的 `default_sni` 修的就是这个 |
+| 6 | 把改完的 `cloud/` 传上去，用**项目自己的脚本**重装：<br>`sh relay.sh --ip 123.56.158.212 --port 8443 --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'` | ✅ **装成**：容器 `dsh-relay` Up（`caddy:2.11.4`，`--restart unless-stopped`）；脚本自检打印 `https 入口：401（basic auth 在挡着）✓` 和 `隧道出口：401 ✓` |
+| 7 | 家里在 tmux（会话 `dsh-tunnel`）里起 `ssh -N -T -E /tmp/dsh-tunnel.log -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -R 127.0.0.1:18080:127.0.0.1:3080 mindul@123.56.158.212` | ✅ 云上 `127.0.0.1:18080` 开始听；经 Caddy 带密码访问，**回的是家里 dsh web 的 401 原文**（`dsh web authentication required; reopen the URL printed by dsh web.`）→ 证明反代真的到了家里 |
+| 8 | 从家里打公网 `https://123.56.158.212:8443/` | ❌ **超时**（绑到 eth1 绕开本机 Clash 后 40s 无连接；同一路径打 80 端口 0.03s 就 200）→ **安全组没放行 8443**（见下） |
+
+**密码落在哪**：云上 `/home/mindul/dsh-relay/relay-password.txt`（**600**，里面有 URL / 用户名 /
+密码，以及"怎么改密码"三步）。仓库里没有密码（`git ls-files` 可验）。
+
+**⬜ 还差的一步（要用户自己在阿里云控制台点，助手不许动安全组）**：
+**放行 8443/tcp**。判据：本机 401/200 只说明"中继+隧道"好；**从外面连不上才是安全组**。
+放行后从家里应该看到 `curl -sk -u dsh:<pw> https://123.56.158.212:8443/` 返回家里的那个 401
+（而不是超时）。⚠️ 那台宿主上 `ufw.service` 是 active、但 `/etc/ufw/ufw.conf` 写着 `ENABLED=no`
+—— 非特权读不出实际规则，真放行后要是还不通，再让用户看一眼
+`sudo ufw status verbose` / `sudo iptables -S INPUT`（**助手不碰**）。
+
+**还没做的**：真手机打开（要用户拿手机 + 带 token 的地址）；域名模式（`--domain`）一次没跑过；
+安全组/防火墙的真实状态；隧道断线重连时长。
 
 ---
 
@@ -310,13 +344,16 @@ sh tests/relay-e2e.sh         # 9 条：真起 caddy 容器（host 网络）+ �
 ⚠️ **没 docker 时这两条打印"跳过"并 `exit 77`**（跳过码 —— 2026-10-07 由 `exit 0`
 改来，见 hazards H8）—— 所以 `77` 是"**没测**"，别当通过。
 
-**要两台机器 / 要手机的（一条都没做过）**：
+**要两台机器 / 要手机的（2026-10-07 更新）**：
 
-- ⬜ 真阿里云上 `relay.sh --domain` / `--ip` 跑通，`curl -sk … | head` 看到 401；
+- 🟡 真阿里云上 `relay.sh --ip` **已跑通**（`--no-compose` 用户空间模式，见上面那节）；
+  `--domain`（Let's Encrypt）**一次没跑过**；
 - ⬜ 真 Let's Encrypt 签发 + 续期（`docker compose logs` 看 ACME 日志）；
-- ⬜ 手机浏览器：第一次 basic auth + 贴带 token 的地址 + 会话能流式刷新；
-- ⬜ 隧道断开→恢复的真实时长；
-- ⬜ 手机丢了/要断入口：`docker compose -f /opt/dsh-relay/docker-compose.yml down`
+- ⬜ **真手机浏览器**：第一次 basic auth + 贴带 token 的地址 + 会话能流式刷新
+  —— 要用户拿手机；**前置条件：安全组先放行 8443**；
+- ⬜ 隧道断开→恢复的真实时长（现在只是 tmux 里的 `ssh -N -R`，没有 autossh、没装 systemd）；
+- ⬜ 手机丢了/要断入口：`docker rm -f dsh-relay`（用户空间模式）或
+  `docker compose -f /opt/dsh-relay/docker-compose.yml down`
   （**不是** `systemctl stop caddy`，见 hazards H7）。
 
 **仍待用户拍的一条**：要不要让 `tests/run_tests.sh` 的 D 节也**显式挡住 docker**

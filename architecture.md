@@ -60,17 +60,17 @@
 | `bin/dsh-remote` | 620 | 家里这头的主命令（14 个子命令） |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
-| `cloud/relay.sh` | 301 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检 |
+| `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
 | `cloud/Caddyfile.domain` | 47 | 域名模式模板（占位符 `{{...}}`） |
-| `cloud/Caddyfile.ip` | 44 | IP 模式模板（`tls internal` 自签） |
-| `cloud/docker-compose.yml` | 38 | 中继器：一个 `caddy:2` 容器（host 网络）+ 两个命名卷 |
+| `cloud/Caddyfile.ip` | 50 | IP 模式模板（`tls internal` 自签 + `default_sni`） |
+| `cloud/docker-compose.yml` | 41 | 中继器：一个 `caddy:2.11.4` 容器（host 网络）+ 两个命名卷 |
 | `hooks/claude-hooks.json` | 27 | hook 桥模板（`__DSH_NOTIFY__` 由 `notify-enable` 替换成实际命令） |
 | `env.zsh` / `env.bash` | 24 / 24 | shell 集成：只导出三个目录变量；两份必须同改 |
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 31 | 隧道配置样板 |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 716 | 185 条（2026-10-07 实测），不联网 / 不碰真 `$HOME`；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2 caddy validate` |
-| `tests/caddy-validate.sh` | 72 | 3 条，用 `caddy:2` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
+| `tests/run_tests.sh` | 736 | 199 条（2026-10-07 实测），不联网 / 不碰真 `$HOME`；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
 | `README.md` / `AGENTS.md` / `BACKLOG.md` / `architecture.md` / `journal.md` / `docs/` | — | 文档 |
@@ -97,7 +97,7 @@
    - 域名模式：证书是 Let's Encrypt 签的（`{ email {{EMAIL}} }` + 站点名是域名）。
    - IP 模式：`tls internal`，Caddy 自己 CA 签的自签证书，浏览器第一次会警告一次。
 3. Caddy 先过 `basic_auth`：用户名默认 `dsh`，密码是 relay.sh 生成/传入的那个
-   （`docker run --rm caddy:2 caddy hash-password` 算出的 bcrypt 哈希写在 Caddyfile 里）。
+   （`docker run --rm caddy:2.11.4 caddy hash-password` 算出的 bcrypt 哈希写在 Caddyfile 里）。
    `--allow-ip` 给了的话前面还有一条 `@notme not remote_ip …` → 403。
 4. Caddy `reverse_proxy 127.0.0.1:18080`，并把请求头改写成
    `Host: 127.0.0.1:3080`、`Origin: http://127.0.0.1:3080`、
@@ -202,9 +202,19 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 
 ## 5. `cloud/relay.sh`：云上那一半
 
-**在云上跑，要 root**（`--dry-run` 除外，脚本自己检查 `id -u` 并 `die`）。
-它和 `Caddyfile.domain` / `Caddyfile.ip` / `docker-compose.yml` 必须放在同一个目录
-（脚本用 `$0` 的目录找它们，找不到就 `die`）。
+**两种跑法**（2026-10-07 加了第二种，ADR-012）：
+
+| | compose 模式（默认） | **用户空间模式**（`--no-compose`） |
+|---|---|---|
+| 要什么 | **root**（`id -u != 0` 直接 `die`）+ `docker compose` 插件（退 `docker-compose`） | 不要求 root；只要能跑 `docker run` |
+| 落盘 | 脚本自己所在目录（`$SELF_DIR`，要和 `docker-compose.yml` 放一起） | `--dir <目录>`（默认也是 `$SELF_DIR`）|
+| 数据 | 命名卷 `caddy-data` / `caddy-config` | 宿主目录 `$DIR/{data,config,logs}` |
+| 起容器 | `docker compose up -d` | `docker rm -f dsh-relay` → `docker run -d --name dsh-relay --restart unless-stopped --network=host -v …` |
+| docker 命令 | 写死 `docker` | `--docker-cmd '<命令>'`（默认 `docker`；要提权就 `'sudo docker'`）|
+
+`--dry-run` 两种模式都不要 root。它和 `Caddyfile.domain` / `Caddyfile.ip` /
+`docker-compose.yml` 必须放在同一个目录（脚本用 `$0` 的目录找它们，找不到就 `die`；
+**用户空间模式不再要求 `docker-compose.yml` 存在**）。
 
 两种模式（**必须给且只能给一个** `--domain` / `--ip`）：
 
@@ -218,36 +228,47 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 
 参数：`--email` `--port` `--tunnel-port`（默认 18080）`--local-port`（默认 3080）
 `--user`（basic auth 用户名，默认 `dsh`）`--password`（不给就每次随机 20 位）
-`--allow-ip`（可多次）`--install-docker` `--dry-run` `-h`。
+`--allow-ip`（可多次）`--install-docker` `--no-compose` `--dir` `--docker-cmd`
+`--dry-run` `-h`（`--help` 用 awk 打到头部注释块结束，**不写死行号**）。
 
 它做的事，按顺序：
 
-1. **docker 探测**：`docker compose version` 通就用 `docker compose`，否则退到
-   `docker-compose`，都没有就 `die`。`--install-docker` 才会 apt 装
-   （`docker.io` + `docker-compose-v2`，老发行版退 `docker-compose`）+ `systemctl enable --now docker`；
-   非 apt 系统直接 `die`。
-2. **密码哈希**：`docker run --rm <CADDY_IMAGE> caddy hash-password --plaintext <密码>`
-   （`CADDY_IMAGE` 可换镜像，默认 `caddy:2`）。没有 docker 或是 dry-run 时用占位哈希
+1. **docker 探测**：按 `$DOCKER`（`--docker-cmd`，默认 `docker`）查那条命令在不在；
+   compose 模式下 `docker compose version` 通就用 `docker compose`，否则退到
+   `docker-compose`，都没有就 `die`（并提示可以改用 `--no-compose`）。
+   `--install-docker` 才会 apt 装（`docker.io` + `docker-compose-v2`，老发行版退
+   `docker-compose`）+ `systemctl enable --now docker`；非 apt 系统直接 `die`。
+2. **密码哈希**：`$DOCKER run --rm <CADDY_IMAGE> caddy hash-password --plaintext <密码>`
+   （`CADDY_IMAGE` 可换镜像，**默认钉住的 `caddy:2.11.4`** —— 浮动 tag 会被国内
+   mirror 兑成旧镜像，hazards H13）。没有 docker 或是 dry-run 时用占位哈希
    `$2a$14$DRYRUNPLACEHOLDER…`。
+   **紧跟一道版本自检**：`$DOCKER run --rm <CADDY_IMAGE> caddy version` ——
+   真跑时 < 2.8 就 `die`（`basic_auth` 指令要 ≥ 2.8），dry-run 时只 `warn`，
+   认不出（空串）也只 `warn`。
 3. **渲染**：`sed` 把 `{{DOMAIN}} {{EMAIL}} {{IP}} {{PORT}} {{USER}} {{HASH}}
    {{TUNNEL_PORT}} {{LOCAL_PORT}}` 替换掉；`{{ALLOW_BLOCK}}` 那一行换成
    一个临时文件的内容（两行：`@notme not remote_ip <一串>` + `respond @notme "forbidden" 403`）。
    渲染完还要 `grep -E '\{\{[A-Z_]+\}\}'` 兜底：有没替换的占位符就列出**行号**并 `die`。
 4. **dry-run**：把 Caddyfile 打到 **stdout**（进度/报告全走 stderr，见 ADR-0011），
-   有 docker 时写一份 `Caddyfile.dryrun` 用 `caddy validate` 真验一遍再删掉，然后 exit 0。
-5. **真跑**：旧的 `Caddyfile` 备份成 `Caddyfile.bak-<时间戳>` → 落盘新的 →
-   `mkdir logs` → `docker compose up -d` → 最多 20s 等 `compose ps` 里出现 `dsh-relay`
-   → `sleep 2` 打一次 `compose ps`；`ufw` 处于 active 才 `ufw allow <PORT>/tcp`。
+   有 docker 时 `mkdir -p $DIR` 后写一份 `Caddyfile.dryrun` 用 `caddy validate` 真验一遍
+   再删掉；用户空间模式还会把"真跑时会执行的那条 `docker run …`"打到 stderr，然后 exit 0。
+5. **真跑**：旧的 `$DIR/Caddyfile` 备份成 `Caddyfile.bak-<时间戳>` → 落盘新的 →
+   `mkdir -p $DIR/{logs,data,config}` → 起容器（compose 模式 `docker compose up -d`；
+   用户空间模式 `rm -f` 再 `docker run -d`）→ 最多 20s 等 `dsh-relay` 出现在 `ps` 里
+   → `sleep 2` 再打一次 ps；`ufw` 处于 active 才 `ufw allow <PORT>/tcp`
+   （非 root 跑时 `ufw status` 本来就失败 → 这一步自然跳过）。
 6. **自检**：域名模式 `curl -sk --resolve <域名>:<PORT>:127.0.0.1 https://<域名>:<PORT>/`，
    IP 模式 `curl -sk -H "Host: <IP>:<PORT>" https://127.0.0.1:<PORT>/`；
    **401 = 对**（basic auth 在挡），000 = 连不上，其它码 = basic_auth 没生效。
-   再探一下 `http://127.0.0.1:18080/`：000 就是"家里的隧道还没起"（第一次跑正常）。
-7. **结尾打印**（stderr）：手机地址、用户名、密码，`docker compose -f … ps/logs/down`
-   三条命令，以及脚本做不了的两件事（安全组只放 22 + 对外端口；手机第一次要
-   basic auth 一次 + 贴一次带 token 的地址）。
+   再探一下 `http://127.0.0.1:18080/`：000 就是"家里的隧道还没起"（第一次跑正常），
+   非 0 说明家里那半已经在后面了。
+7. **结尾打印**（stderr）：手机地址、用户名、密码，看状态/看日志/撤掉三条命令
+   （按模式给 `docker compose -f …` 或 `$DOCKER …`），以及脚本做不了的两件事
+   （安全组只放 22 + 对外端口；手机第一次要 basic auth 一次 + 贴一次带 token 的地址）。
 
-**可重复跑**：每次重新渲染（旧 Caddyfile 留备份）、recreate 容器、重新自检。
-密码不给 `--password` 就每次换新的（这也意味着重跑一次要重新在手机上输密码）。
+**可重复跑**：每次重新渲染（旧 Caddyfile 留备份）、recreate 容器（用户空间模式靠
+`rm -f` 再 `run`）、重新自检。密码不给 `--password` 就每次换新的
+（这也意味着重跑一次要重新在手机上输密码）。
 
 ---
 
@@ -272,12 +293,17 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 }
 ```
 
-`cloud/Caddyfile.ip` 只有三处不同：没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
-多一行 `tls internal`。两个模板都写了 `auto_https disable_redirects` ——
+`cloud/Caddyfile.ip` 只有四处不同：没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
+多一行 `tls internal`，以及全局块里多一行 **`default_sni {{IP}}`**。
+最后这行是**必须的**：浏览器连 `https://<IP>:8443` 时**不发 SNI**
+（RFC 6066 不允许 SNI 放 IP 字面量），没有它 Caddy 选不出证书、握手直接
+`internal error`（2026-10-07 真机实测，ADR-012 / hazards H13）。
+两个模板都写了 `auto_https disable_redirects` ——
 Caddy 默认会为了 http→https 跳转去占宿主 `:80`，80 被占或没备案时容器会
 restart 循环（实测，hazards H6）。
 
-`cloud/docker-compose.yml`：服务名 `relay`，`image: caddy:2`，
+`cloud/docker-compose.yml`：服务名 `relay`，**`image: caddy:2.11.4`**（钉住的 tag，
+不是浮动的 `caddy:2` —— 国内 mirror 会把浮动 tag 兑成旧镜像，hazards H13），
 `container_name: dsh-relay`，**`network_mode: host`**（两个原因缺一不可：要连宿主
 `127.0.0.1:18080` 的隧道口；要直接占用宿主 443/8443），`restart: unless-stopped`，
 挂载 `./Caddyfile:ro`、`./logs:/var/log/caddy`、命名卷 `caddy-data:/data`
@@ -427,15 +453,16 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **185 通过 0 失败**（A 10 / B 6 / C 22 / D 21 / E 45 / F 14 / G 8 / H 6 / I 53） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker** | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景 |
-| `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
+| `tests/run_tests.sh` | **199 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 53） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景 |
+| `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
 
 ⚠️ **跟 docker 有关的两件事**（2026-10-07 实测 + 当天修掉，细节在 hazards H8）：
 
 - `run_tests.sh` 在**装了 docker 的机器上**，D 节会经 `relay.sh --dry-run` 真跑
-  `docker run --rm caddy:2 caddy validate`（一轮 5 次；`caddy:2` 不在本地会去拉镜像）
+  `docker run --rm caddy:2.11.4 caddy hash-password / caddy version / caddy validate`
+  （一轮十几次容器启动；镜像不在本地会去拉一次，约 50MB）
   —— 所以它的文件头现在写的是"**不联网、不碰真 `$HOME`**"，另起一段声明 D 节会碰 docker
   （此前写"不碰 docker"，那句只在"机器上没有 docker"时成立）；
 - 两个 docker 脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码，不是通过）。
@@ -473,7 +500,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 | `DSH_NOTIFY_CONF` | dsh-notify | 换 `notify.conf` 路径 |
 | `DSH_NOTIFY_LOG` | dsh-notify | 换日志路径 |
 | `XDG_CONFIG_HOME` / `XDG_STATE_HOME` | 上述全部 | 标准 XDG 覆盖 |
-| `CADDY_IMAGE` | relay.sh、两个 docker 测试 | Caddy 镜像，默认 `caddy:2` |
+| `CADDY_IMAGE` | relay.sh、两个 docker 测试 | Caddy 镜像，**默认钉住的 `caddy:2.11.4`**（换版本用环境变量覆盖；别用浮动 tag，hazards H13） |
 | `AUTOSSH_GATETIME` | dsh-remote tunnel | 用 autossh 时置 0（第一次连不上也继续重试） |
 
 ---

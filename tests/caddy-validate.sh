@@ -10,12 +10,13 @@
 # 顺带做一次"反向自检"：故意塞一条坏配置，确认这个测试**能失败**
 # （一个永远绿的测试等于没测）。
 #
-# 镜像：caddy:2（约 20MB）。拉不动时先 docker pull caddy:2。
+# 镜像：caddy:2.11.4（约 50MB；**钉住的 tag** —— 浮动 tag 在国内 mirror 上可能是
+# 几年前的旧镜像，见 hazards H13）。拉不动时先 docker pull caddy:2.11.4。
 
 set -u
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 proj=$(CDPATH= cd -- "$here/.." && pwd)
-IMG=${CADDY_IMAGE:-caddy:2}
+IMG=${CADDY_IMAGE:-caddy:2.11.4}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
 pass=0

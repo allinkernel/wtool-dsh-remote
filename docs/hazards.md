@@ -424,3 +424,64 @@ systemctl --user is-enabled dsh-remote-tunnel   # 生成之后期望还是 disab
 `.zshrc` / `.bashrc` / `.config/dsh-remote` / `.local/state/dsh-remote` 的指纹
 （软链比 `readlink`+`stat -c %Y`，实体比 `%F|%s|%Y`），要求**逐字不变**。
 本轮跑了两轮 179 条，两条都是"真 `$HOME` 的指纹跑完逐字不变"。
+
+**订正（2026-10-07）**：上面那张表里"`relay.sh` 在云上要 **root + docker**"这句
+**已经不全面** —— `relay.sh` 现在有 `--no-compose` 用户空间模式：不要 root、不要 compose，
+只要求能跑 `docker run`（要提权就 `--docker-cmd 'sudo docker'`）。见 H13 / ADR-012。
+
+---
+
+## H13. 真阿里云那台上的三个坑：IP 模式无 SNI / mirror 把浮动 tag 兑成旧镜像 / 那台没有 compose
+
+**现象（2026-10-07 第一次真装到 `mindul@123.56.158.212`，三个都是实测）**：
+
+1. **TLS 握手直接失败**：手机/浏览器访问 `https://<IP>:8443` 时，Caddy 回
+   `TLS alert internal error`（curl `SSL_ERROR_SYSCALL`、openssl `alert number 80`）。
+   本机 `curl -k https://127.0.0.1:8443` 同样症状，而 `openssl s_client -servername <IP>`
+   （手动塞 SNI）却好好的。
+2. **容器无限重启**：`docker run caddy:2 …` 起来就退，日志里
+   `run: adapting config using caddyfile: /etc/caddy/Caddyfile:22: unrecognized directive: basic_auth`。
+3. **`relay.sh` 在那台机器上一条路都走不通**：它是 root-only（`id -u != 0` 直接 `die`），
+   起来之后又要 `docker compose up -d`；而那台 **没有 compose 插件**
+   （`docker: unknown command: docker compose`）、`mindul` **不在 docker 组**
+   （每条 docker 都要 `sudo docker`）。
+
+**根因**：
+
+1. **浏览器连 IP 时不发 SNI**（RFC 6066 不允许 SNI 里放 IP 字面量）。Caddy 按 SNI 选证书，
+   没有 SNI 就选不出来 → 握手就断。`Caddyfile.ip`（IP 模式模板）没给这种情况留退路。
+2. 那台 `/etc/docker/daemon.json` 配了 5 个国内 mirror，其中一个的 `caddy:2` 缓存停在
+   **4 年前的 v2.4.6**；v2.4.6 里这个指令还叫 `basicauth`，没有 `basic_auth`。
+   更坑的是 `relay.sh --dry-run` 的 `caddy validate` 用的是**本机**镜像
+   （v2.11.4）→ **"本机验证通过"掩盖了云上那份配置根本没被同一个 Caddy 读过**。
+3. 用户给的硬约束是"唯一允许的特权动作是 `sudo docker` 启停中继容器" ——
+   `sudo sh relay.sh` 不在授权里，装 compose / 改 docker 组更不许。
+
+**修法（代码已改，ADR-012）**：
+
+1. `cloud/Caddyfile.ip` 全局块加 `default_sni {{IP}}`（只 IP 模式加；域名本来就有 SNI）。
+2. `relay.sh` / `docker-compose.yml` / 两个测试脚本的默认镜像 **钉到 `caddy:2.11.4`**；
+   `relay.sh` 再加一道**版本自检**：真跑时 caddy < 2.8 就 `die` 并告诉你怎么换镜像。
+3. `relay.sh` 加用户空间模式：`--no-compose` + `--dir <目录>` + `--docker-cmd '<命令>'`
+   （云上就是用 `--no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'` 装成的）。
+
+**判据 / 复现**（都在那台真机上实测）：
+
+```sh
+# ① 无 SNI 的握手（加 default_sni 之前 → internal error；之后 → 拿到证书）
+ssh mindul@123.56.158.212 'timeout 8 openssl s_client -connect 127.0.0.1:8443 </dev/null 2>&1 | grep -E "issuer=|alert"'
+
+# ② 镜像 tag 被 mirror 兑成什么，直接问（两台各跑一次对比）
+ssh mindul@123.56.158.212 'sudo -n docker run --rm caddy:2      caddy version'   # → v2.4.6（2026-10-07 实测）
+ssh mindul@123.56.158.212 'sudo -n docker run --rm caddy:2.11.4 caddy version'   # → v2.11.4
+docker run --rm caddy:2.11.4 caddy version                                        # 本机也是 v2.11.4
+
+# ③ 那台有没有 compose / 在不在 docker 组
+ssh mindul@123.56.158.212 'docker compose version; id -nG'
+```
+
+**验证程度**：2026-10-07 真机实测各 1 次；改完之后在同一天用 `relay.sh --no-compose`
+**重新装成了**（自检打印 `https 入口：401 ✓` 和 `隧道出口：401 ✓`）。
+
+**还没验证的**：`default_sni` 在 Caddy < 2.7 上是否存在（那台现在用的是 2.11.4，
+没测过更老的版本）；`--docker-cmd` 里带空格以外的复杂命令（比如 `env FOO=1 docker`）没试过。

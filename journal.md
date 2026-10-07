@@ -168,3 +168,61 @@ exit 2、`install.sh` 根本没机会跑），旧标签 `<env src= shells=>` 换
 改用 awk 后 185 全绿；教训写进 hazards H10 的订正段（含"别用 `sed -n '2,/^[^#]/p'`"）。
 
 **没做的**：D 节要不要显式挡 docker（仍留 U5）；`main` 没动、没有 push。
+
+---
+
+## 2026-10-07（第三轮）—— 中继第一次真装到阿里云（IP 模式）
+
+**谁**：助手。用户在同一轮里派了三件事（① 修 U6 四个小瑕疵 → 提交 `7e85e1b`；
+② 把服务器信息记进 `harness/dsh-conf/AGENTS.md` → 提交 `0406ddd`；③ 就是本条）。
+
+**在哪台、按什么约束**：`ssh mindul@123.56.158.212`（Ubuntu 26.04、`sudo -n` 免密、
+docker 有但**不在 docker 组**、**没有 compose 插件**、80 被 nginx 占着、8443 空着）。
+用户三条硬约束照原话记在 `harness/dsh-conf/AGENTS.md`；本轮**只写 `/home/mindul/dsh-relay/**`、
+只用 `sudo docker` 启停那个容器**，没碰 apt / `/etc` / nginx / 防火墙 / 安全组。
+
+**做了什么（按时间顺序，含两次失败）**：
+
+1. 本机用项目自己的渲染器出 Caddyfile：
+   `sh cloud/relay.sh --ip 123.56.158.212 --port 8443 --password <20位> --dry-run`（本机镜像里 validate 通过）。
+2. `scp` 到 `/home/mindul/dsh-relay/`，`sudo docker run -d --name dsh-relay --network=host … caddy:2`
+   → **容器无限重启**：`unrecognized directive: basic_auth`。查出那台的 mirror 把 `caddy:2`
+   兑成 **v2.4.6（4 年前）**；本机同一 tag 是 v2.11.4 —— 也就是说 `--dry-run` 的
+   "本机验证通过"是**假的**。
+3. 换成 `caddy:2.11.4` 再起 → 这次容器活了，但 `curl -sk https://127.0.0.1:8443/`
+   还是失败：`openssl` 报 `tlsv1 alert internal error`。用 `-servername` 手动塞 SNI 就正常
+   → 根因是**连 IP 不发 SNI**（RFC 6066），Caddy 选不出证书。也就是说 **IP 模式的模板
+   设计上就跑不通**，此前只是从没真装过。
+4. 改代码（同一个提交里）：`Caddyfile.ip` 全局块加 `default_sni {{IP}}`；镜像 tag 钉成
+   `caddy:2.11.4`（relay.sh / compose / 两个测试脚本）+ relay.sh 加版本自检；
+   relay.sh 加 `--no-compose` / `--dir` / `--docker-cmd` 用户空间模式；顺手把它的
+   `--help` 也改成"打到注释块结束"（同 H10 那个坑）。ADR-012 + hazards H13 +
+   architecture/README/BACKLOG 同步。
+5. 把改完的 `cloud/` 传上去，**用项目自己的脚本重装**：
+   `sh relay.sh --ip 123.56.158.212 --port 8443 --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'`
+   → 装成。容器 `dsh-relay`（`caddy:2.11.4`、`--restart unless-stopped`），
+   脚本自检：`https 入口：401（basic auth 在挡着）✓`、`隧道出口：401 ✓`。
+6. 家里在 tmux（会话 `dsh-tunnel`）起 `ssh -N -T -R 127.0.0.1:18080:127.0.0.1:3080`；
+   云上 `127.0.0.1:18080` 开始听，经 Caddy 带密码访问回的是**家里 dsh web 的 401 原文**
+   （`dsh web authentication required; reopen the URL printed by dsh web.`）。
+7. 从家里打公网 8443 → **超时**。判据：① 用 `--interface eth1`（SO_BINDTODEVICE）
+   绕开本机 Clash TUN 后，打 80 端口 0.03s 拿到 nginx 的 200，打 8443 是 40s 无连接；
+   ② 同时在那台上 `ss -tn "( sport = :8443 or dport = :8443 )"` 连采 10 秒，**一条都没有**，
+   Caddy 日志也没有新行 → 包没到机器。**结论：安全组没放行 8443**（用户自己去控制台点）。
+
+**怎么验证的（判据汇总）**：
+
+- 无 SNI 握手：`openssl s_client -connect 127.0.0.1:8443 </dev/null` →
+  改之前 `alert internal error`，改之后拿到 `issuer=CN=Caddy Local Authority - ECC Intermediate`。
+- 中继本身：不带密码 401 + `www-authenticate: Basic realm="restricted"`；密码错 401；
+  密码对且隧道没起时 502（`dial tcp 127.0.0.1:18080: connect: connection refused`）。
+- 打到家里：带密码时 body 是 `dsh web authentication required; …`（dsh web 的原文），
+  另有 `via: 1.1 Caddy` + `cache-control: no-store` —— 与家里 `curl 127.0.0.1:3080/` 逐字一致。
+- 本机测试：`sh tests/run_tests.sh` → **199 通过 0 失败**（比上一轮 +14：
+  `default_sni`、钉住的 tag、`--no-compose` 的 dry-run 与静态断言等）。
+
+**没做的**：安全组放行（不归助手）；真手机打开；`--domain` 模式；隧道常驻（现在只是 tmux，
+本机没 autossh）；`ufw` 在那台到底是 active 还是没生效（非特权读不出来，如实记着）。
+
+**如实记账**：`/home/mindul/dsh-relay/Caddyfile.bak-20261007-115442` 是第 5 步之前那份
+（同密码、旧哈希），留着没删；试验用的 `Caddyfile.try-default-sni` / `watch8443.txt` 已删。

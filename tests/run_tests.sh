@@ -2,8 +2,8 @@
 # run_tests.sh —— tools/dsh-remote 的用例（**不联网、不碰真 $HOME**）
 #
 # ⚠️ 它**会碰 docker**：本机装了 docker 时，D 节经 `cloud/relay.sh --dry-run`
-#    会真跑 `docker run --rm caddy:2 caddy validate`（要 caddy:2 镜像已在本地，
-#    没有会去拉）。别的节不碰 docker。见 hazards H8。
+#    会真跑 `docker run --rm caddy:2.11.4 caddy hash-password / caddy version /
+#    caddy validate`（镜像不在本地会去拉，约 50MB）。别的节不碰 docker。见 hazards H8。
 #
 #   sh tests/run_tests.sh         # 全跑
 #   sh tests/run_tests.sh -v      # 每条都打印
@@ -250,6 +250,8 @@ check_contains "domain：Origin 也改了" "header_up Origin http://127.0.0.1:30
 check_contains "domain：反代到隧道端口" "reverse_proxy 127.0.0.1:18080" "$out"
 check_contains "domain：写了域名" "dsh.example.com" "$out"
 check_contains "domain：配了 ACME 邮箱" "me@example.com" "$out"
+# default_sni 只该出现在 IP 模式（域名本来就会进 SNI，见 hazards H13）
+check_not_contains "domain：不该有 default_sni" "default_sni" "$out"
 
 out=$("$setup" --ip 47.98.1.2 --dry-run 2>&1)
 check "ip dry-run 退出 0" "0" "$?"
@@ -257,6 +259,8 @@ check "ip：占位符都替换了" "" "$(leaked_placeholders "$out")"
 check_contains "ip：自签证书" "tls internal" "$out"
 check_contains "ip：站点地址带端口" "47.98.1.2:8443" "$out"
 check_contains "ip：Host 也改写" "header_up Host 127.0.0.1:3080" "$out"
+# IP 模式必须有 default_sni：浏览器连 https://<IP> 不发 SNI，没它握手直接失败（H13）
+check_contains "ip：带 default_sni（连 IP 没有 SNI，没它就是握手 Internal Error）" "default_sni 47.98.1.2" "$out"
 
 out=$("$setup" --ip 47.98.1.2 --allow-ip 1.2.3.4/32 --dry-run 2>&1)
 check_contains "allow-ip：插入了 remote_ip 规则" "not remote_ip 1.2.3.4/32" "$out"
@@ -275,6 +279,13 @@ out=$("$setup" --domain a.com --tunnel-port 19999 --local-port 3999 --user bob -
 check_contains "端口/用户名可覆盖（隧道）" "reverse_proxy 127.0.0.1:19999" "$out"
 check_contains "端口/用户名可覆盖（本地）" "header_up Host 127.0.0.1:3999" "$out"
 check_contains "端口/用户名可覆盖（用户）" "bob " "$out"
+
+# 用户空间模式：没有 compose 插件 / 不在 docker 组的机器（真阿里云那台就是）
+out=$("$setup" --ip 47.98.1.2 --no-compose --dir "$TMP/relaydir" --docker-cmd docker --dry-run 2>&1)
+check "--no-compose --dir 的 dry-run 退出 0" "0" "$?"
+check_contains "--no-compose：打印真跑时会执行的 docker run" "docker run -d --name dsh-relay" "$out"
+check_contains "--no-compose：数据挂在 --dir 指定的目录" "$TMP/relaydir/Caddyfile" "$out"
+check_contains "--no-compose：提示里说要先 rm -f（可重复跑）" "docker rm -f dsh-relay" "$out"
 
 # ---------------------------------------------------------------- E dsh-remote
 printf 'E. dsh-remote 子命令\n'
@@ -378,11 +389,20 @@ check_contains "compose：用 caddy 官方镜像" "image: caddy:2" "$cmp"
 check_contains "compose：host 网络（要连宿主 127.0.0.1 的隧道口）" "network_mode: host" "$cmp"
 check_contains "compose：证书放命名卷" "caddy-data:" "$cmp"
 check_contains "compose：Caddyfile 只读挂载" "/etc/caddy/Caddyfile:ro" "$cmp"
+# 镜像 tag 必须钉住：浮动 tag 会被国内 mirror 兑成几年前的旧镜像（H13）
+check_contains "compose：镜像 tag 钉到 caddy:2.11.4（不是浮动的 caddy:2）" "image: caddy:2.11.4" "$cmp"
 rl=$(cat "$setup")
-check_contains "relay.sh：哈希在容器里算" "docker run --rm" "$rl"
+check_contains "relay.sh：哈希在容器里算" "dk run --rm" "$rl"
 check_contains "relay.sh：用 compose 起服务" "compose up -d" "$rl"
 check_not_contains "relay.sh：不再 apt 装 caddy" "apt-get install -y --no-install-recommends caddy" "$rl"
 check_contains "relay.sh：宿主只要求 docker" "docker" "$rl"
+check_contains "relay.sh：默认镜像也钉住" "caddy:2.11.4" "$rl"
+check_not_contains "relay.sh：默认不再是浮动的 caddy:2" 'CADDY_IMAGE:-caddy:2}' "$rl"
+check_contains "relay.sh：有用户空间模式（--no-compose）" "--no-compose" "$rl"
+check_contains "relay.sh：docker 命令可换（--docker-cmd，给要 sudo 的机器）" 'DOCKER=${DOCKER_CMD:-docker}' "$rl"
+check_contains "relay.sh：起容器走 \$DOCKER，不写死 docker" '$DOCKER run -d --name "$CONTAINER_NAME"' "$rl"
+check_contains "relay.sh：--help 会用算出来的注释块范围（别再写死行号）" "awk 'NR == 1 { next }" "$rl"
+check_contains "relay.sh：版本自检（太老的镜像直接拦下来）" "basic_auth 指令要 ≥ 2.8" "$rl"
 
 # ---------------------------------------------------------------- F cloud-install
 printf 'F. cloud-install（一条命令装到阿里云；用假的 ssh/scp 验参数）\n'

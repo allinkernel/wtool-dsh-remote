@@ -18,7 +18,10 @@
 
 services:
   relay:
-    image: caddy:2
+    # **钉住 tag**，别写浮动的 caddy:2：国内 mirror 会把 caddy:2 兑成几年前的旧镜像
+    # （2026-10-07 实测阿里云那台拿到的是 v2.4.6，没有 basic_auth 指令 → 起来就崩），
+    # 而且浮动 tag 会让"本机 validate 过的那份配置"和"云上真跑的那份"不是一个版本。
+    image: caddy:2.11.4
     container_name: dsh-relay
     network_mode: host
     restart: unless-stopped

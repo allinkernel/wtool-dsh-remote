@@ -12,6 +12,12 @@
 	admin 127.0.0.1:2019
 	# 同上：别去占宿主 :80（见 Caddyfile.domain 里的说明）
 	auto_https disable_redirects
+	# **IP 模式必须有这一行**：浏览器连 https://<IP>:8443 时**不会发 SNI**
+	# （RFC 6066 不允许 SNI 里放 IP 字面量），Caddy 没有 SNI 就选不出证书，
+	# 握手直接 Internal Error（curl 报 SSL_ERROR_SYSCALL / openssl 报 alert 80）。
+	# 2026-10-07 在真阿里云上实测撞到；加 default_sni 后不带 SNI 的握手才通。
+	# 域名模式不需要它（域名本来就会进 SNI）。
+	default_sni {{IP}}
 }
 
 {{IP}}:{{PORT}} {

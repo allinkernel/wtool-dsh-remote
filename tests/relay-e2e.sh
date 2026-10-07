@@ -17,7 +17,7 @@
 set -u
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 proj=$(CDPATH= cd -- "$here/.." && pwd)
-IMG=${CADDY_IMAGE:-caddy:2}
+IMG=${CADDY_IMAGE:-caddy:2.11.4}
 pass=0
 fail=0
 ok() {
