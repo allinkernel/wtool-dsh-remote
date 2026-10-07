@@ -4,6 +4,70 @@
 > 引擎/跨项目的事在 `~/self/wtool/harness/BACKLOG.md`，别混。
 >
 > 状态：⬜ 待做 · 🔄 在做 · ✅ 做完（写清怎么做的、验证到什么程度）· ⏸ 待决定（要人来拍）
+>
+> 任务**从这个文件来**，不从 ADR 标题来。现状看 `architecture.md`，
+> 决策理由看 `docs/adr/`，踩过的坑看 `docs/hazards.md`，流水看 `journal.md`。
+
+---
+
+## 🔴 仍未做 / 未验证（一览，2026-10-07 盘点）
+
+> 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 179 通过 0 失败，2026-10-07 复跑两轮），
+> 但**真机端到端从头到尾没跑过**。下表是"还剩什么"的全集，展开在后面的小节里。
+
+| # | 状态 | 事项 | 一句话 |
+|---|---|---|---|
+| U1 | ⬜ | **真机端到端从未跑过** | 真阿里云 + 真手机这条链路一次都没走通；下面 U2–U5 是它的拆解 |
+| U2 | ⏸ | **云端落地步骤**（阿里云那台怎么装） | `relay.sh --domain/--ip`、安全组、域名备案 —— 要用户拍 |
+| U3 | ⬜ | **隧道常驻 / 断线重连** | systemd 单元只生成不 enable；本机没 autossh；重连时长没测过 |
+| U4 | ⏸ | **钩子桥未证实会触发** | `check-hooks` 复查：触发 → 0，没触发 → 1；两条出路要用户选 |
+| U5 | ⬜ | **要 docker / 要两台机器的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；没 docker 时会假绿 |
+| U6 | ⏸ | **三个代码小瑕疵** | `status` 提示指错路径 / `help` 输出越界 / docker 测试假绿 |
+| U7 | ⏸ | 真 `$HOME` 里两条 2026-09-20 的老软链 | 要用户自己重跑一次 `wtool install` 才会纠正 |
+| U8 | ⏸ | "源找不到"要不要从警告改成 `exit 1` | 现在选的是"警告 + 继续"，三个仓库口径一致 |
+| U9 | ⏸ | `main` 与 `ds_dev` 的差距要不要合 | 助手不合并、不推送，由用户定 |
+
+**明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
+隧道常驻（要人自己 enable 或挂 tmux）；隧道断线重连时长的任何数字；
+真机上的安全组/防火墙/证书续期的任何验证。
+
+---
+
+## ✅ 建立 wsw 文档体系（2026-10-07）
+
+**为什么**：用户 2026-10-07 要求"重新看下这个项目的设计文档，调整此文档为此 git
+项目自己的文档，文档标准按 `~/.dsh/AGENTS.md` 里的【wsw 文档体系】来"。
+
+**做了什么**（全部在 `tools/dsh-remote/` 内，只改这一个仓）：
+
+- 新增 `architecture.md`：**只写现状**，逐行核对代码后写成 —— 14 个子命令的真实行为、
+  `dsh-notify` 的三种模式与 provider 表、`install.sh` 的契约变量与"源找不到"语义、
+  `relay.sh` 的两种模式与 7 步流程、两个 Caddyfile 与 compose 的实质内容、
+  配置字段与环境变量总表、四个测试文件各测什么/多少条/要什么。
+- 新增 `docs/adr/`：索引 + **ADR-001…011**（云上 Caddy+反向隧道、容器化 + 命名卷、
+  域名/IP 两种模式、basic auth、`dsh web` 只绑回环、hook 桥与"未证实"的记录方式、
+  `install.sh` 只认契约变量、Host/Origin 改写、配置不放 `~/.dsh`、推送恒 0 退出、
+  `relay.sh` 的 stdout 约定）。
+- 新增 `docs/hazards.md`：**H1…H12**（每条：现象 → 根因 → 修法 → 判据/复现 + 验证程度）。
+- 新增 `journal.md`（可选第六类）：把 `13734e3` / `7388984` / `f8da57c` / `b68e491` /
+  `bc5c797` 几个关键提交按日期与判据记下来。
+- 更新 `AGENTS.md`（文档地图 + 加载顺序 + 交付方式 + 本项目硬规矩）、`README.md`
+  （订正与代码不符处，见下）、本文件。
+
+**验证到什么程度**：
+
+- `sh tests/run_tests.sh` → **179 通过 0 失败**（两轮）；逐节 A 10 / B 6 / C 20 / D 21 /
+  E 41 / F 14 / G 8 / H 6 / I 53；跑完真 `$HOME` 指纹不变那条断言是绿的。
+- 文档里的每个"现状"都对着代码核过；与 README/AGENTS 的旧说法冲突处**按代码改文档**
+  （README 共 10 处 + AGENTS 加了文档地图/硬规矩，逐条列在提交信息里；
+  例如 README §5.6 原来写 `systemctl stop caddy`
+  —— 云上是容器，没有这个服务，见 hazards H7）。
+- 全程没跑 docker 测试、没联网、没碰云上、没在真 `$HOME` 上装东西
+  （唯一一次碰 docker 是 `run_tests.sh` 的 D 节自己经 `relay.sh --dry-run` 调了
+  `caddy validate`，镜像本地已有、没拉、没留容器；口径已写进 hazards H8）。
+
+**还剩什么**：文档体系本身没有遗留；**U1–U9 一条都没解决**（这次只动文档）。
 
 ---
 
@@ -25,8 +89,8 @@ total 0                                  ← 一条命令都没有
 
 它还会把**空目录**的配置/日志软链铺好、打一份"布局"总结 —— 装完看起来和装好了
 一模一样，`wtool` 那边照样报 `install 完成`。这台机器上的现状正好是这个病的活标本：
-引擎现在的 `~/.wtool/wtool-work-dir/links/` 根本不存在，而 `~/.wtool/usr/bin/` 里
-那两条 Sep 20 的软链还指着**更老**的一格 `~/.wtool/links/tools/dsh-remote/bin/*`。
+引擎现在的 `~/.wtool/wtool-work-dir/links/` 根本不存在，而 `~/.wtool/usr/bin/`
+里那两条 Sep 20 的软链还指着**更老**的一格 `~/.wtool/links/tools/dsh-remote/bin/*`。
 
 **根因**：`scripts/install.sh:31` 把"源"写死成引擎的内部布局
 `link_dir="$HOME/.wtool/wtool-work-dir/links/tools/dsh-remote"`
@@ -38,7 +102,7 @@ total 0                                  ← 一条命令都没有
 同一个病在 `tools/android_repack`（`14bf463`）和 `harness/dsh-conf`（`977101b`）
 上修过 —— **这是最后一处**。
 
-**改动**（`7388984` 之后的新提交，都在 `ds_dev` 上）：
+**改动**（`f8da57c`，都在 `ds_dev` 上）：
 
 1. `scripts/install.sh`：
    * 源 = **`WTOOL_PROJECT_DIR`**（引擎对项目脚本的契约，见 `bootstrap/wtool.sh` 的
@@ -91,6 +155,7 @@ HOME=$T/home WTOOL_HOME=$T/home WTOOL_PREFIX=$T/prefix WTOOL_PROJECT_DIR=$PWD \
   `wtool uninstall tools/dsh-remote` → 软链撤掉、实体留着。
 * 真 `$HOME` 没被碰：11 条真路径（rc 文件、两条配置软链、`~/.wtool/usr/...`）
   在**整轮测试 + 上面那些临时实验**前后 `stat` 逐字相同。
+* **2026-10-07 复跑**：`sh tests/run_tests.sh` 仍然 **179 / 0**。
 
 **还剩什么**：
 
@@ -135,9 +200,147 @@ wtool: error: wtool.xml 里的 id='tools/dsh-remote' 已经取消：项目身份
 
 ---
 
-## ⏸ 待决定：真阿里云那台要不要现在装
+## ⏸ U1/U2 真阿里云那台要不要现在装 + 落地步骤（待用户决定）
 
-跟本次修复无关，但别忘：云端 Caddy / 隧道 / 钩子桥都还没在这台机器上真跑过
-（`cloud-install` 只测了参数拼装）。**hook 桥"挂上了但没被证实会触发"** 是
-README §4 里那条已知缺口，`dsh-remote check-hooks` 是复查命令。
-要不要装、什么时候装，用户定。
+**先记清楚事实**：**端到端从未真跑过**。跑过的只有本机的 179 条自动测试
+（`cloud-install` 只用**假的 ssh/scp** 验了参数拼装；`relay.sh` 只在
+`--dry-run` 里渲染 + 用 `caddy:2` 校验过配置）。真机器上会发生什么，没有任何记录。
+
+**要不要装、什么时候装、用哪条路 —— 用户定。** 三个选项：
+
+1. **先不装**：本机已经把能验的都验了（179 条），云端留到需要出门时再说。
+2. **只做域名模式**（有域名且已备案）：对外 443 + Let's Encrypt。
+3. **IP 模式**（没域名 / 没备案）：`--ip <公网IP> --port 8443`，自签证书，
+   手机第一次点一次"继续访问"。
+
+**落地步骤**（助手不代跑；每一步都要用户点头才动云上）：
+
+```sh
+# ① 家这头：填 remote.conf（cloud_host / cloud_user / cloud_ssh_port / identity）
+cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
+
+# ② 一条命令装到云上（走域名模式；IP 模式见下）
+dsh-remote cloud-install --domain dsh.example.com --email me@example.com
+#   IP 模式：dsh-remote cloud-install --ip <公网IP> --port 8443
+#   想先看它要干什么：加 --dry-run
+#   等价手工（cloud-install 内部就是这两条）：
+#     scp -r cloud/ root@<host>:/opt/dsh-relay
+#     ssh -t root@<host> 'cd /opt/dsh-relay && sudo sh relay.sh --tunnel-port 18080 --domain …'
+
+# ③ 阿里云控制台安全组：只放行 22/tcp（限家里出口 IP）+ 443/tcp（或 8443/tcp）
+#    ⚠️ 隧道端口 18080 和 harness 端口 3080 **绝对不要开**
+
+# ④ 家这头起隧道：先前台确认通了，再决定要不要常驻
+dsh-remote tunnel          # 或者 dsh-remote systemd（只生成单元，还要自己 enable）
+dsh-remote status          # 体检；dsh-remote url 打印手机该收藏的地址
+```
+
+**还没定的细节（要用户拍）**：
+
+- 域名与备案：大陆机器 80/443 要备案；没备案就走 IP 模式（或把机器放境外）。
+- 云上那台是不是就用 `root` 做隧道用户；建议给隧道专用一把钥匙 + `authorized_keys`
+  里 `restrict,port-forwarding,permitlisten="127.0.0.1:18080"`（样板在 `remote.conf.example`）。
+- 要不要 `--allow-ip <家里出口IP>/32` 再收紧一层（出口 IP 变了要重跑 `relay.sh`）；
+  注意 `relay.sh` 重跑会**重新随机密码**（除非 `--password`）。
+
+---
+
+## ⏸ U3 隧道常驻 / 断线重连（缺）
+
+**现状（代码事实，2026-10-07 核对）**：
+
+- `dsh-remote tunnel` 是**前台**循环：断了打印退出码、睡 `retry_seconds`（默认 10s）再连。
+  **没有指数退避、没有 daemon 化**。
+- `dsh-remote systemd` **只写** `~/.config/systemd/user/dsh-remote-tunnel.service`
+  （`Restart=always` / `RestartSec=10`），**不 enable、不 start**；要常驻得自己
+  `systemctl --user enable --now dsh-remote-tunnel`（+ 可选 `loginctl enable-linger $USER`）。
+- `autossh` 是**可选**的（PATH 里有它且 `autossh != off` 才用）；**本机实测没有装**
+  （`command -v autossh` 无输出，2026-10-07）。
+- **断线重连的真实时长从来没有测过**（README §6 里就写着"没有自动测"）。
+
+**要做什么（待用户拍）**：
+
+- ⏸ 常驻用哪条路：systemd user 单元（`enable-linger`）/ tmux / autossh（要装包）；
+- ⬜ 若走 systemd：要不要让 `dsh-remote systemd` 顺手 `enable --now`（现在是刻意不做的
+  —— 装服务是"改系统状态"，脚本只生成本来更安全）；
+- ⬜ 有一次真实的"拔网线/换网络"复测：记下从断开到重新可用花了多久，
+  这个数字才有资格写进文档。
+
+---
+
+## ⏸ U4 钩子桥未证实会触发（复查命令在这里）
+
+**现状**：`notify-enable` 写的 profile patch 能让 `dsh --profile web --dump-config`
+里出现 `hooks-claude-code`，但 2026-09-21 的对照实验表明**插件没有被真正加载**
+（`configPath` 指到不存在的文件也不报错；一次性 headless 会话三种钩子一个都没触发；
+正在跑的实例十几轮没写日志）。细节与已排除的可能写在 `architecture.md` §9、
+`docs/hazards.md` H3、`README.md` §4。
+
+**一条命令复查**（一次性进程、不动正在跑的会话、会真调一次模型、几十秒）：
+
+```sh
+dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打印两条出路
+```
+
+**两条出路（用户选）**：
+
+- **A（官方路子，要重启 harness）**：`npm i -g pnpm && dsh plugin --profile web add
+  @deepseek-ai/dsh-hooks-claude-code`，然后重启 `dsh web`（**会打断正在跑的会话**），
+  再跑一次 `check-hooks`。
+- **B（先不折腾桥）**：推送通道本身是通的（`dsh-remote notify-test` 实测能到本地接收端，
+  测试里也真发过）；需要"卡住就提醒"时手动 `dsh-notify "…" "…"`。
+
+**在证实之前**：不许把"会话卡住会推手机"写成已有能力（ADR-006）。
+
+---
+
+## ⬜ U5 人工验收清单（要 docker / 要两台机器 / 要手机）
+
+**要 docker 的两条**（助手不代跑；本机 `/usr/bin/docker` 有、`caddy:2` 镜像本地已有）：
+
+```sh
+cd tools/dsh-remote
+sh tests/caddy-validate.sh    # 3 条：两个模板各 caddy validate 一遍 + 一条"坏配置必须被拒"的反证
+sh tests/relay-e2e.sh         # 9 条：真起 caddy 容器（host 网络）+ 假后端，
+                              #   验 401 / 200 / body 来自后端 / Host 改写成回环 / 密码错 401 /
+                              #   compose down -v 撤干净（跑完自己收摊）
+```
+
+⚠️ **没 docker 时这两条都打印"跳过"并 `exit 0`**（假绿，见 hazards H8）——
+所以要么在有 docker 的机器上跑，要么看输出里有没有"跳过"。
+
+**要两台机器 / 要手机的（一条都没做过）**：
+
+- ⬜ 真阿里云上 `relay.sh --domain` / `--ip` 跑通，`curl -sk … | head` 看到 401；
+- ⬜ 真 Let's Encrypt 签发 + 续期（`docker compose logs` 看 ACME 日志）；
+- ⬜ 手机浏览器：第一次 basic auth + 贴带 token 的地址 + 会话能流式刷新；
+- ⬜ 隧道断开→恢复的真实时长；
+- ⬜ 手机丢了/要断入口：`docker compose -f /opt/dsh-relay/docker-compose.yml down`
+  （**不是** `systemctl stop caddy`，见 hazards H7）。
+
+---
+
+## ⏸ U6 三个代码小瑕疵（要改就是改代码行为 → 等用户拍）
+
+| # | 在哪 | 现象 | 候选做法 |
+|---|---|---|---|
+| 1 | `bin/dsh-remote:121` | `status` 在没配推送时提示"照 notify.conf.example 写 **`~/.dsh/notify.conf`**"，而落点是 `~/.config/dsh-remote/notify.conf`（只有 `migrate` 会读 `~/.dsh`） | 把提示改成 `$CONF_DIR/notify.conf`（hazards H9） |
+| 2 | `bin/dsh-remote` 的 `usage()` | `help` 打 `sed -n '2,25p'`，多打 `set -u` 和两行注释（注释块只到 21 行）；`dsh-notify --help` 是 `2,20p`，把"退出码永远是 0"那段截断 | 改成 `2,21p` / 加结束标记（hazards H10） |
+| 3 | `tests/caddy-validate.sh`、`tests/relay-e2e.sh` | 没 docker 时"跳过"并 `exit 0`，CI/`&&` 链里算通过 | 改成 `exit 77`（跳过码）或在输出里显式写"这段没测"（hazards H8） |
+
+三条都**不是**本次文档任务的范围（改代码行为要用户点头），先记在这儿。
+
+**另一条要记账的口径**：`tests/run_tests.sh` 文件头写着"不碰 docker"，但本机装了
+docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:2 caddy validate`
+（2026-10-07 实测：没拉镜像、没留下容器）。口径已改文档（README §6 / AGENTS.md /
+`architecture.md` §10 / hazards H8）；要不要把 D 节显式挡住 docker，同第 3 条一起定。
+
+---
+
+## ⏸ U7–U9 其余待决定
+
+- ⏸ **U7**：这台机器上两条 Sep 20 的老软链还指着老布局（见上面 install.sh 那节的"还剩什么"）；
+  纠正动作是用户自己在真 `$HOME` 上重跑 `wtool install tools/dsh-remote`，助手不代跑。
+- ⏸ **U8**：`scripts/install.sh` 的"源找不到"现在是**警告 + 继续 + 末尾交代**，
+  要不要改成 `exit 1`（三个仓库现在口径一致，都选了警告）。
+- ⏸ **U9**：`main` 与 `ds_dev` 的差距要不要合 —— 助手不合并、不推送。

@@ -16,7 +16,7 @@
         ▼
    阿里云 Caddy                     ← 对外唯一的入口
         │  reverse_proxy → 127.0.0.1:18080
-        │  （顺手把 Host/Origin 改写成回环，见 §4）
+        │  （顺手把 Host/Origin/Referer 改写成回环，见 §4）
         ▼
    云上 sshd 的反向隧道端            ← 云上不用开新端口，家主动连出去
         ▲
@@ -57,12 +57,12 @@ vi ~/.config/dsh-remote/notify.conf      # 选一个渠道（provider=…）并�
 dsh-remote notify-test                   # 结果：手机收到一条「🔔 dsh-notify 测试」；没收到看日志
 
 # 2. 打开"卡住就推我"的钩子
-dsh-remote notify-enable      # 写 ~/.config/dsh-remote/hooks.json + profile patch；web profile 是热加载，不用重启
+dsh-remote notify-enable      # 写 ~/.config/dsh-remote/hooks.json + profile patch；web profile 的 patchReload 是 live，正常情况下不用重启
 
-# 3. 阿里云那台（一条命令：传脚本 → 装 Caddy → 生成随机密码 → 起服务 → 自检 → 记下地址）
+# 3. 阿里云那台（一条命令：传脚本 → 拉 caddy:2 镜像起容器 → 生成随机密码 → 自检 → 把地址记回配置）
 dsh-remote cloud-install --domain dsh.example.com --email me@example.com
 #   没域名/没备案：dsh-remote cloud-install --ip <公网IP> --port 8443
-#   只想看它要做什么：加 --dry-run
+#   只想看它要做什么：加 --dry-run（宿主要 docker；加 --install-docker 才会顺手装 docker）
 
 # 4. 反向隧道（先在 tmux 里前台跑一次，确认通了再装 systemd）
 cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
@@ -92,8 +92,24 @@ dsh-remote status                                  # 体检
 | `dsh-remote cloud-setup` | 只打印要做的事（不动手） |
 | `dsh-remote migrate` | 把旧版放在 `~/.dsh` 下的配置/日志搬到自己目录 |
 | `dsh-remote check-hooks` | 一次性进程验证钩子桥到底会不会触发（对照实验，几十秒） |
-| `dsh-remote log` | 看隧道 / 推送日志 |
+| `dsh-remote log` | 看推送日志（`notify.log`）和 harness 日志（`web.log`）；隧道日志在 tmux / systemd 那边 |
 | `dsh-notify "标题" "正文"` | 直接推一条（脚本里也能用，退出码永远是 0） |
+
+`cloud-install` 的选项（真装到云上那一条）：
+
+| 选项 | 默认 | 作用 |
+|---|---|---|
+| `--domain D` | — | 域名模式（443 + Let's Encrypt）；与 `--ip` 二选一 |
+| `--ip I` | — | IP 模式（默认 8443 + 自签）；与 `--domain` 二选一 |
+| `--email E` | `admin@<域名>` | ACME 邮箱（域名模式用） |
+| `--port P` | 443 / 8443 | 对外端口 |
+| `--user U` | `dsh` | basic auth 的用户名 |
+| `--allow-ip CIDR` | — | 只放行这些来源（可给多次），其它一律 403 |
+| `--ssh-user S` | `cloud_user`（默认 `root`） | 云上 ssh 用哪个用户 |
+| `--dry-run` | — | 只打印要执行的 scp / ssh 命令，一个字节都不传 |
+
+隧道端口和本地端口不在命令行上：从 `remote.conf` 的 `remote_port` / `local_port`
+取（默认 18080 / 3080）。密码也不在命令行上 —— 云上 `relay.sh` 每次随机生成。
 
 ---
 
@@ -172,8 +188,9 @@ npm i -g pnpm && dsh plugin --profile web add @deepseek-ai/dsh-hooks-claude-code
 在证实之前，别把"会推手机"当成已经有的能力。
 
 **中继器容器被一个真容器测试钉住了。** `tests/relay-e2e.sh` 会在本机起一个
-`caddy` 容器（host 网络）+ 一个假后端，验四件事：没密码 401、密码对 200、
-body 真的来自"隧道口后面的服务"、Host 被改写成回环。写这条测试当场抓到一个真 bug：
+`caddy` 容器（host 网络）+ 一个假后端，验这几件事：没密码 401、密码对 200、
+密码错 401、body 真的来自"隧道口后面的服务"、Host 被改写成回环，最后
+`compose down -v` 收摊干净（共 9 条）。写这条测试当场抓到一个真 bug：
 Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆机器没备案用不了 80）时
 容器会 restart 循环 —— 所以两个模板都加了 `auto_https disable_redirects`。
 
@@ -214,8 +231,10 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
    restrict,port-forwarding,permitlisten="127.0.0.1:18080" ssh-ed25519 AAAA... dsh-remote
    ```
 
-6. 手机丢了：云上 `systemctl stop caddy`（或者把安全组那个端口关掉）即可
+6. 手机丢了：云上 `docker compose -f /opt/dsh-relay/docker-compose.yml down`
+   （或者 `docker stop dsh-relay`；把安全组那个端口关掉也一样）即可
    断掉整条路。harness 本身没有对公网监听，所以没有第二条路。
+   （云上的 Caddy 是**容器**，宿主上没有 `caddy.service` 可以 `systemctl stop`。）
 
 **不做什么**：不改 `dsh web` 的默认监听（它拒绝 `0.0.0.0` 是有意的，
 那是把 RCE 直接挂网上）；不把 basic auth 换成"藏在 URL 里的 token"；
@@ -226,9 +245,15 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 179 条（以输出为准），不联网、不碰 docker、不碰真 $HOME
-sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker
+sh tests/run_tests.sh        # 179 条（以输出为准），不联网、不碰真 $HOME
+                             #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
+                             #   跑一次 docker run … caddy validate（要求 caddy:2 已在本地）
+sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
+sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密码错 / 撤干净），要 docker，人工跑
 ```
+
+⚠️ 后两条**没有 docker 时会打印"跳过"然后 `exit 0`** —— 别只看退出码，
+看输出里有没有"跳过"（`docs/hazards.md` H8）。
 
 `run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、
 `dsh-notify` 真发一条到本地 HTTP 接收端（含 `--hook` 解析、`on_stop` 开关、
@@ -250,25 +275,31 @@ sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
+逐节条数（2026-10-07 实测，合计 **179**）：语法 A 10 / `env` 两份 B 6 /
+`dsh-notify` C 20 / Caddyfile 渲染 D 21 / 子命令 E 41 / `cloud-install` F 14 /
+`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53。
+
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
 （永远绿的测试等于没测）。
 
-没有自动测的部分（要两台机器，报告里说清楚了）：真阿里云上的
-安全组/防火墙、手机浏览器上的实际体验、隧道断线重连的真实时长。
+没有自动测的部分（要两台机器 / 要手机，`BACKLOG.md` 里列全了）：真阿里云上的
+安全组/防火墙、真实 Let's Encrypt 签发与续期、手机浏览器上的实际体验、
+隧道断线重连的真实时长、钩子桥到底会不会触发。
 
 ---
 
 ## 7. 占地与清理
 
 - 仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档）；证书、密码、密钥、
-  日志一律在**安装落点**和云上的 `/etc/caddy/`，不进 git。
+  日志一律在**安装落点**和云上的 `/opt/dsh-relay/`（证书与续期状态在命名卷
+  `caddy-data` 里），不进 git。
 - `wtool install tools/dsh-remote` 装出来的东西（`$WTOOL_PREFIX` 默认
   `~/.wtool/usr`，`$WTOOL_HOME` 默认 `$HOME`）：
 
   | 落点 | 是什么 |
   |---|---|
   | `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify` | 软链 → 仓库 `bin/` 里的脚本（`$WTOOL_PREFIX/bin` 由引擎放进 PATH） |
-  | `$WTOOL_PREFIX/etc/dsh-remote/` | 配置**实体**（`remote.conf`、`notify.conf`、`hooks.json`、两份 `*.example`） |
+  | `$WTOOL_PREFIX/etc/dsh-remote/` | 配置**实体**（install 只放两份 `*.example`；`remote.conf` / `notify.conf` / `hooks.json` 是之后由你和 `notify-enable` 写进去的） |
   | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期文件**实体**（`notify.log`、`web.log`、`web-url.txt`） |
   | `~/.config/dsh-remote` | 软链 → 上面那个 `etc/dsh-remote` |
   | `~/.local/state/dsh-remote` | 软链 → 上面那个 `var/dsh-remote` |
@@ -276,7 +307,8 @@ sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒
 
   家在跑的时候只有一条 ssh 进程（`dsh-remote tunnel` / systemd 单元）。
 - 全撤：`dsh-remote notify-disable` → 停隧道 → 云上
-  `systemctl disable --now caddy` → `wtool uninstall tools/dsh-remote`。
+  `docker compose -f /opt/dsh-relay/docker-compose.yml down`
+  （要连证书一起撤就加 `-v`）→ `wtool uninstall tools/dsh-remote`。
   **只撤软链**：`etc/` 和 `var/` 里的实体（你的配置和日志）留着 —— 要彻底清
   得自己删那个目录。
 
