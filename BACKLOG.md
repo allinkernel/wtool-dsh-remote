@@ -13,14 +13,15 @@
 ## 🔴 仍未做 / 未验证（一览，2026-10-07 盘点）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 199 通过 0 失败，2026-10-07 复跑两轮），
-> 但**真机端到端从头到尾没跑过**。下表是"还剩什么"的全集，展开在后面的小节里。
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **268 通过 0 失败**，2026-10-07 实跑），
+> 真机端到端也在 2026-10-07 当天走通了（中继 + 公网 + 常驻隧道）。
+> 下表是"还剩什么"的全集，展开在后面的小节里。
 
 | # | 状态 | 事项 | 一句话 |
 |---|---|---|---|
 | U1 | 🟢 | **真机端到端**（往下拆成 U2/U3/U5） | 2026-10-07 中继在真阿里云上装成，**从家里经公网 8443 已经走通到家里的 dsh web**；还差真手机打开（带 token） |
 | U2 | 🟢 | **云端落地步骤** | IP 模式已在真机跑通（`--no-compose` 用户空间模式）；**8443 从外面已经能连**（11:52 还连不上、12:03 通了，见下面那节） |
-| U3 | 🟡 | **隧道常驻 / 断线重连** | 2026-10-07 在家里用 tmux 起了 `ssh -N -R`，从云上验到 18080 通；**常驻/重连时长仍未做**（本机没 autossh） |
+| U3 | ✅ | **隧道常驻 / 断线重连** | 2026-10-07 做完：`dsh-tunnel.service`（systemd `--user`，`Restart=always` + `ServerAlive*`）替掉一次性 tmux；**实测 `kill -9` 之后 3199ms / 3207ms 拉起进程、3276ms / 3305ms 公网恢复**（两次）；详见下面 U3 那节 |
 | U4 | ⏸ | **钩子桥未证实会触发** | `check-hooks` 复查：触发 → 0，没触发 → 1；两条出路要用户选 |
 | U5 | ⬜ | **要 docker 的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；**假绿已修**（没 docker → `exit 77`），但"要不要让 D 节也显式挡 docker"仍待定 |
 | U6 | ✅ | **三个代码小瑕疵**（2026-10-07 已修） | `status` 提示指错路径 / `help` 输出越界 / docker 测试假绿 —— 三条都改完，见下面 U6 那一节 |
@@ -29,8 +30,8 @@
 | U9 | ⏸ | `main` 与 `ds_dev` 的差距要不要合 | 助手不合并、不推送，由用户定 |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
-隧道常驻（要人自己 enable 或挂 tmux）；隧道断线重连时长的任何数字；
-真机上的安全组/防火墙/证书续期的任何验证。
+**"网络真断"（ServerAlive 那条路）的重连、重启机器后服务会不会自己起来**（linger 已开、
+单元已 `enable`，但没重启过机器）；真机上的安全组/防火墙/证书续期的任何验证。
 
 ---
 
@@ -82,7 +83,7 @@ curl -sk -u dsh:<pw> https://123.56.158.212:8443/
 带 token 之后能不能出界面、流式刷新正不正常 —— **没验过**。
 
 **还没做的**：真手机打开（上面那条）；域名模式（`--domain`）一次没跑过；
-安全组规则原文没人核对；隧道断线重连时长；隧道常驻（现在只有 tmux）。
+安全组规则原文没人核对。（隧道常驻与重连时长已在同日做完，见下面的 U3。）
 
 ---
 
@@ -283,9 +284,9 @@ dsh-remote cloud-install --domain dsh.example.com --email me@example.com
 # ③ 阿里云控制台安全组：只放行 22/tcp（限家里出口 IP）+ 443/tcp（或 8443/tcp）
 #    ⚠️ 隧道端口 18080 和 harness 端口 3080 **绝对不要开**
 
-# ④ 家这头起隧道：先前台确认通了，再决定要不要常驻
-dsh-remote tunnel          # 或者 dsh-remote systemd（只生成单元，还要自己 enable）
-dsh-remote status          # 体检；dsh-remote url 打印手机该收藏的地址
+# ④ 家这头把隧道装成常驻（断了会自己回来）；先前台调试就用 dsh-remote tunnel
+dsh-remote tunnel-install  # systemd --user 常驻：Restart=always + ssh 保活
+dsh-remote tunnel-status --probe   # 体检（含云上只读检查）；dsh-remote url 打印手机地址
 ```
 
 **还没定的细节（要用户拍）**：
@@ -298,26 +299,48 @@ dsh-remote status          # 体检；dsh-remote url 打印手机该收藏的地
 
 ---
 
-## ⏸ U3 隧道常驻 / 断线重连（缺）
+## ✅ U3 隧道常驻 / 断线重连（2026-10-07 做完并实测）
 
-**现状（代码事实，2026-10-07 核对）**：
+**用户 2026-10-07 拍板**："加上吧"——常驻用 systemd `--user`（`Restart=always`）+ ssh 自带的
+`ServerAlive*`/`ExitOnForwardFailure`，**不依赖 autossh**（本机与云上都没有，装包越界）。
+决策与否决项见 **ADR-0013**；现状见 `architecture.md` §3.1。
 
-- `dsh-remote tunnel` 是**前台**循环：断了打印退出码、睡 `retry_seconds`（默认 10s）再连。
-  **没有指数退避、没有 daemon 化**。
-- `dsh-remote systemd` **只写** `~/.config/systemd/user/dsh-remote-tunnel.service`
-  （`Restart=always` / `RestartSec=10`），**不 enable、不 start**；要常驻得自己
-  `systemctl --user enable --now dsh-remote-tunnel`（+ 可选 `loginctl enable-linger $USER`）。
-- `autossh` 是**可选**的（PATH 里有它且 `autossh != off` 才用）；**本机实测没有装**
-  （`command -v autossh` 无输出，2026-10-07）。
-- **断线重连的真实时长从来没有测过**（README §6 里就写着"没有自动测"）。
+**做了什么（全部在真机上跑过）**：
 
-**要做什么（待用户拍）**：
+| # | 做了什么 | 结果 |
+|---|---|---|
+| 1 | 新子命令 `tunnel-install` / `tunnel-uninstall` / `tunnel-status`（旧 `systemd` 保留为 `--no-enable` 的同义词） | 渲染 `~/.config/systemd/user/dsh-tunnel.service` → `daemon-reload` → `enable --now`，打印判据；`--dry-run` 一个字节都不写 |
+| 2 | 单元：`Restart=always` / `RestartSec=3` / `StartLimitIntervalSec=0`（**在 `[Unit]` 段**）/ `StandardOutput=journal` / `ExecStart` = 绝对路径 ssh + `-N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new -p <port> [-i <key>] -R 127.0.0.1:18080:127.0.0.1:3080 <user>@<host>` | `systemd-analyze --user verify` 无警告；本机 `ss -ltn` 看不到 18080（正常），云上 `ss -ltn` 看到 `127.0.0.1:18080` |
+| 3 | 退役旧的一次性 tmux 会话 `dsh-tunnel`：装之前检测 → `kill-session` → 等 1 秒让云上让出端口 | `tmux ls` 里已没有 `dsh-tunnel`；两处端口都被新服务接管 |
+| 4 | **断线重连实测**：`kill -9 <MainPID>`（两次） | 新进程 **3199ms / 3207ms** 起来；公网 `curl -sk --interface eth1 https://123.56.158.212:8443/` 恢复 **401** 用时 **3276ms / 3305ms** |
+| 5 | **端口冲突实测**（故意造）：先自己起一条占着 18080 的 ssh，再起服务 | journal 出现 `Error: remote port forwarding failed for listen port 18080`，**每 3 秒重试一次**（12 秒 4 次）；把占端口的那条杀掉 → **760ms** 服务接上（见 hazards H14） |
+| 6 | `tunnel-status --probe` 体检 | 单元/进程/端口/云上 `ss`/`curl`（401 = 请求穿到家里）/linger 全绿 |
+| 7 | 顺带订正的配置（真机事实，见 hazards H16 / H17） | `remote.conf`：`cloud_user=root`→`mindul`、`identity=~/.ssh/id_rsa`→`~/.ssh/id_ed25519`、`public_url` 填上；云上 basic auth 密码按文件里的值重渲染（12:05 验通） |
 
-- ⏸ 常驻用哪条路：systemd user 单元（`enable-linger`）/ tmux / autossh（要装包）；
-- ⬜ 若走 systemd：要不要让 `dsh-remote systemd` 顺手 `enable --now`（现在是刻意不做的
-  —— 装服务是"改系统状态"，脚本只生成本来更安全）；
-- ⬜ 有一次真实的"拔网线/换网络"复测：记下从断开到重新可用花了多久，
-  这个数字才有资格写进文档。
+**判据（怎么证明常驻是真的）**：
+
+```sh
+systemctl --user is-active dsh-tunnel.service     # active
+systemctl --user is-enabled dsh-tunnel.service    # enabled
+systemctl --user show -p MainPID -p NRestarts --value dsh-tunnel.service
+ssh mindul@123.56.158.212 'ss -ltn | grep 18080'  # 云上 127.0.0.1:18080 在听（只读检查）
+curl -sk --interface eth1 https://123.56.158.212:8443/   # 401（Caddy 在挡）
+dsh-remote tunnel-status --probe                  # 一条命令看全
+```
+
+**验证到什么程度 / 没验什么**：
+
+- ✅ 进程被杀 → 重连（两次，秒级数字在上面）；端口冲突 → 自愈（760ms）。
+- ✅ 公网端到端：不带密码 401（Caddy）、带密码拿到**家里 dsh web 的 401 原文（68 字节）**
+  → 反代真的到了家里（12:05 实测）。带 token 的 200 界面要用户浏览器里的 token，**没验**。
+- ✅ `sh tests/run_tests.sh` → **268 通过 0 失败**（新增 J 节 69 条，全是离线断言）。
+- ✅ `loginctl enable-linger mindul`（**本机实测不需要 sudo**，polkit 允许 self-linger），
+  用户管理器随之起来 —— 在这之前本机 `systemctl --user` 根本连不上 bus（hazards H15）。
+- ⬜ **"网络真断"那条路没测**：ServerAlive 要 15s×3 才发现 + 3s 重启，理论上 ≤48s 回来，
+  但没有真拔网线/换网络复测过。
+- ⬜ **重启机器后是否自动恢复没测**（linger=yes、`enabled`、`WantedBy=default.target` 都到位，
+  没人重启过这台机器）。
+- ⬜ 真手机打开公网地址（带 token）仍然没验（U1 剩下的那一条）。
 
 ---
 
@@ -369,7 +392,7 @@ sh tests/relay-e2e.sh         # 9 条：真起 caddy 容器（host 网络）+ �
 - ⬜ 真 Let's Encrypt 签发 + 续期（`docker compose logs` 看 ACME 日志）；
 - ⬜ **真手机浏览器**：第一次 basic auth + 贴带 token 的地址 + 会话能流式刷新
   —— 要用户拿手机；**前置条件：安全组先放行 8443**；
-- ⬜ 隧道断开→恢复的真实时长（现在只是 tmux 里的 `ssh -N -R`，没有 autossh、没装 systemd）；
+- ✅ 隧道断开→恢复的真实时长：**2026-10-07 实测 3199/3207ms 拉起、3276/3305ms 公网恢复**（`kill -9`，两次；见 U3）；
 - ⬜ 手机丢了/要断入口：`docker rm -f dsh-relay`（用户空间模式）或
   `docker compose -f /opt/dsh-relay/docker-compose.yml down`
   （**不是** `systemctl stop caddy`，见 hazards H7）。

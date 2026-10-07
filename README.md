@@ -66,11 +66,14 @@ dsh-remote cloud-install --domain dsh.example.com --email me@example.com
 #   ⚠️ 那台没有 docker compose 插件 / 不在 docker 组（比如 2026-10 的阿里云那台）时，
 #      cloud-install 里的 `sudo sh relay.sh` 走不通 —— 见 §4 的"用户空间模式"。
 
-# 4. 反向隧道（先在 tmux 里前台跑一次，确认通了再装 systemd）
+# 4. 反向隧道：装成常驻（断了会自己回来，不用 tmux 看着）
 cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
-#   填 cloud_host / identity，并把 public_url 填成云端脚本打印的那个地址
-dsh-remote tunnel                                  # 或者 dsh-remote systemd 装成常驻
-dsh-remote status                                  # 体检
+#   填 cloud_host / cloud_user / identity，并把 public_url 填成云端脚本打印的那个地址
+dsh-remote tunnel-install     # systemd --user 单元 dsh-tunnel.service：Restart=always + ssh 保活
+#   想先前台看日志：dsh-remote tunnel（Ctrl-C 退出）
+#   想让它在你没登录时也活着：loginctl enable-linger "$USER"（本机实测不需要 sudo）
+dsh-remote tunnel-status --probe                   # 体检（含云上只读检查）
+dsh-remote status                                  # 总览：harness / 隧道 / 推送 / 手机地址
 ```
 
 手机上：打开 `public_url` → 输一次 basic auth 的用户名密码 → 再贴一次
@@ -85,8 +88,11 @@ dsh-remote status                                  # 体检
 |---|---|
 | `dsh-remote status` | 体检：harness / 隧道 / 推送 / 手机地址 |
 | `dsh-remote serve` | 在**后台**起 `dsh web --no-open`，把带 token 的地址存下来 |
-| `dsh-remote tunnel` | 前台保活反向隧道（放 tmux 或 systemd） |
-| `dsh-remote systemd` | 生成 systemd user 单元（可 `loginctl enable-linger` 常驻） |
+| `dsh-remote tunnel` | 前台保活反向隧道（调试用；常驻用 `tunnel-install`） |
+| `dsh-remote tunnel-install` | 装成 systemd `--user` 常驻服务：`Restart=always`（默认 3s）+ ssh 的 `ServerAlive*`，日志进 journald |
+| `dsh-remote tunnel-uninstall` | 撤掉它（`disable --now` + 删单元文件） |
+| `dsh-remote tunnel-status` | 看单元/进程/端口/云上隧道口/公网；`--probe` 会 ssh 上云做**只读**检查 |
+| `dsh-remote systemd` | 旧名字：只生成单元不 enable（= `tunnel-install --no-enable`） |
 | `dsh-remote url` | 打印手机该收藏的地址 |
 | `dsh-remote notify-test` | 推一条测试消息 |
 | `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
@@ -302,16 +308,19 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **199**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-07 实测，合计 **268**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 27 / 子命令 E 53 / `cloud-install` F 14 /
-`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53。
+`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53 / **常驻隧道 J 69**。
+J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
+跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
 （永远绿的测试等于没测）。
 
 没有自动测的部分（要两台机器 / 要手机，`BACKLOG.md` 里列全了）：真阿里云上的
 安全组/防火墙、真实 Let's Encrypt 签发与续期、手机浏览器上的实际体验、
-隧道断线重连的真实时长、钩子桥到底会不会触发。
+"网络真断"那条重连路（进程被杀那条已实测：3.2s）、重启机器后会不会自动恢复、
+钩子桥到底会不会触发。
 
 ---
 
@@ -330,10 +339,11 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
   | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期文件**实体**（`notify.log`、`web.log`、`web-url.txt`） |
   | `~/.config/dsh-remote` | 软链 → 上面那个 `etc/dsh-remote` |
   | `~/.local/state/dsh-remote` | 软链 → 上面那个 `var/dsh-remote` |
+  | `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染，改配置就重跑它） |
   | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `dsh-remote notify-enable` 写 |
 
   家在跑的时候只有一条 ssh 进程（`dsh-remote tunnel` / systemd 单元）。
-- 全撤：`dsh-remote notify-disable` → 停隧道 → 云上
+- 全撤：`dsh-remote notify-disable` → `dsh-remote tunnel-uninstall` → 云上
   `docker compose -f /opt/dsh-relay/docker-compose.yml down`
   （要连证书一起撤就加 `-v`）→ `wtool uninstall tools/dsh-remote`。
   **只撤软链**：`etc/` 和 `var/` 里的实体（你的配置和日志）留着 —— 要彻底清

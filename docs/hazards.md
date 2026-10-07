@@ -485,3 +485,181 @@ ssh mindul@123.56.158.212 'docker compose version; id -nG'
 
 **还没验证的**：`default_sni` 在 Caddy < 2.7 上是否存在（那台现在用的是 2.11.4，
 没测过更老的版本）；`--docker-cmd` 里带空格以外的复杂命令（比如 `env FOO=1 docker`）没试过。
+
+---
+
+## H14. 旧隧道占着云上同一个端口 → 新单元"秒退 + 无限重启"（每 3 秒一次）
+
+**现象（2026-10-07 12:11 在真机上**故意复现**）**：云上 `127.0.0.1:18080` 已经被一条
+ssh 占着时，`dsh-tunnel.service` 起来立刻退，journal 里连成一片：
+
+```
+dsh-tunnel[302549]: Error: remote port forwarding failed for listen port 18080
+systemd[234642]: dsh-tunnel.service: Failed with result 'exit-code'.
+systemd[234642]: dsh-tunnel.service: Scheduled restart job, restart counter is at 3.
+```
+
+`systemctl --user is-active` 在 `activating (auto-restart)` 与 `active` 之间来回，
+`NRestarts` 每 3 秒涨 1；**它不会自己停**（`StartLimitIntervalSec=0`）。
+
+**根因**：`ExitOnForwardFailure=yes` 让 ssh 在"远程端口绑不上"时**立刻退出**（这是我们要的：
+不能假装隧道好了），而 `Restart=always` 又立刻把它拉起来 —— 两件事合起来就是死循环。
+真正的原因几乎总是"**家里还有一条老隧道**"：旧的一次性 `tmux` 会话
+（`ssh -N -R 127.0.0.1:18080:…`）没退，或者旧版单元 `dsh-remote-tunnel.service`
+还 enabled。2026-10-07 之前家里正是前者。
+
+**修法**：
+
+1. `tunnel-install` **装之前**先查：`tmux has-session -t <tmux_session>`（默认
+   `dsh-tunnel`）→ 在就 `kill-session` 并 `sleep 1` 让云上把端口让出来（`--keep-tmux` 可跳过）；
+   再查旧版单元文件 `dsh-remote-tunnel.service` → 在就 `disable --now`。
+2. 装完停 3 秒看 `NRestarts` **涨没涨**（不是看 `is-active`）——涨了就把
+   "端口被占 / 认证失败"和 journal 尾巴打出来。
+3. 真卡住了怎么办：`journalctl --user -u dsh-tunnel.service -n 20` 看到
+   `remote port forwarding failed` 就是端口被占 → `dsh-remote tunnel-status` 会点名
+   "还有一条 ssh 占着 18080 / 旧 tmux 会话还在"。
+
+**判据 / 复现**（2026-10-07 实测，**在真机上故意造了一次冲突**）：
+
+```sh
+# ① 停服务、自己起一条抢端口的 ssh（模拟旧 tmux 隧道）、再把服务起起来
+systemctl --user stop dsh-tunnel.service
+ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -i ~/.ssh/id_ed25519 \
+    -R 127.0.0.1:18080:127.0.0.1:3080 mindul@123.56.158.212 &
+systemctl --user start dsh-tunnel.service; sleep 12
+journalctl --user -u dsh-tunnel.service --since '-15s' | grep -c 'remote port forwarding failed'   # → 4
+# ② 把抢端口的那条杀掉 → 下一次重启就接上
+kill -9 <抢端口那条的 pid>; sleep 2
+systemctl --user is-active dsh-tunnel.service        # → active
+```
+
+**验证程度**：现象 2026-10-07 复现 1 轮（4 次失败重试）；修法（先停旧会话）在同一天
+真实装机时生效一次（`tunnel-install` 打印"已停掉旧 tmux 会话 dsh-tunnel"）。
+"抢占者被杀 → **760ms** 接上"也是实测（`MainPID` 换新 + `is-active=active`）。
+
+**同族的坑**：认证失败（H16）表现**一模一样**（也是每 3 秒一次地重启），区别只在
+journal 里那行是 `Permission denied (publickey,password)` 而不是 `remote port forwarding failed`。
+
+---
+
+## H15. 本机 `systemd --user` 是 `enable-linger` 之后才有的；环境变量会骗你
+
+**现象（2026-10-07 12:01 之前的实测）**：`systemctl --user …` 一律
+`Failed to connect to bus: No such file or directory`；`/run/user/1000` **不存在**；
+`loginctl list-sessions` 空、`loginctl list-users` 说 `No users`；
+`systemctl status user@1000.service` → `inactive (dead)`。
+**但环境变量看着一切正常**：`XDG_RUNTIME_DIR=/run/user/1000/`、
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus` 都设着 —— 只是那个目录不存在。
+
+**根因**：这台 WSL2（systemd 255，PID 1 是 systemd、logind 也在跑）里的会话
+**没有经过 logind**：用户管理器 `user@<uid>.service` 只有在"有 logind 会话"或
+"该用户开了 linger"时才被拉起来。两个都没有 → 用户总线不存在 → 所有 `systemctl --user` 失败。
+
+**修法**：`loginctl enable-linger <用户>`。**本机 2026-10-07 实测不需要 sudo**
+（polkit 允许 `set-self-linger`，`rc=0`、`/var/lib/systemd/linger/mindul` 当场出现），
+logind 随即把 `user@1000.service` 拉起来（`Active: active (running)`），
+`/run/user/1000/bus` 出现，`systemctl --user` 立刻可用。回退：`loginctl disable-linger <用户>`。
+`tunnel-install` 在动手之前先探一次，探不到就**什么都不碰**地退出（不把能用的旧隧道弄没）。
+
+**判据 / 复现**：
+
+```sh
+loginctl show-user "$(id -un)" -p Linger          # Linger=yes/no
+ls -l /run/user/"$(id -u)"/bus                    # 用户总线在不在
+systemctl --user show-environment >/dev/null; echo $?   # 0 = 用户管理器在（tunnel-install 用的就是这个探针）
+systemctl --user is-system-running                # 没 bus 时实测打印：Failed to connect to bus（rc=1）
+```
+
+**订正（同日，针对上级 agent 的口头说法）**：有说法称"`systemctl --user is-system-running`
+在没有用户 bus 时也会打印 `running`，别只看它"。**本次没能复现** —— 在这台机器上，
+没有 bus 时它打印的是 `Failed to connect to bus: No such file or directory`（rc=1），
+有了之后才打印 `running`。**以本条为准**：探针的权威判据是
+`systemctl --user show-environment` 的退出码（H15 用的就是它），
+以及环境变量**不能**当证据（`XDG_RUNTIME_DIR` 指着不存在的目录也照样设着）。
+
+**验证程度**：`enable-linger` 前后各测 1 次（同一天）；"重启机器后服务会不会自己起来"
+**没有实测**（linger + `enabled` 都到位了，但没人重启这台机器）。
+
+---
+
+## H16. `remote.conf` 里两个值和真机不符：`cloud_user=root` 登不上、`identity=id_rsa` 没授权
+
+**现象（2026-10-07 实测）**：
+
+1. `ssh root@123.56.158.212` → `Permission denied (publickey,password)`；
+   能登的是 `mindul`（`id -un` → `mindul`）。而 `remote.conf` 里写的是 `cloud_user=root`。
+2. 单元里渲染出 `-i /home/mindul/.ssh/id_rsa` 之后，服务**每 3 秒一次**
+   `mindul@123.56.158.212: Permission denied (publickey,password)`；
+   换成 `~/.ssh/id_ed25519` 立刻好。
+
+**根因**：`remote.conf` 是照 `remote.conf.example` 抄的，两个值都是"样板默认"
+而不是这台机器的事实：云上那台的 `authorized_keys` 里是 **`id_ed25519`**（今天的部署
+用它），`id_rsa`（2024 年的老钥匙）**没被授权**。
+
+**为什么以前没暴露**：旧的一次性 tmux 隧道**不带 `-i`** —— ssh 会按默认顺序
+（`id_rsa` → `id_ecdsa` → `id_ed25519`）一把把试，`id_rsa` 被拒之后 `id_ed25519` 成功，
+于是"碰巧一直能连"。**带上 `-i` 就没有这个兜底**（只试指定的那一把 + agent，而这台
+`SSH_AUTH_SOCK` 是空的、没有 agent）。
+
+**修法**：`identity=~/.ssh/id_ed25519`（`cloud_user=mindul`）。
+判断"哪把钥匙真的行"要用**只带那一把**的判据，别用不带 `-i` 的 ssh 去猜：
+
+```sh
+ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_rsa     -o LogLevel=ERROR mindul@123.56.158.212 id -un  # → Permission denied（rc=255）
+ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -o LogLevel=ERROR mindul@123.56.158.212 id -un  # → mindul（rc=0）
+ssh -o BatchMode=yes -o LogLevel=ERROR root@123.56.158.212 id -un                                              # → Permission denied
+```
+
+**验证程度**：三条命令 2026-10-07 各实测 1 次；改完重装后服务 `active`、
+公网 401 恢复（见 journal 同日条目）。
+
+**教训**：模板里的 `cloud_user=root` / `identity=~/.ssh/id_rsa` 只是**占位**。
+"前台能连"**不等于**"这个身份/这把钥匙对" —— 前台会在默认身份里挑一把能用的，
+而单元是**钉死**的。
+
+---
+
+## H17. `relay-password.txt` 会和 Caddyfile 漂移；bcrypt 哈希不同**推不出**"密码被换了"
+
+**现象（2026-10-07 实测）**：`https://123.56.158.212:8443/` 不带密码 401（正常，
+`WWW-Authenticate: Basic realm="restricted"`），**带 `relay-password.txt` 里那个密码
+也是同一个 401（body 0 字节）** —— 也就是 Caddy 把文件里的密码拒了。
+文件 mtime `11:47:05`；`Caddyfile` mtime `12:00:42`（同目录还有 11:54:42 的备份）。
+
+**根因**：`relay.sh` **不给 `--password` 就每次渲染都随机换一个新密码**（它的设计），
+而 `relay-password.txt` 是**人手**写的、`relay.sh` 不碰它 → 只要有人重渲染一次
+（或换台机器跑一次），两边就漂移。文件里的值只在"最后一次写它的人"眼里是对的。
+
+**⚠️ 我第一版推断错在哪（显式订正）**：我先看到"当前 Caddyfile 的 bcrypt 哈希 ≠ 11:54
+备份里的哈希"，就写成"12:00 换过密码"。**这个推理不成立** —— bcrypt 每次算都用新的
+随机 salt，**同一个密码**两次算出来的哈希也不同。哈希不同只能说明"重渲染过"，
+不能说明"密码换过"。以本条为准。12:00 那次到底用的什么密码，**根因没定位**
+（不是我们跑的，控制台输出没留存）。
+
+**修法**：**以 `relay-password.txt` 为权威**，显式把密码传给 `relay.sh` 重渲染
+（不让它随机），再重启中继容器：
+
+```sh
+# 云上（唯一允许的特权动作：sudo docker 启停中继容器；写只落在 /home/mindul/dsh-relay/**）
+cd /home/mindul/dsh-relay && sh cloud/relay.sh --ip 123.56.158.212 --port 8443 \
+  --tunnel-port 18080 --local-port 3080 --password "$(sed -n 's/^PASSWORD=//p' relay-password.txt)" \
+  --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'
+```
+
+**判据 / 复现**（2026-10-07 12:05 从家里实测，绕开本机 Clash）：
+
+```sh
+# 不带密码 → Caddy 自己的 401（body 0、有 WWW-Authenticate）
+curl -sk --interface eth1 -D - -o /dev/null https://123.56.158.212:8443/
+# 带密码 → **家里 dsh web 的** 401 原文（68 字节）
+curl -sk --interface eth1 -u "dsh:$(sed -n 's/^PASSWORD=//p' relay-password.txt)" https://123.56.158.212:8443/
+#   → dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+**判据怎么读**：拿到 **68 字节的 `dsh web authentication required…`** = 过了 basic auth
+并且反代真的到了家里；拿到 **0 字节 + `WWW-Authenticate`** = 密码不对（Caddy 挡的）。
+
+**验证程度**：修好之后带密码那条 2026-10-07 实测 **200/401 + 68 字节原文**各 1 次。
+**授权边界**：这次重渲染是**上级明确授权的一次例外**（用户的三条硬约束里"只在
+`/home/mindul` 下操作" + "特权动作只有 `sudo docker`"允许它）；**云上默认仍然是只读**，
+下次别顺手改（H12 的禁区清单不变）。

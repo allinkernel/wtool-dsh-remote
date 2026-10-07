@@ -23,6 +23,11 @@
 #   I 安装脚本：源问 WTOOL_PROJECT_DIR 要（手跑按 $0 自推）、落点从
 #     WTOOL_HOME/WTOOL_PREFIX 推、换 WTOOL_HOME 装到别处、源找不到不建悬空链、
 #     --uninstall 撤干净 —— 全程临时 HOME（跑完比真 $HOME 的指纹）
+#   J 隧道常驻：systemd 单元渲染（Restart=always/保活参数/journald）、
+#     daemon-reload + enable --now 的调用、幂等、旧 tmux 会话抢端口的检测与停掉、
+#     用户管理器不可用时"还没动旧隧道就停手"、tunnel-status 的漂移检测、卸载
+#     —— 单元落点用 DSH_REMOTE_UNIT_DIR 钉到临时目录，systemctl/tmux 全是桩
+#     （真 tmux 上可能正跑着生产隧道），跑完比真 ~/.config/systemd/user 的指纹
 #
 # 要 docker 的两条在 tests/ 下单独放：caddy-validate.sh（3 条）、relay-e2e.sh（9 条）。
 # 它们**没有 docker 时 exit 77**（跳过码）—— 别把 77 当通过（H8）。
@@ -728,6 +733,214 @@ fi
 
 # ---- 真 $HOME 没被碰（整节跑完比指纹）
 check "真 \$HOME 的指纹跑完逐字不变（只写临时目录）" "$home_fp_before" "$(real_home_fp)"
+
+# ------------------------------------------------- J 隧道常驻（systemd 单元）
+printf 'J. 隧道常驻：单元渲染 / 旧 tmux 抢端口 / 卸载\n'
+# 这一节**只在临时目录 + 桩命令里跑**：
+#   * 单元落点用 DSH_REMOTE_UNIT_DIR 钉到临时目录（绝不碰真 ~/.config/systemd/user）
+#   * systemctl / tmux /（probe 用的）ssh 全是桩（真 tmux 上可能正跑着生产隧道）
+real_unit_fp() {
+    for p in "$HOME/.config/systemd/user/dsh-tunnel.service" "$HOME/.config/systemd/user/dsh-remote-tunnel.service"; do
+        if [ -e "$p" ]; then
+            printf '%s|%s|%s\n' "$p" "$(stat -c '%s' "$p")" "$(stat -c '%Y' "$p")"
+        else
+            printf '%s|absent\n' "$p"
+        fi
+    done
+}
+unit_fp_before=$(real_unit_fp)
+
+jstub="$TMP/jstub"
+mkdir -p "$jstub"
+cat >"$jstub/systemctl" <<'STUB'
+#!/bin/sh
+printf 'SYSTEMCTL: %s\n' "$*" >>"$J_LOG"
+case "$*" in
+*show-environment*) [ "${J_SD_OK:-1}" = 1 ] && exit 0 || exit 1 ;;
+*"show -p MainPID"*) printf '%s\n' "${J_MAINPID:-4242}"; exit 0 ;;
+*"show -p NRestarts"*) printf '%s\n' "${J_NRESTARTS:-0}"; exit 0 ;;
+*is-active*) printf '%s\n' "${J_ACTIVE:-active}"; exit 0 ;;
+*is-enabled*) printf '%s\n' "${J_ENABLED:-enabled}"; exit 0 ;;
+*status*) printf '● dsh-tunnel.service（桩）\n'; exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$jstub/tmux" <<'STUB'
+#!/bin/sh
+printf 'TMUX: %s\n' "$*" >>"$J_LOG"
+case "$*" in
+*has-session*) [ "${J_TMUX_HAS:-0}" = 1 ] && exit 0 || exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$jstub/systemctl" "$jstub/tmux"
+
+export J_LOG="$TMP/j.log"
+export DSH_REMOTE_UNIT_DIR="$TMP/junits"
+export DSH_REMOTE_SYSTEMCTL="$jstub/systemctl"
+export DSH_REMOTE_TMUX="$jstub/tmux"
+export DSH_REMOTE_CONF="$TMP/j-remote.conf"
+: >"$J_LOG"
+cat >"$TMP/j-remote.conf" <<EOF
+cloud_host=203.0.113.9
+cloud_user=alice
+cloud_ssh_port=2222
+identity=~/.ssh/id_j
+remote_port=18099
+local_port=3099
+tmux_session=dsh-j-stub
+EOF
+
+# ① --dry-run：只打印，不写文件、不调 systemctl、不碰 tmux
+"$remote" tunnel-install --dry-run >"$TMP/j1.out" 2>&1
+check "tunnel-install --dry-run 退出 0" "0" "$?"
+j1=$(cat "$TMP/j1.out")
+check_contains "dry-run 打出单元全文（Restart=always）" "Restart=always" "$j1"
+check_contains "dry-run：ExitOnForwardFailure=yes" "ExitOnForwardFailure=yes" "$j1"
+check_contains "dry-run：ServerAliveInterval=15" "ServerAliveInterval=15" "$j1"
+check_contains "dry-run：反向转发用 conf 里的端口" "-R 127.0.0.1:18099:127.0.0.1:3099" "$j1"
+check "dry-run 一个字节都没写" "" "$(ls -A "$DSH_REMOTE_UNIT_DIR" 2>/dev/null)"
+check "dry-run 没调 systemctl（没连用户管理器）" "0" "$(grep -c SYSTEMCTL "$J_LOG" 2>/dev/null || true)"
+check "dry-run 没碰 tmux（只 has-session 看一眼，不 kill）" "0" "$(grep -c 'kill-session' "$J_LOG" 2>/dev/null || true)"
+
+# ② 真装（systemd 后端）
+: >"$J_LOG"
+"$remote" tunnel-install >"$TMP/j2.out" 2>&1
+check "tunnel-install 退出 0" "0" "$?"
+junit="$DSH_REMOTE_UNIT_DIR/dsh-tunnel.service"
+if [ -f "$junit" ]; then ok "单元落在 \$DSH_REMOTE_UNIT_DIR/dsh-tunnel.service"; else bad "单元落点" "$(ls -A "$DSH_REMOTE_UNIT_DIR" 2>/dev/null)"; fi
+ju=$(cat "$junit" 2>/dev/null)
+check_contains "单元：Restart=always" "Restart=always" "$ju"
+check_contains "单元：RestartSec=3（默认 3-5s 档）" "RestartSec=3" "$ju"
+check_contains "单元：StartLimitIntervalSec=0（断了无限重试）" "StartLimitIntervalSec=0" "$ju"
+# 这个键属于 [Unit]；写在 [Service] 里 systemd 只警告 Unknown key 然后忽略（实测踩过）
+check "单元：StartLimitIntervalSec 不在 [Service] 段（放那儿会被忽略）" "0" \
+    "$(sed -n '/^\[Service\]/,$p' "$junit" | grep -c StartLimitIntervalSec || true)"
+check_contains "单元：ServerAliveInterval=15" "ServerAliveInterval=15" "$ju"
+check_contains "单元：ServerAliveCountMax=3" "ServerAliveCountMax=3" "$ju"
+check_contains "单元：TCPKeepAlive=yes" "TCPKeepAlive=yes" "$ju"
+check_contains "单元：日志走 journald" "StandardOutput=journal" "$ju"
+check_contains "单元：开机自启（WantedBy=default.target）" "WantedBy=default.target" "$ju"
+check_contains "单元：ExecStart 是绝对路径的 ssh" "ExecStart=/usr/bin/ssh" "$ju"
+check_contains "单元：BatchMode（服务里没终端，别等密码提示）" "BatchMode=yes" "$ju"
+check_contains "单元：远程端口可配（conf 里的 18099）" "-R 127.0.0.1:18099:127.0.0.1:3099" "$ju"
+check_contains "单元：登录用户走 cloud_user" "alice@203.0.113.9" "$ju"
+check_contains "单元：ssh 端口走 cloud_ssh_port" "-p 2222" "$ju"
+check_contains "单元：identity 的 ~ 展开成 \$HOME" "-i $HOME/.ssh/id_j" "$ju"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    jv=$(systemd-analyze verify "$junit" 2>&1)
+    check_not_contains "systemd-analyze verify：没有 Unknown key" "Unknown key name" "$jv"
+    check_not_contains "systemd-analyze verify：没点名我们的单元" "$junit:" "$jv"
+else
+    ok "没有 systemd-analyze，跳过单元语法校验"
+fi
+jlg=$(cat "$J_LOG")
+check_contains "装的时候 daemon-reload" "--user daemon-reload" "$jlg"
+check_contains "装的时候 enable --now dsh-tunnel.service" "--user enable --now dsh-tunnel.service" "$jlg"
+j2=$(cat "$TMP/j2.out")
+check_contains "打印判据：is-active" "is-active=active" "$j2"
+check_contains "打印判据：云上 ss 那条命令" "ss -ltn | grep 18099" "$j2"
+check_contains "打印判据：本机不该看到远程端口" "不该" "$j2"
+
+# ③ 幂等：再装一次，内容逐字不变、不产生 .bak
+: >"$J_LOG"
+ju_before=$(cat "$junit")
+"$remote" tunnel-install >/dev/null 2>&1
+check "重复 install 退出 0" "0" "$?"
+check "重复 install 单元内容逐字不变" "$ju_before" "$(cat "$junit")"
+check "重复 install 没留 .bak（内容没变就不备份）" "0" "$(ls "$DSH_REMOTE_UNIT_DIR" | grep -c '\.bak-' || true)"
+check "重复 install 不 restart（内容没变，别白断一次隧道）" "0" \
+    "$(grep -c -- '--user restart dsh-tunnel.service' "$J_LOG" || true)"
+
+# ④ 旧的一次性 tmux 会话还在：要提示 + 停掉（不然两条隧道抢云上同一个端口）
+: >"$J_LOG"
+J_TMUX_HAS=1 "$remote" tunnel-install >"$TMP/j3.out" 2>&1
+check "有旧 tmux 会话时 install 仍然退出 0" "0" "$?"
+j3=$(cat "$TMP/j3.out")
+check_contains "认出旧 tmux 会话并 kill-session" "TMUX: kill-session -t dsh-j-stub" "$(cat "$J_LOG")"
+check_contains "提示里点明会抢同一个端口" "抢同一个端口" "$j3"
+: >"$J_LOG"
+J_TMUX_HAS=1 "$remote" tunnel-install --keep-tmux >/dev/null 2>&1
+check "--keep-tmux：不动别人的会话" "0" "$(grep -c 'kill-session' "$J_LOG" || true)"
+
+# ⑤ systemctl --user 不可用：**在停旧隧道之前**就要停手，别把正在跑的弄没了
+: >"$J_LOG"
+J_SD_OK=0 DSH_REMOTE_UNIT_DIR="$TMP/junits2" "$remote" tunnel-install >"$TMP/j4.out" 2>&1
+j4_rc=$?
+[ "$j4_rc" -ne 0 ] && ok "用户管理器不可用时 install 非 0（不假装成功）" || bad "用户管理器不可用时 install 非 0"
+j4=$(cat "$TMP/j4.out")
+check_contains "给出出路：enable-linger" "loginctl enable-linger" "$j4"
+check "不可用时一个字节都没写" "" "$(ls -A "$TMP/junits2" 2>/dev/null)"
+check "不可用时没碰 tmux（旧隧道还在跑）" "0" "$(grep -c TMUX "$J_LOG" 2>/dev/null || true)"
+
+# ⑥ tunnel-status：看状态 + 认配置漂移 + 点名旧 tmux
+DSH_REMOTE_UNIT_DIR="$TMP/junits" "$remote" tunnel-status >"$TMP/j5.out" 2>&1
+check "tunnel-status 退出 0" "0" "$?"
+j5=$(cat "$TMP/j5.out")
+check_contains "status：打印单元完整路径" "$TMP/junits/dsh-tunnel.service" "$j5"
+check_contains "status：打印 is-active" "is-active=active" "$j5"
+check_contains "status：参数与 remote.conf 一致" "一致" "$j5"
+check_contains "status：说清反向隧道不该在本地听" "18099 本地没听" "$j5"
+sed 's/^remote_port=.*/remote_port=18111/' "$DSH_REMOTE_CONF" >"$TMP/j-remote2.conf"
+DSH_REMOTE_CONF="$TMP/j-remote2.conf" DSH_REMOTE_UNIT_DIR="$TMP/junits" \
+    "$remote" tunnel-status >"$TMP/j6.out" 2>&1
+check_contains "status：配置改了能认出来（漂移）" "对不上了" "$(cat "$TMP/j6.out")"
+J_TMUX_HAS=1 DSH_REMOTE_UNIT_DIR="$TMP/junits" "$remote" tunnel-status >"$TMP/j7.out" 2>&1
+check_contains "status：点名还在抢端口的旧 tmux 会话" "会话 dsh-j-stub 还在" "$(cat "$TMP/j7.out")"
+
+# ⑦ --probe：上云那条 ssh 是只读的（桩 ssh 只回结果，不真连）
+mkdir -p "$TMP/jssh"
+cat >"$TMP/jssh/ssh" <<'STUB'
+#!/bin/sh
+printf 'SSH: %s\n' "$*" >>"$J_LOG"
+printf 'LISTEN 0 128 127.0.0.1:18099 0.0.0.0:*\nhttp_code=401\n'
+STUB
+chmod +x "$TMP/jssh/ssh"
+: >"$J_LOG"
+PATH="$TMP/jssh:$PATH" DSH_REMOTE_CONF="$TMP/j-remote.conf" DSH_REMOTE_UNIT_DIR="$TMP/junits" \
+    "$remote" tunnel-status --probe >"$TMP/j8.out" 2>&1
+check "--probe 退出 0" "0" "$?"
+j8=$(cat "$TMP/j8.out")
+check_contains "--probe：认得出云上在听、请求到家里了" "请求穿到了家里" "$j8"
+check_contains "--probe：ssh 真的是只读命令（ss / curl，没别的）" "ss -ltn | grep '127.0.0.1:18099'" "$(cat "$J_LOG")"
+
+# ⑧ 改了配置再装：单元要跟着变，而且**要 restart 一次**
+#    （systemctl enable --now 对已经在跑的单元不会重启它，不补一刀就是"文件变了、跑的还是旧参数"）
+sed 's/^remote_port=.*/remote_port=18222/' "$DSH_REMOTE_CONF" >"$TMP/j-remote3.conf"
+: >"$J_LOG"
+DSH_REMOTE_CONF="$TMP/j-remote3.conf" "$remote" tunnel-install >"$TMP/j12.out" 2>&1
+check "改端口后 install 退出 0" "0" "$?"
+check_contains "单元跟着配置变（18222）" "-R 127.0.0.1:18222:127.0.0.1:3099" "$(cat "$junit")"
+check_contains "内容变了会 restart" "--user restart dsh-tunnel.service" "$(cat "$J_LOG")"
+check "内容变了会留 .bak" "1" "$(ls "$DSH_REMOTE_UNIT_DIR" | grep -c '\.bak-' || true)"
+
+# ⑨ 卸载：disable --now + 删文件 + daemon-reload
+: >"$J_LOG"
+DSH_REMOTE_UNIT_DIR="$TMP/junits" "$remote" tunnel-uninstall >"$TMP/j9.out" 2>&1
+check "tunnel-uninstall 退出 0" "0" "$?"
+if [ ! -e "$TMP/junits/dsh-tunnel.service" ]; then ok "单元文件删掉了"; else bad "单元文件删掉了"; fi
+jlg=$(cat "$J_LOG")
+check_contains "卸载：disable --now dsh-tunnel.service" "--user disable --now dsh-tunnel.service" "$jlg"
+check_contains "卸载：daemon-reload" "--user daemon-reload" "$jlg"
+
+# ⑩ 旧名字 systemd：等价 --no-enable（以前就是"只生成不 enable"）；旧单元文件要一起撤
+mkdir -p "$TMP/junits3"
+: >"$J_LOG"
+DSH_REMOTE_UNIT_DIR="$TMP/junits3" "$remote" systemd >"$TMP/j10.out" 2>&1
+check "旧名字 systemd 退出 0" "0" "$?"
+if [ -f "$TMP/junits3/dsh-tunnel.service" ]; then ok "旧名字写到同一个单元名"; else bad "旧名字写到同一个单元名"; fi
+check_contains "旧名字只生成不 enable" "只写了单元" "$(cat "$TMP/j10.out")"
+check "旧名字没 enable" "0" "$(grep -c 'enable --now' "$J_LOG" || true)"
+mkdir -p "$TMP/junits4"
+printf '[Unit]\nDescription=old\n' >"$TMP/junits4/dsh-remote-tunnel.service"
+: >"$J_LOG"
+DSH_REMOTE_UNIT_DIR="$TMP/junits4" "$remote" tunnel-install >"$TMP/j11.out" 2>&1
+check "有旧版单元时 install 退出 0" "0" "$?"
+check_contains "install 把旧版单元 disable 掉（它会抢同一个端口）" \
+    "--user disable --now dsh-remote-tunnel.service" "$(cat "$J_LOG")"
+
+# ---- 真 $HOME 的 systemd 单元没被这一节碰过
+check "真 \$HOME 的 systemd 单元指纹没变" "$unit_fp_before" "$(real_unit_fp)"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"

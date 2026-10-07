@@ -235,3 +235,62 @@ docker 有但**不在 docker 组**、**没有 compose 插件**、80 被 nginx �
 （大概率是用户自己在控制台放行了 8443）。BACKLOG 那节的第 8/9 步、U1/U2 的状态已按此更新，
 hazards H13 不受影响（它讲的是镜像 tag、无 SNI、没有 compose 三个坑）。
 **还没验的**：真手机 + 带 token 的地址（token 只在用户浏览器里）；安全组规则原文。
+
+---
+
+## 2026-10-07（下午）U3 收尾：隧道常驻 + 断线重连实测（12:00–12:12）
+
+**这一轮的起点**：用户 2026-10-07 拍板"加上吧"（U3）。做之前先只读侦察，
+侦察出来的三条事实改写了原本的计划：
+
+1. 云上 basic auth **用 `relay-password.txt` 里的密码过不去**（不带密码和带密码都是
+   Caddy 的同一个 401、body 0 字节）。`Caddyfile` mtime 12:00:42、文件 mtime 11:47:05。
+   **我先误判成"12:00 换过密码"**（依据是哈希不同）—— 错：bcrypt 每次 salt 不同，
+   同一密码哈希也不同。见 hazards H17。
+2. `remote.conf` 里 `cloud_user=root` 登不上（`Permission denied (publickey,password)`）；
+   `identity=~/.ssh/id_rsa` **也没被云上授权**，能用的是 `~/.ssh/id_ed25519`
+   （旧 tmux 隧道不带 `-i` 才碰巧一直能连）。见 hazards H16。
+3. `systemctl --user` **根本连不上 bus**（`/run/user/1000` 不存在、`loginctl list-sessions`
+   空）—— 用户提示里说的"systemd --user 可用"当时并不成立。见 hazards H15。
+
+**做过的事（都留了判据）**：
+
+- 12:01 `loginctl enable-linger mindul` → **不需要 sudo**、rc=0；
+  logind 当场起 `user@1000.service`（active），`/run/user/1000/bus` 出现，
+  `systemctl --user is-system-running` 从 `Failed to connect to bus` 变 `running`。
+- 12:04 把仓库里的 `cloud/relay.sh` 同步上云（只差 H12→H13 两处注释）；
+  12:05 用**显式密码**重渲染中继（`relay.sh --password <文件里的值> --no-compose …`），
+  `sudo docker` 重建容器。**复验**：不带密码 401（Caddy 挡）；带密码 → **68 字节**
+  `dsh web authentication required; reopen the URL printed by dsh web.`（反代到了家里）。
+- 12:05 订正 `~/.config/dsh-remote/remote.conf`（两次改动各留了 `.bak-<时间戳>`）：
+  `cloud_user=mindul`、`identity=~/.ssh/id_ed25519`、`public_url=https://123.56.158.212:8443`。
+- 写代码：`tunnel-install` / `tunnel-uninstall` / `tunnel-status`（`systemd` 旧名字保留成
+  `--no-enable` 同义词）；ssh 参数收进 `tunnel_conf` + `tunnel_argv` 一处；
+  单元渲染 `Restart=always` / `RestartSec=3` / `StartLimitIntervalSec=0`（**[Unit] 段**，
+  写 [Service] 里会被 systemd 忽略 —— 是 `systemd-analyze --user verify` 抓出来的）/
+  journald / `BatchMode=yes`。测试加 J 节 69 条（单元落点、systemctl、tmux 全是桩）。
+- 12:09:37 第一次真装：**停掉了旧 tmux 会话 `dsh-tunnel`**（它占着云上 18080）。
+  结果 ssh 起不来：`Permission denied` —— 就是上面第 2 条那个 `id_rsa` 坑；
+  它**每 3 秒重启一次**（35 秒 10 次，`NRestarts` 12），`StartLimitIntervalSec=0` 让它不放弃。
+- 12:10:20 改完 identity 重装 → `active (running)`，本机 `ss -ltn` 没有 18080（正常）、
+  云上 `ss -ltn` 看到 `127.0.0.1:18080`。
+- 12:10:51 / 12:10:56 **两次 `kill -9 <MainPID>`**：
+  `3199ms` / `3207ms` 拉起新进程，公网 `curl -sk --interface eth1 …:8443/` 恢复 401 用
+  `3276ms` / `3305ms`（journal 里是 `Main process exited, code=killed, status=9/KILL`
+  → `Scheduled restart job` → `Started`）。
+- 12:11 **故意造端口冲突**：停服务 → 自己起一条占 18080 的 ssh → 起服务 →
+  journal 里 `Error: remote port forwarding failed for listen port 18080`，
+  12 秒 4 次重试；**杀掉占端口的那条 → 760ms 服务接上**，公网 401 恢复。
+- 12:11:37 `tunnel-status --probe --interface eth1` 全绿（含云上 `ss` + `curl` 401 判据）。
+
+**测试**：`sh tests/run_tests.sh` → **268 通过 0 失败**（A10/B6/C22/D27/E53/F14/G8/H6/I53/**J69**）。
+
+**文档**：ADR-0013（常驻用 systemd --user + ssh 保活，不用 autossh、不在云上守）、
+architecture §2/§3/§3.1/§10/§11/§12、hazards **H14/H15/H16/H17**、BACKLOG U3 ✅、
+README §2/§3/§6/§7、本项目 AGENTS.md 条数与缺口。
+`harness/dsh-conf/AGENTS.md` 的"阿里云那台"一节也在同一轮订正（id_ed25519 / linger /
+密码会漂移）。
+
+**没做的（如实记）**：真手机带 token 打开；"网络真断"（ServerAlive 那条路）的重连；
+重启机器后服务会不会自己起来（linger 已开、单元已 enable，但没重启过机器）；
+真 Let's Encrypt；安全组规则原文。

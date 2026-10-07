@@ -57,7 +57,7 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 620 | 家里这头的主命令（14 个子命令） |
+| `bin/dsh-remote` | 1048 | 家里这头的主命令（17 个子命令） |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
 | `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
@@ -69,7 +69,7 @@
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 31 | 隧道配置样板 |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 736 | 199 条（2026-10-07 实测），不联网 / 不碰真 `$HOME`；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/run_tests.sh` | 949 | 268 条（2026-10-07 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
@@ -105,8 +105,12 @@
    （默认只认回环 / 本机 LAN / `--trusted-host`）就认这个请求，**不用重启 harness**。
    会话界面是流式的：`flush_interval -1` + `read_timeout 0`。
 5. 18080 是**云上 sshd 的 `-R` 监听口**，只绑 `127.0.0.1`（安全组里没有它）。
-6. 隧道另一头是家里的 `ssh -N -T -R 127.0.0.1:18080:127.0.0.1:3080`，
-   由 `dsh-remote tunnel` 起、`retry_seconds` 秒一轮地保活。
+6. 隧道另一头是家里的一条 **systemd `--user` 常驻服务** `dsh-tunnel.service`：
+   `ssh -N -T … -R 127.0.0.1:18080:127.0.0.1:3080 <云上用户>@<云上主机>`
+   （由 `dsh-remote tunnel-install` 渲染 + `enable --now`，见 §3.1）。
+   `Restart=always` 负责把退出的 ssh 拉起来，ssh 自己的 `ServerAlive*` 负责把
+   "网络断了但没退"的连接踢死；`dsh-remote tunnel` 是同一个 ssh 参数的前台版本，
+   留给调试用（不再需要 tmux 手工保活）。
 7. 家里 `127.0.0.1:3080` 是 `dsh web`。手机第一次还要贴一次带 token 的地址
    （`dsh-remote serve` 会把它存到 `$STATE_DIR/web-url.txt`），之后浏览器记住。
 
@@ -116,7 +120,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：14 个子命令的真实行为
+## 3. `bin/dsh-remote`：17 个子命令的真实行为
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -139,8 +143,11 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 |---|---|---|
 | `status` | 打印 7 行体检。①配置路径（不存在时提示照样板抄）②`$PROJ_DIR` ③harness：`ss -ltn`（没有 `ss` 用 `netstat -ltn`）看 `local_port`（默认 3080）是否在听；没在听但有 `dsh .*web` 进程则提示"端口对不对"；否则提示没在跑 ④隧道：只有 `cloud_host` 有值时才查 `pgrep -f 'ssh .*-R .*127\.0\.0\.1'` ⑤手机地址 `public_url` ⑥推送：`$CONF_DIR/notify.conf` 的 `provider`（读不到就说 `serverchan`）⑦hook 推送：`$CONF_DIR/hooks.json` 在**且** `$DSH_HOME/profiles/web/cordis.patch.yml` 里 grep 得到 `dsh-remote notify` 才算"已开启"。**只读，不写任何文件**（实测在临时 `DSH_REMOTE_HOME` 里跑过） | 恒 0 |
 | `serve` | 在**后台**起 `dsh web --no-open --port <local_port>`：有 `setsid` 就 `setsid nohup`，否则 `nohup`；stdout/stderr 进 `$STATE_DIR/web.log`。然后最多 40×0.5s=20s 轮询日志里的 `http://127.0.0.1:<端口>/…token=…`，抓到就写 `$STATE_DIR/web-url.txt` 并打印。**端口已经有人在听时拒绝启动**（警告 + 打印上次记的地址），因为重启会打断正在跑的会话 | 0 / 1 |
-| `tunnel` | **前台**死循环保活一条反向隧道。ssh 参数：`-N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new -p <cloud_ssh_port>`（默认 22），有 `identity` 就加 `-i`（`~/` 开头会展开成 `$HOME/`），最后是 `-R 127.0.0.1:<remote_port>:127.0.0.1:<local_port> <cloud_user>@<cloud_host>`（默认 `18080:127.0.0.1:3080`、`root`）。配置 `autossh` 不是 `off` **且** PATH 里有 `autossh` 时用 `AUTOSSH_GATETIME=0 autossh -M 0 <同样的参数>`，否则用裸 `ssh`。每断一次打印退出码，睡 `retry_seconds`（默认 10）再连。**没有 daemon 化、没有指数退避** | 循环 / `cloud_host` 缺失时 1 |
-| `systemd` | **只写文件**：`$HOME/.config/systemd/user/dsh-remote-tunnel.service`（`ExecStart=$SELF_DIR/dsh-remote tunnel`、`Restart=always`、`RestartSec=10`、`After=network-online.target`、`WantedBy=default.target`），然后打印要人自己敲的 `systemctl --user enable --now` 和 `loginctl enable-linger`。**不 enable、不 start、不 reload** | 0 |
+| `tunnel` | **前台**死循环保活一条反向隧道（调试用；常驻走 `tunnel-install`）。ssh 参数由 `tunnel_conf`（读配置）+ `tunnel_argv` 一处拼出，三处共用（本命令 / 单元渲染 / `tunnel-status` 的漂移对比）：`-N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new -p <cloud_ssh_port>`（默认 22），有 `identity` 就加 `-i`（`~/` 开头会展开成 `$HOME/`），最后是 `-R 127.0.0.1:<remote_port>:127.0.0.1:<local_port> <cloud_user>@<cloud_host>`（默认 `18080:127.0.0.1:3080`、`root`）。配置 `autossh` 不是 `off` **且** PATH 里有 `autossh` 时用 `AUTOSSH_GATETIME=0 autossh -M 0 <同样的参数>`，否则用裸 `ssh`。每断一次打印退出码，睡 `retry_seconds`（默认 10）再连。**没有 daemon 化、没有指数退避**；单元那条路额外加 `-o BatchMode=yes`（服务里没终端，别等密码提示） | 循环 / `cloud_host` 缺失时 1 |
+| `tunnel-install` | **装常驻隧道**（2026-10-07 加，ADR-0013）：先探 `systemctl --user`（连不上用户管理器 → 打印 `loginctl enable-linger` 两条出路后 `die`，**先探再动旧的**，什么都不碰）→ 检测旧的一次性 tmux 会话（`tmux_session`，默认 `dsh-tunnel`）：在就 `kill-session`（除非 `--keep-tmux`）→ 检测旧版单元 `dsh-remote-tunnel.service`：在就 `disable --now` → 渲染 `~/.config/systemd/user/dsh-tunnel.service` 落盘（内容一样就不动；不一样先备份 `$uf.bak-<时间戳>`）→ `daemon-reload` + `enable --now`；**内容变了且原本 active** 时再补一次 `restart`（`enable --now` 不会重启已在跑的单元）→ 停 3 秒看 `is-active`/`MainPID`/`NRestarts`，涨了就警告（端口被占/认证失败）→ 打印判据（云上 `ss`、公网 curl、`tunnel-status`、linger）。选项：`--restart-sec`（默认 3）`--remote-port` `--local-port` `--ssh-user`（覆盖 `cloud_user`）`--no-enable` `--keep-tmux` `--dry-run` | 0 / 1 |
+| `tunnel-uninstall` | `disable --now dsh-tunnel.service`（旧版单元在也一起）→ `daemon-reload` → 删单元文件（两个名字都删）。`systemctl --user` 不可用时只删文件并警告。`--dry-run` 只打印 | 0 |
+| `tunnel-status` | 只读体检：单元路径 + `is-active`/`is-enabled`/`MainPID`/`NRestarts`/`RestartSec`；**漂移检测**——拿单元里那行 `ExecStart` 和"用现在的 remote.conf 重新渲染会得到什么"逐字比（不一致就提示重装）；`pgrep` 看占着远程端口的 `ssh -R`；旧 tmux 会话在不在；本地远程端口不该在听、`local_port` 该在听；`linger` 状态。`--probe` 再上云跑**只读**命令（`ss -ltn | grep <rp>` + `curl 127.0.0.1:<rp>/`，401 = 请求穿到了家里的 dsh web），`--interface IF` 给 curl 绑网卡（绕开本机 Clash 用，见 hazards H11） | 0 / 1 |
+| `systemd` | **旧名字，保留**：打印一行"= `tunnel-install --no-enable`"后走同一条路（只渲染落盘，不 `daemon-reload` / 不 enable）。单元名从旧版的 `dsh-remote-tunnel.service` **换成 `dsh-tunnel.service`** | 0 / 1 |
 | `url` | 打印 `public_url`；没配就 `die` | 0 / 1 |
 | `notify-test` | 调 `dsh-notify --test`，再提示失败细节看 `$STATE_DIR/notify.log` | 0 |
 | `notify-enable` | ①`mkdir -p $CONF_DIR $DSH_HOME/profiles/web` ②把 `hooks/claude-hooks.json` 里的 `__DSH_NOTIFY__` 换成 `$NOTIFY` 写进 `$CONF_DIR/hooks.json`（模板不在就 `die`）③`$DSH_HOME/profiles/web/cordis.patch.yml` 不存在就先建一个 `# 注释` + `[]` ④里面没有 `# >>> dsh-remote notify` 标记时：先备份成 `$pf.bak-dsh-remote`，文件里**整行是 `[]`** 就把 `[]` 换成那段块（YAML 里两个顶层值会打架），否则直接追加 ⑤打印验证命令 `dsh --profile web --dump-config \| grep -A3 hooks-claude-code`。**幂等**（标记在就跳过） | 0 / 1 |
@@ -169,6 +176,71 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 必须是 `- insert:`。写 `- id: hooks-claude-code` 会被 patch 层当成
 "覆盖一个已有的行"，boot 时只警告 `patch: entry "hooks-claude-code" not found`，
 然后什么都不发生 —— 这个坑踩过一次（hazards H1）。
+
+### 3.1 常驻隧道：`~/.config/systemd/user/dsh-tunnel.service`（2026-10-07 加）
+
+**为什么要它**：原来靠一个一次性 tmux 会话里的 `ssh -N -R` 保活，**断了不会自己回来**
+（U3）。现在由 `tunnel-install` 渲染成 systemd `--user` 单元并 `enable --now`；
+重连分两层，各管一段（ADR-0013）：
+
+| 断成什么样 | 谁发现 | 多久回来 |
+|---|---|---|
+| ssh 进程**退了**（对端重启、认证失败、被 kill） | systemd `Restart=always` | `RestartSec`（默认 3s）+ ssh 握手 |
+| 网络断了但 ssh **僵着不退** | ssh 自己 `ServerAliveInterval=15 × ServerAliveCountMax=3` | ≤45s 被发现，再按上一行回来 |
+
+**实测**（2026-10-07 12:10，`kill -9 <MainPID>`，见 `journal.md` 同日条目）：
+两次分别 **3199ms / 3207ms** 拉起新进程，公网 401 恢复 **3276ms / 3305ms**。
+⚠️ 只测了"进程被杀"这一条路；**"网络真断（ServerAlive 那条路）"没测过**。
+
+渲染出来的单元（现状，`#` 注释是单元里就有的）：
+
+```ini
+[Unit]
+Description=DSH 反向隧道（手机远程接管家里这台机器）
+Documentation=file:<PROJ_DIR>/README.md
+# 断了就无限重试：0 = 关掉"短时间失败太多次就判 failed"（默认 10s 内 5 次）。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# BatchMode：服务里没有终端，别让它停在那儿等密码/host key 提问
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
+  -o StrictHostKeyChecking=accept-new -p <cloud_ssh_port> [-i <identity>] \
+  -R 127.0.0.1:<remote_port>:127.0.0.1:<local_port> <cloud_user>@<cloud_host>
+Restart=always
+RestartSec=<--restart-sec，默认 3>
+# 日志走 journald：journalctl --user -u dsh-tunnel.service
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-tunnel
+
+[Install]
+WantedBy=default.target
+```
+
+**几个键为什么必须这样**（踩过，别改回去）：
+
+- `StartLimitIntervalSec=0` **属于 `[Unit]`** —— 写到 `[Service]` 里 systemd 只警告
+  `Unknown key name` 然后忽略（`systemd-analyze --user verify` 抓出来的）。
+  置 0 = 无限重试：实测认证失败时它会 **每 3 秒一次一直试**（12:09 那次 35 秒里 10 次），
+  不会自己停下 —— 所以 `tunnel-install` 才要"先探用户管理器、再停旧隧道"。
+- `ExitOnForwardFailure=yes` + `Restart=always` 合起来有个坑：云上端口被别的隧道占着时
+  ssh **秒退**，于是变成"每 3 秒重试一次"的死循环（hazards H14）。
+- `ExecStart` 是**一行**、参数由 `sd_quote` 逐个转义（含空格/`$`/`%` 的参数会被引起来、
+  `$`→`$$`、`%`→`%%`）。`ssh` 写绝对路径（`command -v ssh` 的结果）。
+- 单元里**嵌了** host / 用户 / 端口 / identity（不是运行时读 `remote.conf`）——
+  所以改了 `remote.conf` 要重跑 `tunnel-install`；`tunnel-status` 会把
+  "单元里的 ExecStart" 和 "现在渲染会得到什么" 逐字比，不一致就提示（漂移检测）。
+
+**linger**：用户管理器默认只在"有登录会话"时活着。`loginctl enable-linger <用户>`
+之后 logind 会在开机时就把 `user@<uid>.service` 拉起来，服务才谈得上常驻 ——
+本机 2026-10-07 实测**不需要 sudo**（polkit 允许 self-linger），回退 `disable-linger`。
+`tunnel-install` / `tunnel-status` 都会把 `Linger=` 打出来，但**不替你开**。
+
+**装/卸的边界**：只写 `~/.config/systemd/user/dsh-tunnel.service`（+ `.bak-<时间戳>`）
+和它自己的 `enable` 软链；`systemctl --user daemon-reload` / `enable --now` /
+`disable --now` / `restart`。**不碰 `/etc/systemd`**、不碰系统级 unit。
 
 ---
 
@@ -453,7 +525,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **199 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 53） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景 |
+| `tests/run_tests.sh` | **268 通过 0 失败**（A 10 / B 6 / C 22 / D 27 / E 53 / F 14 / G 8 / H 6 / I 53 / **J 69**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、**常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -480,7 +552,20 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 **没被自动测的部分**（都在 `BACKLOG.md` 的"仍未做/未验证"里）：真阿里云上的
 安全组/防火墙、真实 Let's Encrypt 签发与续期、手机浏览器上的实际体验、
-隧道断线重连的真实时长、hook 桥真的会触发。
+**"网络真断"时 ServerAlive 那条重连路、重启机器后服务会不会自己起来**（linger 已开、单元已
+`enable`，但没重启过）、hook 桥真的会触发。
+
+`run_tests.sh` 的 **J 节（69 条，2026-10-07 加）** 守的是常驻隧道：单元渲染里
+`Restart=always` / `RestartSec` / `ExitOnForwardFailure` / 三个 `ServerAlive*` /
+journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitIntervalSec`
+**在 `[Unit]` 段**（写 `[Service]` 会被 systemd 忽略 —— 真被忽略过一次）；
+`systemd-analyze verify` 没有 `Unknown key`；`daemon-reload` + `enable --now` 的调用；
+重复 install 幂等（内容不变不备份、不 restart）、改配置后内容变化 + `restart`；
+旧 tmux 会话被 `kill-session`（`--keep-tmux` 时不杀）；用户管理器不可用时
+**在碰旧隧道之前就停手且一个字节都不写**；`tunnel-status` 的漂移检测与旧会话点名；
+`--probe` 只发只读命令；卸载 `disable --now` + 删文件。
+它**全程用 `DSH_REMOTE_UNIT_DIR` 指向临时目录、`systemctl`/`tmux` 都是桩**，
+跑完还要比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 
 ---
 
@@ -502,6 +587,10 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 | `XDG_CONFIG_HOME` / `XDG_STATE_HOME` | 上述全部 | 标准 XDG 覆盖 |
 | `CADDY_IMAGE` | relay.sh、两个 docker 测试 | Caddy 镜像，**默认钉住的 `caddy:2.11.4`**（换版本用环境变量覆盖；别用浮动 tag，hazards H13） |
 | `AUTOSSH_GATETIME` | dsh-remote tunnel | 用 autossh 时置 0（第一次连不上也继续重试） |
+| `DSH_REMOTE_UNIT_DIR` | dsh-remote | systemd 单元落点，默认 `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`（测试用来钉到临时目录） |
+| `DSH_REMOTE_SYSTEMCTL` | dsh-remote | 换 `systemctl`（默认 `systemctl`，调用时永远带 `--user`；测试用桩） |
+| `DSH_REMOTE_TMUX` | dsh-remote | 换 `tmux`（默认 `tmux`；只在检测/停旧会话时用 —— 测试用桩，**别拿真 tmux 试**） |
+| `DSH_REMOTE_SSH` | dsh-remote | 换写进单元 `ExecStart` 的 ssh 绝对路径（默认 `command -v ssh`） |
 
 ---
 
@@ -517,6 +606,8 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期**实体**：`notify.log`（推送）、`web.log`（harness 输出）、`web-url.txt`（带 token 的地址）、`cloud-install.log` |
 | `~/.config/dsh-remote` | 软链 → `$WTOOL_PREFIX/etc/dsh-remote` |
 | `~/.local/state/dsh-remote` | 软链 → `$WTOOL_PREFIX/var/dsh-remote` |
+| `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染；旁边可能留 `.bak-<时间戳>`）。由 systemd 自己读，**不在** `$WTOOL_PREFIX` 里 —— systemd 只认 `$XDG_CONFIG_HOME/systemd/user` |
+| `~/.config/systemd/user/default.target.wants/dsh-tunnel.service` | `enable` 建的软链（`disable` 会撤） |
 | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `notify-enable` 写 |
 
 云上（`relay.sh` 装出来的）：`/opt/dsh-relay/`（脚本 + 两个模板 + `docker-compose.yml`

@@ -137,16 +137,17 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 185 条（以跑出来的 PASS 行为准），秒级
+sh tests/run_tests.sh         # 268 条（以跑出来的 PASS 行为准），秒级
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
+                              #   J 节用 DSH_REMOTE_UNIT_DIR + systemctl/tmux 桩，不碰真 unit / 真 tmux
 sh tests/caddy-validate.sh    # 3 条，要 docker（caddy:2 镜像，本地没有会去拉）—— 人工跑
 sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再自己撤 —— 人工跑
 ```
 
 `run_tests.sh` 逐节（2026-10-07 实测）：A 语法 10 / B `env.*` 等价 6 /
-C `dsh-notify` 22 / D Caddyfile 渲染 21 / E 子命令 45 / F `cloud-install` 14 /
-G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 = **185**。
+C `dsh-notify` 22 / D Caddyfile 渲染 27 / E 子命令 53 / F `cloud-install` 14 /
+G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 / J 常驻隧道 69 = **268**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
 
 ⚠️ 两个要 docker 的脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码）：
@@ -154,7 +155,9 @@ G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 = **185**。
 2026-10-07 改成 77（hazards H8）。
 
 改了 `scripts/install.sh` / `env.zsh` / `env.bash` / `wtool.xml` **一定要跑
-`tests/run_tests.sh`**（I 节守的就是"命令真装得出来、源找不到不装假"）。
+`tests/run_tests.sh`**（I 节守的就是"命令真装得出来、源找不到不装假"）；
+改了隧道那三个子命令要跑 J 节（它同时守着"别碰真 `~/.config/systemd/user`
+和真 tmux"—— 后者上面可能挂着生产隧道）。
 
 ---
 
@@ -166,9 +169,14 @@ G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 = **185**。
   `SessionStart`/`Stop`/`PreToolUse` 一个都没触发）。在证实之前，
   **不要把"会话卡住会推手机"写成已有能力**；`dsh-remote check-hooks` 是那条
   一次性复查命令（触发 → 0，没触发 → 1）。细节见 ADR-006 / `architecture.md` §9。
-- **真机端到端从未跑过**：真阿里云、真手机、真 Let's Encrypt、隧道断线重连时长 ——
-  一条都没有；`cloud-install` 只用假 ssh/scp 验过参数拼装。
-- 真阿里云的安全组/防火墙、手机浏览器实测、隧道断线重连时长都**没有自动测**。
+- **真机端到端只走通了一部分**（2026-10-07）：真阿里云中继 + 公网 8443 → 家里
+  `dsh web` 走通了（带 basic auth 拿到家里 401 原文）；常驻隧道 `kill -9` 后
+  **3.2s** 回来（实测，见 U3）。**还没验的**：真手机带 token 打开、真 Let's Encrypt、
+  "网络真断"那条重连路、重启机器后会不会自动恢复。
+- 真阿里云的安全组/防火墙、手机浏览器实测都**没有自动测**；`cloud-install` 只用假
+  ssh/scp 验过参数拼装。
+- **常驻隧道要 `loginctl enable-linger`** 才能跨登录会话/开机活着（本机 2026-10-07
+  已开、实测不需要 sudo）；没开的话"登录会话一结束服务就停"。见 hazards H15。
 
 ---
 

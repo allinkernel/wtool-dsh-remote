@@ -14,6 +14,9 @@ cloud_ssh_port=22
 # 隧道用的私钥（家 → 云）。建议专门配一把，只允许它端口转发：
 #   ~/.ssh/authorized_keys 里写成
 #   restrict,port-forwarding,permitlisten="127.0.0.1:18080" ssh-ed25519 AAAA... dsh-remote
+# ⚠️ 写哪一把必须和云上 authorized_keys 对上：写错的后果不对等 ——
+#    前台 `dsh-remote tunnel` 可能"碰巧还能连"（不带 -i 时 ssh 会按默认顺序试别的钥匙），
+#    而 systemd 单元里带了 `-i`，会直接 Permission denied 然后每 3 秒重试一次（hazards H16）。
 identity=~/.ssh/id_rsa
 
 # 云上只绑 127.0.0.1 的隧道端口（Caddy 反代它）。**别在安全组里开放它**
@@ -22,9 +25,16 @@ remote_port=18080
 # 家里 harness 的端口（dsh web 听的）
 local_port=3080
 
-# 断线重连间隔（秒）；装了 autossh 会自动用它
+# 断线重连间隔（秒）——**只给前台 `dsh-remote tunnel` 用**。
+# 常驻（`tunnel-install`）不用这个值，它由 systemd 的 RestartSec 决定
+# （命令行 `--restart-sec`，默认 3）。
 retry_seconds=10
 autossh=auto
+
+# 旧的一次性隧道可能挂在 tmux 里，`tunnel-install` 装之前会检测并停掉它
+# （两条隧道抢云上同一个端口 → 新的那条会被无限重启，见 docs/hazards.md H14）。
+# 会话名一般不用改。
+tmux_session=dsh-tunnel
 
 # --------------------------------------------------------------- 手机地址
 # 云端 Caddy 装好后填进来（relay.sh 最后会打印）

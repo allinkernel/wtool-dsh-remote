@@ -3,8 +3,11 @@
 #
 #   dsh-remote status          体检：harness / 隧道 / 推送 / 手机地址
 #   dsh-remote serve           在后台起 harness（--no-open），把带 token 的 URL 存起来
-#   dsh-remote tunnel          前台保活一条 SSH 反向隧道（放进 tmux / systemd）
-#   dsh-remote systemd        生成（或安装）隧道的 systemd user 单元
+#   dsh-remote tunnel          前台保活一条 SSH 反向隧道（调试用；常驻看 tunnel-install）
+#   dsh-remote tunnel-install  装成 systemd --user 常驻服务（Restart=always，断线自动重连）
+#   dsh-remote tunnel-uninstall 撤掉它（disable --now + 删单元文件）
+#   dsh-remote tunnel-status   看单元/进程/云上隧道口/公网的现状（--probe 上云只读检查）
+#   dsh-remote systemd         旧名字：只生成单元、不 enable（= tunnel-install --no-enable）
 #   dsh-remote url             打印手机该收藏的地址
 #   dsh-remote notify-test     推一条测试消息到手机
 #   dsh-remote notify-enable   打开"会话卡住/跑完就推手机"（写配置目录的 hooks.json + profile patch）
@@ -174,25 +177,40 @@ cmd_serve() {
 }
 
 # ------------------------------------------------------------------ 隧道
-tunnel_args() {
+# 一条反向隧道 = 云上 127.0.0.1:<remote_port> 转发到家里 127.0.0.1:<local_port>。
+# ssh 参数只写一份（tunnel_argv），三处共用：前台 tunnel / 渲染进 systemd 单元 /
+# tunnel-status 的"配置漂移"对比。保活参数必须留着 —— systemd 只看得到"进程退没退"，
+# 网络断了而 ssh 僵着不退时，只有 ssh 自己的 ServerAlive* 能把它踢死（ADR-0013）。
+tunnel_conf() {
     host=$(conf_any cloud_host CLOUD_HOST) || die "remote.conf 里没有 cloud_host"
-    user=$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')
-    sport=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
-    rp=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
-    lp=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
-    key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
-    case $key in '~/'*) key="$HOME/${key#\~/}" ;; esac
+    ssh_user=$(conf_any cloud_user CLOUD_USER 2>/dev/null || printf 'root')
+    ssh_port=$(conf_any cloud_ssh_port CLOUD_SSH_PORT 2>/dev/null || printf '22')
+    remote_port_v=$(conf_any remote_port REMOTE_PORT 2>/dev/null || printf '18080')
+    local_port_v=$(conf_any local_port LOCAL_PORT 2>/dev/null || printf '3080')
+    identity_key=$(conf_any identity IDENTITY 2>/dev/null || printf '')
+    case $identity_key in '~/'*) identity_key="$HOME/${identity_key#\~/}" ;; esac
+    tmux_name=$(conf_any tmux_session TMUX_SESSION 2>/dev/null || printf 'dsh-tunnel')
+}
 
-    set -- -N -T \
+tunnel_argv() { # 用法：tunnel_argv [--batch]（先调 tunnel_conf 设好上面那批全局量）
+    _batch=${1:-}
+    set -- -N -T
+    [ "$_batch" = "--batch" ] && set -- "$@" -o BatchMode=yes
+    set -- "$@" \
         -o ExitOnForwardFailure=yes \
-        -o ServerAliveInterval=30 \
+        -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
         -o TCPKeepAlive=yes \
         -o StrictHostKeyChecking=accept-new \
-        -p "$sport"
-    [ -n "$key" ] && set -- "$@" -i "$key"
-    set -- "$@" -R "127.0.0.1:${rp}:127.0.0.1:${lp}" "${user}@${host}"
+        -p "$ssh_port"
+    [ -n "$identity_key" ] && set -- "$@" -i "$identity_key"
+    set -- "$@" -R "127.0.0.1:${remote_port_v}:127.0.0.1:${local_port_v}" "${ssh_user}@${host}"
     printf '%s\n' "$@"
+}
+
+tunnel_args() { # 兼容旧调用点：先读配置，再拼参数
+    tunnel_conf
+    tunnel_argv
 }
 
 cmd_tunnel() {
@@ -219,29 +237,424 @@ cmd_tunnel() {
     done
 }
 
-cmd_systemd() {
-    unit_dir="$HOME/.config/systemd/user"
-    unit="$unit_dir/dsh-remote-tunnel.service"
-    mkdir -p -- "$unit_dir"
-    cat >"$unit" <<EOF
+# ------------------------------------------------- 常驻隧道（systemd --user 单元）
+# 为什么不用 autossh：本机 / 云上都没有它（要装包，ADR-0013）。改成两件事分工：
+#   * 进程退了（网络断、对端重启、ssh 自己超时退出）→ systemd 的 `Restart=always` 拉起；
+#   * 网络断了但 ssh 还僵着不退 → ssh 自己的 `ServerAliveInterval × ServerAliveCountMax`
+#     秒内把它踢死，退回上一条。
+# 单元固定落在 ~/.config/systemd/user/dsh-tunnel.service（认 $XDG_CONFIG_HOME）。
+UNIT_NAME=dsh-tunnel.service
+LEGACY_UNIT_NAME=dsh-remote-tunnel.service # 旧版 `dsh-remote systemd` 写的；会抢同一个云上端口
+SYSTEMCTL=${DSH_REMOTE_SYSTEMCTL:-systemctl}
+TMUX_BIN=${DSH_REMOTE_TMUX:-tmux}
+
+unit_dir() { printf '%s' "${DSH_REMOTE_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"; }
+unit_file() { printf '%s/%s' "$(unit_dir)" "$UNIT_NAME"; }
+legacy_unit_file() { printf '%s/%s' "$(unit_dir)" "$LEGACY_UNIT_NAME"; }
+
+# systemctl --user 靠 $XDG_RUNTIME_DIR 找用户总线。**非登录 shell 里它可能是空的**
+# （WSL / cron / 手工 sh 都会），那时报 "Failed to connect to bus"，而用户管理器其实活着。
+# 空的就按 logind 的约定补一个（只在那个目录真存在时才补）。
+systemctl_user() {
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+        XDG_RUNTIME_DIR="/run/user/$(id -u)"
+        export XDG_RUNTIME_DIR
+    fi
+    "$SYSTEMCTL" --user "$@"
+}
+
+# 探用户管理器在不在。**必须在写单元/停旧隧道之前探**：装不上就别把正在跑的弄没了。
+systemd_user_ok() { systemctl_user show-environment >/dev/null 2>&1; }
+
+linger_state() { # yes / no / 未知（老 loginctl 没有 --value，退回去自己剥前缀）
+    command -v loginctl >/dev/null 2>&1 || {
+        printf '未知（没有 loginctl）'
+        return 0
+    }
+    _l=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || printf '')
+    [ -n "$_l" ] || _l=$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')
+    printf '%s' "${_l:-未知}"
+}
+
+# systemd 的 ExecStart 是一行；参数里有空格/引号的要引起来，`$`/`%` 会被 systemd 展开，
+# 得写成 `$$`/`%%`（只对"含不安全字符"的参数做加工，IP/端口/路径都保持原样好读）。
+sd_quote() {
+    case $1 in
+    *[!A-Za-z0-9_@+=:,./-]*)
+        _q=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/$$/g' -e 's/%/%%/g')
+        printf '"%s"' "$_q"
+        ;;
+    *) printf '%s' "$1" ;;
+    esac
+}
+
+unit_body() { # 用法：unit_body <RestartSec>；ExecStart 用 tunnel_conf 设好的全局量渲染
+    _sec=$1
+    tunnel_conf
+    _ssh=${DSH_REMOTE_SSH:-$(command -v ssh 2>/dev/null || printf '')}
+    [ -n "$_ssh" ] || die "PATH 里没有 ssh（单元里的 ExecStart 必须写绝对路径）"
+    _argv=$(tunnel_argv --batch)
+    _exec=$(printf '%s\n' "$_argv" | while IFS= read -r _a; do printf ' %s' "$(sd_quote "$_a")"; done)
+    cat <<EOF
 [Unit]
-Description=DSH 反向隧道（手机远程接管）
-After=network-online.target
+Description=DSH 反向隧道（手机远程接管家里这台机器）
+Documentation=file:$PROJ_DIR/README.md
+# 断了就无限重试：0 = 关掉"短时间失败太多次就判 failed"（默认 10s 内 5 次）。
+# ⚠️ 这个键属于 [Unit]；写在 [Service] 里 systemd 只警告 "Unknown key name" 然后忽略
+# （2026-10-07 被 systemd-analyze --user verify 抓出来，别搬回去）。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$SELF_DIR/dsh-remote tunnel
+# BatchMode：服务里没有终端，别让它停在那儿等密码/host key 提问
+ExecStart=$(sd_quote "$_ssh")$_exec
 Restart=always
-RestartSec=10
+RestartSec=$_sec
+# 日志走 journald：journalctl --user -u $UNIT_NAME
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-tunnel
 
 [Install]
 WantedBy=default.target
 EOF
-    say "已写 $unit"
-    say "启用："
-    say "  systemctl --user daemon-reload && systemctl --user enable --now dsh-remote-tunnel"
-    say "  loginctl enable-linger $USER     # 让它在你没登录时也活着（可选）"
-    say "看状态：systemctl --user status dsh-remote-tunnel"
+}
+
+tmux_has_session() {
+    [ -n "${tmux_name:-}" ] || return 1
+    command -v "$TMUX_BIN" >/dev/null 2>&1 || return 1
+    "$TMUX_BIN" has-session -t "$tmux_name" >/dev/null 2>&1
+}
+
+cmd_tunnel_install() {
+    _sec=3
+    _rp=
+    _lp=
+    _new_user=
+    _dry=0
+    _no_enable=0
+    _keep_tmux=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --restart-sec)
+            _sec=${2:-}
+            shift 2
+            ;;
+        --remote-port)
+            _rp=${2:-}
+            shift 2
+            ;;
+        --local-port)
+            _lp=${2:-}
+            shift 2
+            ;;
+        --ssh-user)
+            _new_user=${2:-}
+            shift 2
+            ;;
+        --no-enable)
+            _no_enable=1
+            shift
+            ;;
+        --keep-tmux)
+            _keep_tmux=1
+            shift
+            ;;
+        --dry-run)
+            _dry=1
+            shift
+            ;;
+        *) die "tunnel-install 不认识的参数：$1（dsh-remote help）" ;;
+        esac
+    done
+    case $_sec in '' | *[!0-9]*) die "--restart-sec 要正整数（秒）：$_sec" ;; esac
+    [ "$_sec" -ge 1 ] || die "--restart-sec 至少 1 秒"
+
+    tunnel_conf
+    [ -n "$_rp" ] && remote_port_v=$_rp
+    [ -n "$_lp" ] && local_port_v=$_lp
+    [ -n "$_new_user" ] && ssh_user=$_new_user
+    case $remote_port_v in '' | *[!0-9]*) die "远程端口要数字：$remote_port_v" ;; esac
+    case $local_port_v in '' | *[!0-9]*) die "本地端口要数字：$local_port_v" ;; esac
+    _me=$(id -un)
+
+    uf=$(unit_file)
+    say "常驻隧道  云上 127.0.0.1:${remote_port_v} → 家里 127.0.0.1:${local_port_v}"
+    say "登录      ${ssh_user}@${host}:${ssh_port}$([ -n "$identity_key" ] && printf '（-i %s）' "$identity_key")"
+    say "单元      $uf（Restart=always，RestartSec=${_sec}s）"
+    say ""
+
+    # 0) 先探 systemd --user：必须在停掉旧隧道**之前**探，装不上就别把正在跑的弄没了
+    if [ "$_dry" = 0 ] && [ "$_no_enable" = 0 ] && ! systemd_user_ok; then
+        warn "systemctl --user 连不上用户管理器（systemd --user 没在跑），单元装了也起不来。"
+        warn "常见原因：这台机器上你没有 logind 会话、也没开 linger。"
+        warn "  loginctl enable-linger $_me    # 没登录时也跑用户服务（本机 2026-10-07 实测不需要 sudo）"
+        warn "  判据：systemctl --user show-environment 退出码 0"
+        die "什么都没动（旧隧道还在跑）"
+    fi
+
+    # 1) 旧的一次性 tmux 隧道：它已经占着云上**同一个**端口，必须先退场。
+    #    两条隧道抢同一个远程端口时，后起的那条 ssh 会立刻退出；配上 Restart=always
+    #    就是"每 RestartSec 秒重启一次"的死循环（hazards H14）。
+    if tmux_has_session; then
+        warn "旧 tmux 会话 $tmux_name 还在：它占着云上 127.0.0.1:${remote_port_v}。"
+        warn "两条隧道抢同一个端口时，新的这条会因 ExitOnForwardFailure 秒退 → 被 systemd 无限重启。"
+        if [ "$_keep_tmux" = 1 ]; then
+            warn "--keep-tmux 给了：不动它 —— **你自己保证别让两条同时占 ${remote_port_v}**"
+        elif [ "$_dry" = 1 ]; then
+            say "（--dry-run：真跑时会执行 $TMUX_BIN kill-session -t $tmux_name）"
+        elif "$TMUX_BIN" kill-session -t "$tmux_name" >/dev/null 2>&1; then
+            say "已停掉旧 tmux 会话 $tmux_name（等 1 秒让云上把 ${remote_port_v} 让出来）"
+            sleep 1
+        else
+            warn "kill-session 失败：自己跑 $TMUX_BIN kill-session -t $tmux_name"
+        fi
+    fi
+
+    # 1b) 旧版单元（老 `dsh-remote systemd` 写的那个名字）同样会抢端口
+    lf=$(legacy_unit_file)
+    if [ -f "$lf" ]; then
+        warn "发现旧版单元 $lf（旧 dsh-remote systemd 生成）—— 它和新单元抢同一个云上端口"
+        if [ "$_dry" = 0 ]; then
+            systemctl_user disable --now "$LEGACY_UNIT_NAME" >/dev/null 2>&1 || true
+            say "已 disable --now $LEGACY_UNIT_NAME（文件留着：rm $lf）"
+        fi
+    fi
+
+    # 2) 渲染 → 落盘（内容一样就不动文件，幂等；不一样先备份）
+    _tmp=$(mktemp) || die "mktemp 失败"
+    unit_body "$_sec" >"$_tmp" || {
+        rm -f -- "$_tmp"
+        die "渲染单元失败"
+    }
+    if [ "$_dry" = 1 ]; then
+        say "== --dry-run：单元内容如下（一个字节都没写）"
+        cat -- "$_tmp"
+        rm -f -- "$_tmp"
+        say ""
+        say "真跑时会执行："
+        say "  $SYSTEMCTL --user daemon-reload"
+        say "  $SYSTEMCTL --user enable --now $UNIT_NAME"
+        return 0
+    fi
+    mkdir -p -- "$(unit_dir)"
+    if [ -f "$uf" ] && cmp -s -- "$_tmp" "$uf"; then
+        say "单元内容没变：$uf"
+        _changed=0
+        rm -f -- "$_tmp"
+    else
+        _changed=1
+        if [ -f "$uf" ]; then
+            _bak="$uf.bak-$(date +%Y%m%d-%H%M%S)"
+            cp -f -- "$uf" "$_bak" && say "旧单元备份成 $_bak"
+        fi
+        mv -f -- "$_tmp" "$uf" || die "写 $uf 失败"
+        say "已写 $uf"
+    fi
+
+    if [ "$_no_enable" = 1 ]; then
+        say ""
+        say "--no-enable：只写了单元，没 daemon-reload / enable / start。自己来："
+        say "  systemctl --user daemon-reload && systemctl --user enable --now $UNIT_NAME"
+        return 0
+    fi
+
+    say ""
+    say "== daemon-reload + enable --now $UNIT_NAME"
+    # enable --now 对**已经在跑**的单元不会重启它 —— 所以内容变了要自己补一次 restart，
+    # 否则单元文件改了、真正跑的 ssh 还是旧参数（漂移）。
+    _was_active=$(systemctl_user is-active "$UNIT_NAME" 2>/dev/null || true)
+    _nr_before=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
+    systemctl_user daemon-reload || die "daemon-reload 失败"
+    if ! systemctl_user enable --now "$UNIT_NAME"; then
+        warn "enable --now 失败，看：systemctl --user status $UNIT_NAME"
+        return 1
+    fi
+    if [ "$_changed" = 1 ] && [ "$_was_active" = active ]; then
+        say "单元内容变了：restart 一次让新参数生效"
+        systemctl_user restart "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+
+    # 3) 起来之后**停 3 秒再看一遍**：Type=simple 的 active 只说明进程被 fork 出来了；
+    #    认证失败 / 端口被占的 ssh 会立刻退，光看 is-active 看不出来 —— 要看 NRestarts。
+    sleep 3
+    _state=$(systemctl_user is-active "$UNIT_NAME" 2>/dev/null || true)
+    [ -n "$_state" ] || _state=未知
+    _enabled=$(systemctl_user is-enabled "$UNIT_NAME" 2>/dev/null || true)
+    [ -n "$_enabled" ] || _enabled=未知
+    _pid=$(systemctl_user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || printf '')
+    _nr=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
+    _lg=$(linger_state)
+    _pid_txt=${_pid:-0}
+    [ "$_pid_txt" = 0 ] && _pid_txt='<MainPID>'
+
+    say ""
+    say "== 判据"
+    say "服务      is-active=$_state  is-enabled=$_enabled  MainPID=${_pid:-0}  NRestarts=${_nr:-?}"
+    say "日志      journalctl --user -u $UNIT_NAME -n 20 -f"
+    say "本机      ss -ltn 里**不该**有 ${remote_port_v}（反向隧道不在本地听）；应该有 ${local_port_v}"
+    say "云上      ssh ${ssh_user}@${host} \"ss -ltn | grep ${remote_port_v}\"   # 应看到 127.0.0.1:${remote_port_v}"
+    say "公网      curl -sk https://<public_url 的 host:port>/   # 不带密码应 401（basic auth 在挡）"
+    say "一键体检  dsh-remote tunnel-status --probe"
+    say "断线自测  kill ${_pid_txt} → 过几秒 systemctl --user is-active $UNIT_NAME 应回 active"
+    say "linger    Linger=$_lg"
+    [ "$_lg" = yes ] || say "          登录会话一结束服务就停 → loginctl enable-linger $_me"
+
+    # NRestarts 是**累计**计数器（过去失败过也留着），所以只比"这次装的前后有没有涨"
+    if [ -n "$_nr" ] && [ -n "$_nr_before" ] && [ "$_nr" != "$_nr_before" ]; then
+        warn ""
+        warn "⚠️ 这次起来之后它已经在重启了（NRestarts $_nr_before → $_nr）："
+        warn "   多半是云上 ${remote_port_v} 被别的隧道占着"
+        warn "   （ExitOnForwardFailure=yes 让 ssh 秒退 → Restart=always 无限重试，hazards H14），"
+        warn "   或者登录 / 密钥不对（auth 失败也是 3 秒一次地重试，不会自己停下 —— H16）。最近几行："
+        systemctl_user --no-pager -l status "$UNIT_NAME" 2>&1 | tail -n 12 >&2 || true
+    fi
+}
+
+cmd_tunnel_uninstall() {
+    _dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --dry-run)
+            _dry=1
+            shift
+            ;;
+        *) die "tunnel-uninstall 不认识的参数：$1（dsh-remote help）" ;;
+        esac
+    done
+    uf=$(unit_file)
+    lf=$(legacy_unit_file)
+    say "撤销单元  $uf"
+    [ -f "$lf" ] && say "          $lf（旧版生成的，一起撤）"
+    if [ "$_dry" = 1 ]; then
+        say "（--dry-run：会 disable --now、删单元文件、daemon-reload；一个字节都没动）"
+        return 0
+    fi
+    if systemd_user_ok; then
+        systemctl_user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+        [ -f "$lf" ] && systemctl_user disable --now "$LEGACY_UNIT_NAME" >/dev/null 2>&1
+        systemctl_user daemon-reload >/dev/null 2>&1 || true
+        say "已 disable --now（服务停了、开机不再自启）"
+    else
+        warn "systemctl --user 连不上（用户管理器没在跑）：只删文件（服务本来也没跑）"
+    fi
+    rm -f -- "$uf" && say "已删 $uf"
+    if [ -f "$lf" ]; then
+        rm -f -- "$lf" && say "已删 $lf"
+    fi
+    say "想临时跑前台隧道：dsh-remote tunnel"
+}
+
+cmd_tunnel_status() {
+    _probe=0
+    _iface=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --probe)
+            _probe=1
+            shift
+            ;;
+        --interface)
+            _iface=${2:-}
+            shift 2
+            ;;
+        *) die "tunnel-status 不认识的参数：$1（dsh-remote help）" ;;
+        esac
+    done
+    _me=$(id -un)
+    uf=$(unit_file)
+    lf=$(legacy_unit_file)
+
+    say "配置      $CONF$([ -f "$CONF" ] || printf '（还没有，先照 remote.conf.example 抄一份）')"
+    say "单元      $uf$([ -f "$uf" ] || printf '（还没有：dsh-remote tunnel-install）')"
+    if [ -f "$uf" ]; then
+        # is-active / is-enabled 对 activating / disabled 是**非 0** 退出码，但照样打印状态词：
+        # 别写成 `|| printf 未知`，那会把 "activating\n未知" 拼在一起（2026-10-07 踩过）。
+        _state=$(systemctl_user is-active "$UNIT_NAME" 2>/dev/null || true)
+        [ -n "$_state" ] || _state=未知
+        _enabled=$(systemctl_user is-enabled "$UNIT_NAME" 2>/dev/null || true)
+        [ -n "$_enabled" ] || _enabled=未知
+        _pid=$(systemctl_user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || printf '')
+        _nr=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
+        _sec=$(sed -n 's/^RestartSec=//p' "$uf" | head -n 1)
+        say "  状态    is-active=$_state  is-enabled=$_enabled  MainPID=${_pid:-0}  NRestarts=${_nr:-?}"
+        say "  参数    Restart=always  RestartSec=${_sec:-?}"
+        if conf_any cloud_host CLOUD_HOST >/dev/null 2>&1; then
+            tunnel_conf
+            _want=$(unit_body "${_sec:-3}" 2>/dev/null | sed -n 's/^ExecStart=//p')
+            _have=$(sed -n 's/^ExecStart=//p' "$uf" | head -n 1)
+            if [ "$_want" = "$_have" ]; then
+                say "  一致性  单元里的 ssh 参数和现在的 remote.conf 一致 ✓"
+            else
+                say "  一致性  **和现在的 remote.conf 对不上了** —— 改了配置就重跑 dsh-remote tunnel-install"
+                say "          单元里：$_have"
+                say "          现在渲染：$_want"
+            fi
+        fi
+    fi
+    [ -f "$lf" ] && warn "旧版单元还在：$lf（会抢云上端口；dsh-remote tunnel-uninstall 会一起撤）"
+
+    if ! conf_any cloud_host CLOUD_HOST >/dev/null 2>&1; then
+        say "隧道      remote.conf 里还没写 cloud_host（照 remote.conf.example 抄一份）"
+        return 0
+    fi
+
+    tunnel_conf
+    say "映射      云上 127.0.0.1:${remote_port_v} → 家里 127.0.0.1:${local_port_v}（${ssh_user}@${host}:${ssh_port}）"
+    _p=$(pgrep -af "ssh .*-R 127\.0\.0\.1:${remote_port_v}:" 2>/dev/null | head -n 1)
+    if [ -n "$_p" ]; then
+        say "进程      $_p"
+    else
+        say "进程      没有一条占着 ${remote_port_v} 的 ssh -R"
+    fi
+    if tmux_has_session; then
+        warn "tmux      会话 $tmux_name 还在（占着云上 ${remote_port_v}）：$TMUX_BIN kill-session -t $tmux_name"
+    else
+        say "tmux      没有 $tmux_name 会话"
+    fi
+    if port_listening "$remote_port_v"; then
+        warn "本机      ${remote_port_v} 在本地听着（**反向隧道不该在本地听**：这是别的进程）"
+    else
+        say "本机      ${remote_port_v} 本地没听 ✓（反向隧道正常就该这样）"
+    fi
+    if port_listening "$local_port_v"; then
+        say "harness   127.0.0.1:${local_port_v} 在跑 ✓"
+    else
+        say "harness   127.0.0.1:${local_port_v} 没在听（dsh web 没跑？）"
+    fi
+    say "linger    Linger=$(linger_state)"
+    [ "$(linger_state)" = yes ] || say "          no 的话登录会话一结束服务就停：loginctl enable-linger $_me"
+
+    if [ "$_probe" = 1 ]; then
+        say ""
+        say "== --probe：上云只读看一眼（ss / curl，不改云上任何东西）"
+        _opts="-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -p $ssh_port"
+        [ -n "$identity_key" ] && _opts="$_opts -i $identity_key"
+        # shellcheck disable=SC2086
+        _out=$(ssh $_opts "${ssh_user}@${host}" \
+            "ss -ltn | grep '127.0.0.1:${remote_port_v}' || echo '（云上 ${remote_port_v} 没有监听）'; curl -s -o /dev/null -w 'http_code=%{http_code}\n' --max-time 8 http://127.0.0.1:${remote_port_v}/" 2>&1)
+        printf '%s\n' "$_out" | sed 's/^/  /'
+        case $_out in
+        *http_code=401*) say "  判据    云上在听，且请求穿到了家里的 dsh web（它自己还要 token，所以回 401 原文）✓" ;;
+        *http_code=000*) warn "  判据    云上端口没通（隧道断了 / 云上没在听）" ;;
+        *) say "  判据    自己看上面的 http_code（401 = 到家里了；其它码看 hazards H11）" ;;
+        esac
+
+        _pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+        if [ -n "$_pub" ]; then
+            _cif=
+            [ -n "$_iface" ] && _cif="--interface $_iface"
+            # shellcheck disable=SC2086
+            _code=$(curl -sk $_cif -o /dev/null -w '%{http_code}' --max-time 10 "$_pub" 2>/dev/null || printf '000')
+            say "  公网    $_pub → HTTP $_code（不带密码应 401 = Caddy 在挡）"
+        fi
+    fi
+}
+
+cmd_systemd() { # 旧名字：保留，等价 tunnel-install --no-enable（以前就是"只生成不 enable"）
+    say "（旧名字）dsh-remote systemd = dsh-remote tunnel-install --no-enable"
+    say "  注意：单元名从 dsh-remote-tunnel.service 换成了 $UNIT_NAME（配置在 $CONF）"
+    cmd_tunnel_install --no-enable "$@"
 }
 
 # ------------------------------------------------------------------ 推送
@@ -602,7 +1015,22 @@ case ${1:-help} in
 status) cmd_status ;;
 serve) cmd_serve ;;
 tunnel) cmd_tunnel ;;
-systemd) cmd_systemd ;;
+tunnel-install)
+    shift
+    cmd_tunnel_install "$@"
+    ;;
+tunnel-uninstall)
+    shift
+    cmd_tunnel_uninstall "$@"
+    ;;
+tunnel-status)
+    shift
+    cmd_tunnel_status "$@"
+    ;;
+systemd)
+    shift
+    cmd_systemd "$@"
+    ;;
 url) cmd_url ;;
 notify-test) cmd_notify_test ;;
 notify-enable) cmd_notify_enable ;;
