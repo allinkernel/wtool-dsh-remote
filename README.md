@@ -106,6 +106,27 @@ SVG 的 `width`/`height` 与 PNG 一致（`viewBox` 用模块坐标，放大不�
 
 ---
 
+### 会话常驻与"开机就有会话"（2026-10-07 起）
+
+`harness` 现在**幂等**：
+
+```sh
+harness                      # 已经有会话在跑 → 直接复用（打印带 token 的地址 + 手机固定地址）
+                             # 没有会话、但装了常驻服务 → 交给 systemctl 起，然后打印地址
+                             # 都没有 → 还跟前台老行为一样（前台跑 dsh web，Ctrl-C 结束）
+
+dsh-remote serve-install     # 把 dsh web 装成 systemd --user 常驻：**开机自动开会话**
+dsh-remote serve-status      # 看：单元在不在 / 端口有没有人听 / token / 隧道
+dsh-remote serve-uninstall   # 撤掉常驻服务（**不动**正在跑的会话）
+```
+
+- 常驻服务用 `Restart=always` + **`RestartSec=30`**；**端口被别人占着（你手起的会话）时它不抢**，
+  每 30 秒试一次，等你那个会话结束再接管 —— **不会打断正在用的会话**。
+- 会话真正起来（抓到 token）之后，`dsh-web-run` 会自动
+  `systemctl --user try-restart dsh-tunnel.service`，把去阿里云的转发重连一次。
+- 想强制"再起一个前台会话"：`DSH_REMOTE_HARNESS_NO_REUSE=1 harness`。
+- 开机自启需要 `loginctl enable-linger <你>`（本机已开，实测不需要 sudo）。
+
 ## 3. 命令
 
 | 命令 | 作用 |

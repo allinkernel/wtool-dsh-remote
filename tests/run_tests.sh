@@ -1005,11 +1005,11 @@ mkdir -p "$TMP/kbin" "$TMP/kstate" "$TMP/kconf"
 cat >"$TMP/kbin/npx" <<'STUB'
 #!/bin/sh
 echo "booting the web profile…"
-echo "dsh web: http://127.0.0.1:3080/?token=Tok-123_abc (LAN: http://10.0.0.2:3080/?token=Tok-123_abc)"
+echo "dsh web: http://127.0.0.1:3085/?token=Tok-123_abc (LAN: http://10.0.0.2:3085/?token=Tok-123_abc)"
 sleep 1
 STUB
 chmod +x "$TMP/kbin/npx"
-printf 'public_url=https://entry.example:8443\n' >"$TMP/kconf/remote.conf"
+printf 'public_url=https://entry.example:8443\nlocal_port=3085\n' >"$TMP/kconf/remote.conf"
 for shname in bash zsh; do
     if ! command -v "$shname" >/dev/null 2>&1; then
         ok "没有 $shname，跳过它那份 env"
@@ -1019,6 +1019,7 @@ for shname in bash zsh; do
     [ -f "$envf" ] || envf="$proj/env.bash"
     rm -f "$TMP/kstate/current-token.txt" "$TMP/kstate/web-url.txt"
     PATH="$TMP/kbin:$PATH" DSH_REMOTE_STATE_DIR="$TMP/kstate" DSH_REMOTE_CONF_DIR="$TMP/kconf" \
+        DSH_REMOTE_HARNESS_NO_REUSE=1 \
         "$shname" -c ". '$envf'; harness --no-open" >"$TMP/k-$shname.out" 2>&1 &
     kpid=$!
     if wait_for_file "$TMP/kstate/current-token.txt"; then
@@ -1028,7 +1029,7 @@ for shname in bash zsh; do
     fi
     check "$shname：抓到的是行首那个 token（不是后面 LAN 那个）" "Tok-123_abc" \
         "$(cat "$TMP/kstate/current-token.txt" 2>/dev/null)"
-    check "$shname：web-url.txt 记的是回环那个地址" "http://127.0.0.1:3080/?token=Tok-123_abc" \
+    check "$shname：web-url.txt 记的是回环那个地址" "http://127.0.0.1:3085/?token=Tok-123_abc" \
         "$(cat "$TMP/kstate/web-url.txt" 2>/dev/null)"
     check_contains "$shname：把手机固定地址打出来了（读 remote.conf 的 public_url）" \
         "https://entry.example:8443" "$(cat "$TMP/k-$shname.out")"
@@ -1049,7 +1050,7 @@ chmod +x "$TMP/kbin/npx"
 printf 'OLD-TOKEN-from-running-instance\n' >"$TMP/kstate/current-token.txt"
 chmod 600 "$TMP/kstate/current-token.txt"
 PATH="$TMP/kbin:$PATH" DSH_REMOTE_STATE_DIR="$TMP/kstate" DSH_REMOTE_CONF_DIR="$TMP/kconf" \
-    bash -c ". '$proj/env.bash'; harness --no-open" >"$TMP/k-nocap.out" 2>&1
+    DSH_REMOTE_HARNESS_NO_REUSE=1 bash -c ". '$proj/env.bash'; harness --no-open" >"$TMP/k-nocap.out" 2>&1
 check "没抓到 token 时 harness 退出 0（不炸）" "0" "$?"
 check "没抓到 token：**旧 token 文件原样留着**（H22 那条教训）" "OLD-TOKEN-from-running-instance" \
     "$(cat "$TMP/kstate/current-token.txt" 2>/dev/null)"
@@ -1057,7 +1058,7 @@ check_contains "没抓到 token：打一行说明，别装没事" "没抓到 tok
 
 cat >"$TMP/kbin/npx" <<'STUB'
 #!/bin/sh
-echo "dsh web: http://127.0.0.1:3080/?token=Tok-123_abc (LAN: http://10.0.0.2:3080/?token=Tok-123_abc)"
+echo "dsh web: http://127.0.0.1:3085/?token=Tok-123_abc (LAN: http://10.0.0.2:3085/?token=Tok-123_abc)"
 sleep 1
 STUB
 chmod +x "$TMP/kbin/npx"
@@ -1443,6 +1444,93 @@ check_contains "拒绝时说清为什么（单引号）" "别用单引号" "$(ca
 
 # ⑦ help 里有这条命令
 check_contains "help 里有 passwd" "dsh-remote passwd" "$("$remote" help)"
+
+# ------------------------------------------------- O dsh web 常驻 + harness 复用
+printf 'O. dsh web 常驻：单元渲染 / 端口被占不抢 / harness 复用\n'
+
+# ① serve-install --dry-run 的单元内容（一个字节都不写）
+"$remote" serve-install --dry-run >"$TMP/o1.out" 2>&1
+check "serve-install --dry-run 退出码 0" "0" "$?"
+check_contains "ExecStart 跑 dsh-web-run" "dsh-web-run --port" "$(cat "$TMP/o1.out")"
+check_contains "Restart=always" "Restart=always" "$(cat "$TMP/o1.out")"
+check_contains "RestartSec=30（端口被占时别每 3 秒敲门）" "RestartSec=30" "$(cat "$TMP/o1.out")"
+check_contains "WantedBy=default.target（开机自启）" "WantedBy=default.target" "$(cat "$TMP/o1.out")"
+# 回归守卫：ExecStartPost 在"端口被占 → 本服务立刻退出 → 每 30 秒重试"里**也会跑**，
+# 于是隧道被反复重启、手机链路每 30 秒断一次（2026-10-07 实测踩到；重连已挪进 dsh-web-run）。
+if grep -q '^ExecStartPost=' "$TMP/o1.out"; then
+    bad "单元里不该有 ExecStartPost（会把隧道每 30 秒重启一次）" ""
+else
+    ok "单元里没有 ExecStartPost（重连只在真抓到 token 时做）"
+fi
+
+# ② dsh-web-run：假 npx → 抓 token；**退出后不删** token（服务语义）
+ostub="$TMP/ostub"
+mkdir -p "$ostub"
+cat >"$ostub/npx" <<'STUB'
+#!/bin/sh
+printf 'dsh web: http://127.0.0.1:3999/?token=OTOK (LAN: http://10.0.0.9:3999)\n'
+STUB
+chmod +x "$ostub/npx"
+os="$TMP/ostate"
+mkdir -p "$os"
+PATH="$ostub:$PATH" XDG_STATE_HOME="$os" DSH_REMOTE_CONF_DIR="$TMP/oconf" DSH_REMOTE_NO_TUNNEL_RESTART=1 \
+    sh "$proj/bin/dsh-web-run" --port 3999 >"$TMP/o2.out" 2>&1
+check "dsh-web-run 抓到 token 后正常退出" "0" "$?"
+check "token 文件内容" "OTOK" "$(cat "$os/dsh-remote/current-token.txt" 2>/dev/null)"
+check "web-url 文件内容" "http://127.0.0.1:3999/?token=OTOK" "$(cat "$os/dsh-remote/web-url.txt" 2>/dev/null)"
+check "退出后 token 文件还在（服务不删 token）" "yes" \
+    "$([ -s "$os/dsh-remote/current-token.txt" ] && echo yes || echo no)"
+
+# ③ dsh-web-run：端口被占 → 退出 1（让 systemd 按 RestartSec 重试）、不抢
+python3 -c 'import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",3998)); s.listen(1); time.sleep(25)' &
+opid=$!
+sleep 1
+PATH="$ostub:$PATH" XDG_STATE_HOME="$os" DSH_REMOTE_CONF_DIR="$TMP/oconf" \
+    sh "$proj/bin/dsh-web-run" --port 3998 >"$TMP/o3.out" 2>&1
+check "端口被占 → 退出 1" "1" "$?"
+check_contains "提示不去抢端口" "已经有会话在跑" "$(cat "$TMP/o3.out")"
+kill "$opid" 2>/dev/null || true
+wait "$opid" 2>/dev/null || true
+
+# ④ harness 复用分支：真监听一个端口 → 必须"复用"，不起第二个会话
+python3 -c 'import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("127.0.0.1",3997)); s.listen(1); time.sleep(25)' &
+hpid=$!
+sleep 1
+mkdir -p "$TMP/oconf2"
+printf 'local_port=3997\npublic_url=https://example.invalid:8443\n' >"$TMP/oconf2/remote.conf"
+printf 'OTOK2\n' >"$os/dsh-remote/current-token.txt"
+DSH_REMOTE_CONF_DIR="$TMP/oconf2" XDG_STATE_HOME="$os" \
+    sh -c '. "$1/env.bash"; harness' sh "$proj" >"$TMP/o4.out" 2>&1
+check "harness 复用分支退出码 0" "0" "$?"
+check_contains "明说是复用" "复用，没开新的" "$(cat "$TMP/o4.out")"
+check_contains "给出带 token 的本地地址" "token=OTOK2" "$(cat "$TMP/o4.out")"
+check_contains "给出手机固定地址" "example.invalid:8443" "$(cat "$TMP/o4.out")"
+check_contains "提示 serve-install" "serve-install" "$(cat "$TMP/o4.out")"
+kill "$hpid" 2>/dev/null || true
+wait "$hpid" 2>/dev/null || true
+
+# ⑤ 逃生阀：DSH_REMOTE_HARNESS_NO_REUSE=1 → 不去复用/不起服务（前台路）
+mkdir -p "$TMP/oconf3"
+printf 'local_port=3997\n' >"$TMP/oconf3/remote.conf"
+cat >"$ostub/npx" <<'STUB'
+#!/bin/sh
+printf 'dsh web: http://127.0.0.1:3996/?token=GUARD (LAN: http://10.0.0.9:3996)\n'
+STUB
+chmod +x "$ostub/npx"
+PATH="$ostub:$PATH" XDG_STATE_HOME="$os" DSH_REMOTE_CONF_DIR="$TMP/oconf3" \
+    DSH_REMOTE_HARNESS_NO_REUSE=1 DSH_REMOTE_NO_TUNNEL_RESTART=1 \
+    sh -c '. "$1/env.bash"; harness' sh "$proj" >"$TMP/o5.out" 2>&1
+check_contains "逃生阀 → 走前台（抓到 GUARD）" "已捕获 token" "$(cat "$TMP/o5.out")"
+
+# ⑥ serve-status 只读报告
+PATH="$ostub:$PATH" DSH_REMOTE_CONF_DIR="$TMP/oconf2" "$remote" serve-status >"$TMP/o6.out" 2>&1
+check "serve-status 退出码 0" "0" "$?"
+check_contains "报告里有 web 单元" "web 单元" "$(cat "$TMP/o6.out")"
+
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"

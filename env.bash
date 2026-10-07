@@ -49,7 +49,7 @@ harness() {
         printf 'harness：PATH 里没有 npx（这套用法是 npx @deepseek-ai/dsh web）\n' >&2
         return 127
     fi
-    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub _hr_mark
+    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub _hr_mark _hr_lp _hr_live _hr_i
     _hr_state=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
     _hr_tok=$_hr_state/current-token.txt
     _hr_url=$_hr_state/web-url.txt
@@ -60,6 +60,58 @@ harness() {
     rm -f -- "$_hr_mark" 2>/dev/null
     _hr_conf=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}/remote.conf
     mkdir -p -- "$_hr_state" 2>/dev/null
+
+    # ── ① 已经有会话在跑 → 复用（绝不起第二个）──────────────────────────────
+    _hr_lp=$(sed -n 's/^[[:space:]]*local_port[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+    [ -n "${_hr_lp}" ] || _hr_lp=3080
+    _hr_live=0
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -q "127.0.0.1:${_hr_lp} " && _hr_live=1
+    elif command -v curl >/dev/null 2>&1; then
+        curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${_hr_lp}/" 2>/dev/null && _hr_live=1
+    fi
+    # 逃生阀：DSH_REMOTE_HARNESS_NO_REUSE=1 → 不做"复用/交给服务"，就走下面的前台路。
+    # 用途：测试（用例要验前台抓 token）、以及"我就是想再起一个新的"这种特殊场合。
+    if [ "${DSH_REMOTE_HARNESS_NO_REUSE:-0}" = 1 ]; then _hr_live=0; fi
+    if [ "${_hr_live}" = 1 ]; then
+        printf '[dsh-remote] 已经有会话在 127.0.0.1:%s 上跑 —— 复用，没开新的\n' "${_hr_lp}"
+        if [ -s "$_hr_tok" ]; then
+            printf '[dsh-remote] 带 token 的本地地址：http://127.0.0.1:%s/?token=%s\n' \
+                "${_hr_lp}" "$(tr -d '\n' <"$_hr_tok")"
+        elif [ -s "$_hr_url" ]; then
+            printf '[dsh-remote] 本地地址：%s\n' "$(cat "$_hr_url")"
+        else
+            printf '[dsh-remote] （没记下 token：那个会话不是这里起的；手机入口用固定地址即可）\n'
+        fi
+        _hr_pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+        [ -n "${_hr_pub}" ] && printf '[dsh-remote] 手机固定地址：%s\n' "${_hr_pub}"
+        printf '[dsh-remote] 想让它开机自动开会话：dsh-remote serve-install\n'
+        return 0
+    fi
+
+    # ── ② 装了 dsh-web.service 但没跑 → 起来（后台常驻，退出 shell 也不停）────
+    if [ "${DSH_REMOTE_HARNESS_NO_REUSE:-0}" != 1 ] && command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user cat dsh-web.service >/dev/null 2>&1; then
+        printf '[dsh-remote] 交给常驻服务 dsh-web.service …\n'
+        # --no-block：服务是 Type=simple，若端口被别的会话占着它会立刻退出并等重试，
+        # 同步 start 会把那种情况报成"失败"（其实 systemd 正在按 RestartSec 重试）。
+        systemctl --user start --no-block dsh-web.service 2>/dev/null || true
+        _hr_i=0
+        while [ "${_hr_i}" -lt 20 ]; do
+            [ -s "$_hr_url" ] && break
+            sleep 1
+            _hr_i=$((_hr_i + 1))
+        done
+        if [ -s "$_hr_url" ]; then
+            printf '[dsh-remote] 本地地址：%s\n' "$(cat "$_hr_url")"
+        else
+            printf '[dsh-remote] 还没写出地址（可能端口被别的会话占着，服务会每 30 秒重试）\n'
+            printf '[dsh-remote] 看：journalctl --user -u dsh-web.service -n 20\n'
+        fi
+        _hr_pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+        [ -n "${_hr_pub}" ] && printf '[dsh-remote] 手机固定地址：%s\n' "${_hr_pub}"
+        return 0
+    fi
 
     npx @deepseek-ai/dsh web "$@" 2>&1 | while IFS= read -r _hr_line; do
         case $_hr_line in

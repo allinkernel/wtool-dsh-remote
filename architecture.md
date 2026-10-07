@@ -127,7 +127,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：23 个子命令的真实行为
+## 3. `bin/dsh-remote`：26 个子命令的真实行为
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -349,6 +349,34 @@ compose，命令还是折行的、只复制了半行" → 做成一条命令（A
 `--dry-run` 只打印这五步。网卡绕开本机代理用 `DSH_REMOTE_IFACE=eth1`（同 §11）。
 
 ---
+
+
+### 3.5 dsh web 常驻：`dsh-web.service` + `dsh-web-run` + `harness` 三步（2026-10-07 加）
+
+**谁在跑会话**：`~/.config/systemd/user/dsh-web.service`（`WantedBy=default.target`，配 linger → 开机自启）：
+
+```
+ExecStart=/usr/bin/sh <项目>/bin/dsh-web-run --port <local_port>
+Restart=always
+RestartSec=30          # 端口被手起的会话占着时，不必每 3 秒去敲门
+```
+
+`bin/dsh-web-run`：前台跑 `npx @deepseek-ai/dsh web "$@"`，边转发输出边抓
+`dsh web: http://…?token=…` 那行的 token，写 `current-token.txt` / `web-url.txt`（600）；
+**退出不删** token（服务语义；重启覆盖）。它还在**真抓到 token 之后**做一次
+`systemctl --user try-restart dsh-tunnel.service` —— 这就是"会话起来后自动重连阿里云转发"。
+端口已有人听 → 打印说明并 **exit 1**（让 systemd 按 `RestartSec=30` 重试，绝不抢）。
+
+**`harness`（env.zsh / env.bash，两份逐字相同）三步**：
+
+| 顺序 | 条件 | 行为 |
+|---|---|---|
+| ① | `local_port` 已有人听（`ss`，没有 `ss` 就用 `curl`） | **复用**：打印带 token 的本地地址 + `public_url` + 提示 `serve-install`；**不起第二个** |
+| ② | 没人在听，但 `dsh-web.service` 已装 | `systemctl --user start --no-block` 交给它，最多等 20s 拿 `web-url.txt`，打印地址/固定地址 |
+| ③ | 上面都不成立 | 退回**原来**的前台行为（`npx dsh web` + 抓 token + 退出时清 token） |
+
+逃生阀：`DSH_REMOTE_HARNESS_NO_REUSE=1` → 跳过 ①②，永远走 ③（测试用它验前台抓 token；
+"我就是想再起一个"也用这个）。相关命令：`serve-install` / `serve-status` / `serve-uninstall`。
 
 ## 4. `cloud-install`：会碰云上那台机器的唯一子命令
 

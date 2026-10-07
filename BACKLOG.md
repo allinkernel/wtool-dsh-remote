@@ -583,3 +583,28 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
   `zsh -n env.zsh` / `bash -n env.bash` 过；`sh tests/run_tests.sh` 全绿。
 - **注意**：这会让用户 `.zshrc` 里那条别名失效（这正是项目文档要求的口径：
   "别名优先于函数，先 unalias"）；用户若要保留别名，把这两行删掉即可。
+
+## ✅ 2026-10-07：dsh web 常驻化（开机自启）+ `harness` 复用 + 起来后重连隧道
+
+- **需求**（用户原话）：开机自动执行 harness 开会话；后续执行**复用**老会话、不再开新的；
+  `dsh-remote` 在 harness 启动后**自动触发重连**阿里云转发。
+- **做了什么**：
+  1. 新 `bin/dsh-web-run`（给 systemd 的包装：跑 dsh web + 抓 token + **退出不删 token**；
+     端口被占 → exit 1 让 systemd 重试；**真抓到 token 后**才 `try-restart dsh-tunnel.service`）；
+  2. 新子命令 `serve-install` / `serve-status` / `serve-uninstall` → 单元
+     `~/.config/systemd/user/dsh-web.service`（`Restart=always`、`RestartSec=30`、`WantedBy=default.target`）；
+  3. `harness`（env.zsh/env.bash 逐字相同）改成三步：**① 复用 ② 交给服务 ③ 回退前台**；
+     逃生阀 `DSH_REMOTE_HARNESS_NO_REUSE=1`。
+- **踩到的坑（H24）**：第一版把重连写成单元的 `ExecStartPost` —— "端口被占→服务立刻退出→每 30 秒重试"
+  时它**也会跑**，于是隧道被反复重启、手机链路每 30 秒断一次（实测看到隧道 `ActiveEnterTimestamp`
+  被刷新）。重连挪进 `dsh-web-run`，并加**回归守卫**（O 节断言单元里没有行首 `ExecStartPost=`）。
+- **验证**（真机 + 测试）：
+  - 真机：`harness` 在活会话下 → 立刻打印"复用"、rc=0、**没起新进程**；
+    `serve-install` → 单元写好并 enable（`default.target.wants` 有软链）、服务因端口被占进入
+    `activating`（每 30s 重试）；你正在用的会话**全程没被碰**；隧道 `NRestarts=0`（两次采样、间隔 32s）。
+  - 测试：**420 通过 / 0 失败**（原 400 + 新 O 节 20 条：单元渲染/ExecStartPost 回归守卫/
+    dsh-web-run 抓 token 且不删/端口被占 exit 1/harness 复用分支/逃生阀/serve-status）。
+  - ⚠️ 老 K 节用例原来**依赖"本机 3080 没人听"**（碰巧过的）：已把夹具改到 3085 并显式加逃生阀。
+- **可重跑判据**：`sh tests/run_tests.sh`（应 420/0）；真机 `harness`（有会话时应打印"复用"）；
+  `dsh-remote serve-status`。
+- **没验的**：真·重启机器后的自动恢复（要等下次重启）、服务接管那一刻（需要那个手起会话先结束）。

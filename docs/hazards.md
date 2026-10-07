@@ -880,3 +880,22 @@ grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run
 **验证程度**：真机 + 本机各 1 次（用户先踩到，2026-10-07 修完在本机 dry-run 复现过
 "抽出来再跑=0"）。**教训（通用）**：**给用户复制的命令，永远只有一行、参数给全**；
 把分支判断留在脚本里，别留在文档里让人挑。
+
+## H24. systemd 的 `ExecStartPost` 在"起来就退出"的失败尝试里**也会跑**
+
+- **现象**：给 `dsh-web.service` 写了 `ExecStartPost=-systemctl --user try-restart dsh-tunnel.service`，
+  想表达"会话起来后重连隧道"。但端口被手起的会话占着时，这个服务每 30 秒重试一次、
+  每次都立刻退出 —— 而**每次尝试都会执行 `ExecStartPost`** → 隧道被每 30 秒重启一次，手机链路跟着断。
+- **判据（怎么看出来）**：
+  ```sh
+  systemctl --user show dsh-tunnel.service -p NRestarts -p ActiveEnterTimestamp
+  # 每隔半分钟采样两次：ActiveEnterTimestamp 在往前跳 = 隧道被反复重启
+  journalctl --user -u dsh-web.service -n 20   # 能看到 Main process exited, status=1/FAILURE 后又被拉起
+  ```
+- **修法**：把"会话起来之后才该做的事"放到**主进程自己能判断的地方**（这里是
+  `bin/dsh-web-run` 抓到 token 之后），**不要**用 `ExecStartPost` 表达。
+  另加回归守卫：渲染出的单元里不许出现行首 `ExecStartPost=`（`tests/run_tests.sh` O 节）。
+- **验证程度**：实测复现 1 次（2026-10-07）、修完再采样两次确认 `NRestarts=0`、时间戳不动。
+- **`Type=` 的语义**：`Type=simple` 时"启动完成"= fork 完成，所以主进程随即退出也算"起来过"，
+  这正是 `ExecStartPost` 会跑的窗口。要"进程真的活了才算起来"得用 `Type=exec` + 健康检查，
+  本项目的做法是让**脚本内部**判断。

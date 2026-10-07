@@ -8,6 +8,10 @@
 #   dsh-remote tunnel-uninstall 撤掉它（disable --now + 删单元文件）
 #   dsh-remote tunnel-status   看单元/进程/云上隧道口/公网的现状（--probe 上云只读检查）
 #   dsh-remote token-broker    前台跑"把 / 302 到当前 token"的小服务（常驻用 broker-install）
+#   dsh-remote serve-install   把 dsh web 装成 systemd --user 常驻（开机自动开会话；
+#                              端口被别人占着时不抢，等它结束再接管）
+#   dsh-remote serve-status    看 web 服务 / 端口 / token / 隧道 的现状
+#   dsh-remote serve-uninstall 撤掉 web 常驻服务（不动正在跑的会话）
 #   dsh-remote broker-install  把 token broker 装成 systemd --user 常驻（手机固定地址靠它）
 #   dsh-remote broker-uninstall 撤掉它
 #   dsh-remote systemd         旧名字：只生成单元、不 enable（= tunnel-install --no-enable）
@@ -756,6 +760,142 @@ SyslogIdentifier=dsh-token-broker
 [Install]
 WantedBy=default.target
 EOF
+}
+
+# ---------------------------------------------------------------- dsh web 常驻（systemd --user）
+#   开机自动开会话；`harness` 会优先复用它（有服务就不再前台起第二个）。
+#   端口被占（用户手起的 harness/serve 还在跑）→ dsh-web-run 退出 1，
+#   systemd 按 RestartSec=30 重试 —— 等那个会话结束它自然接管，绝不打断人家。
+SERVE_UNIT_NAME=dsh-web.service
+serve_unit_file() { printf '%s/%s' "$(unit_dir)" "$SERVE_UNIT_NAME"; }
+serve_unit_body() {
+    _run=$SELF_DIR/dsh-web-run
+    [ -f "$_run" ] || die "找不到 $_run（wtool install 过吗？）"
+    _sh=$(command -v sh 2>/dev/null || printf '/bin/sh')
+    tunnel_conf
+    cat <<EOF
+[Unit]
+Description=DSH web（家里的 dsh 会话；开机自动起，端口被占时等它空出来）
+Documentation=file:$PROJ_DIR/README.md
+StartLimitIntervalSec=0
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$(sd_quote "$_sh") $(sd_quote "$_run") --port $(sd_quote "$local_port_v")
+# ⚠️ 这里**不要**放 ExecStartPost 去 try-restart 隧道：端口被占时本服务会每 30 秒
+#    重试一次，而 ExecStartPost 在那种"起来就退出"的尝试里也会跑 → 隧道被反复重启，
+#    手机链路每 30 秒断一次（2026-10-07 实测踩到）。重连改在 dsh-web-run 里：
+#    **只有真抓到 token（会话确实起来了）** 才 try-restart 隧道。
+Restart=always
+# 30 秒：端口被手起的会话占着时，不必每 3 秒去敲一次门
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-web
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+cmd_serve_status() {
+    uf=$(serve_unit_file)
+    say "web 单元      $uf"
+    if [ -f "$uf" ]; then
+        say "  已装        是（enabled=$(systemctl_user is-enabled "$SERVE_UNIT_NAME" 2>/dev/null || printf '未知') / active=$(systemctl_user is-active "$SERVE_UNIT_NAME" 2>/dev/null || printf '未知')）"
+    else
+        say "  已装        否（装：dsh-remote serve-install）"
+    fi
+    tunnel_conf
+    if port_listening "$local_port_v"; then
+        say "端口         127.0.0.1:$local_port_v 有人在听"
+    else
+        say "端口         127.0.0.1:$local_port_v 没人听"
+    fi
+    if [ -s "$(token_file)" ]; then
+        say "token        有（$(token_file)，$(wc -c <"$(token_file)" | tr -d ' ') 字节）"
+    else
+        say "token        没有（broker 会回 503）"
+    fi
+    say "隧道         $(systemctl_user is-active dsh-tunnel.service 2>/dev/null || printf '未装/未跑')"
+    say "固定地址     $(conf_any public_url PUBLIC_URL 2>/dev/null || printf '（remote.conf 里没写）')"
+}
+
+cmd_serve_install() {
+    _dry=0
+    _no_enable=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --dry-run) _dry=1; shift ;;
+        --no-enable)
+            _no_enable=1
+            shift
+            ;;
+        *) die "serve-install 不认识的参数：$1（--dry-run / --no-enable）" ;;
+        esac
+    done
+    tunnel_conf
+    uf=$(serve_unit_file)
+    say "dsh web       127.0.0.1:${local_port_v}（开机自动起；端口被占就不抢，等它空出来）"
+    say "跑什么        $SELF_DIR/dsh-web-run --port $local_port_v"
+    say "单元          $uf（Restart=always，RestartSec=30）"
+    say "起来之后      自动 try-restart dsh-tunnel.service（重连阿里云那条）"
+    say ""
+    if [ "$_dry" = 0 ] && [ "$_no_enable" = 0 ] && ! systemd_user_ok; then
+        warn "systemctl --user 连不上用户管理器（systemd --user 没在跑）。"
+        warn "  loginctl enable-linger $(id -un)    # 没登录时也跑用户服务（本机实测不需要 sudo）"
+        die "什么都没动"
+    fi
+    _tmp=$(mktemp) || die "mktemp 失败"
+    serve_unit_body >"$_tmp" || {
+        rm -f -- "$_tmp"
+        die "渲染 web 单元失败"
+    }
+    if [ "$_dry" = 1 ]; then
+        say "== --dry-run：单元内容如下（一个字节都没写）"
+        cat -- "$_tmp"
+        rm -f -- "$_tmp"
+        return 0
+    fi
+    _changed=1
+    if unit_write "$uf" "$_tmp"; then
+        say "单元内容没变：$uf"
+        _changed=0
+    fi
+    rm -f -- "$_tmp"
+    if [ "$_no_enable" = 1 ]; then
+        say "--no-enable：只写了单元。自己来：systemctl --user daemon-reload && systemctl --user enable --now $SERVE_UNIT_NAME"
+        return 0
+    fi
+    unit_enable "$SERVE_UNIT_NAME" "$_changed" || return 1
+    sleep 2
+    _st=$(systemctl_user is-active "$SERVE_UNIT_NAME" 2>/dev/null || true)
+    say ""
+    say "状态          ${_st:-未知}"
+    if port_listening "$local_port_v"; then
+        say "注意          127.0.0.1:$local_port_v 现在有人在听（可能是你手起的会话）。"
+        say "              服务不会去抢；每 30 秒试一次，等那个会话结束就自动接管。"
+        say "              现在正在跑的那个会话**不受影响**（没被重启）。"
+    fi
+    say "看日志        journalctl --user -u $SERVE_UNIT_NAME -f"
+    say "体检          dsh-remote serve-status"
+}
+
+cmd_serve_uninstall() {
+    uf=$(serve_unit_file)
+    say "撤掉 web 常驻服务：$SERVE_UNIT_NAME（正在跑的会话**不动**）"
+    if systemd_user_ok; then
+        systemctl_user disable --now "$SERVE_UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$uf" ]; then
+        _bak="$uf.bak-$(date +%Y%m%d-%H%M%S)"
+        mv -f -- "$uf" "$_bak" && say "单元移走：$_bak"
+    else
+        say "单元本来就不在"
+    fi
+    if systemd_user_ok; then systemctl_user daemon-reload >/dev/null 2>&1 || true; fi
+    say "完事。复查：systemctl --user list-unit-files | grep dsh"
 }
 
 cmd_token_broker() { # 前台跑 broker（常驻用 broker-install；这条留着手工调试）
@@ -1819,6 +1959,13 @@ broker-uninstall)
     shift
     cmd_broker_uninstall "$@"
     ;;
+serve-install)
+    shift
+    cmd_serve_install "$@"
+    ;;
+serve-uninstall) cmd_serve_uninstall ;;
+serve-status) cmd_serve_status ;;
+
 systemd)
     shift
     cmd_systemd "$@"

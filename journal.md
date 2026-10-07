@@ -432,3 +432,14 @@ SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/�
 - 测试：D 节 +7（抽 `HINT-CMD` 复跑 `--dry-run`，验参数没掉、上游端口一致）、L 节 +5、
   **新 N 节 22**（passwd 正常路径 + docker 不可用 / 哈希算不出 / 密码带单引号 三条失败路径）。
   全量 **400 通过 0 失败**。
+
+## 2026-10-07（下午，续）：dsh web 常驻化 + harness 复用 + 起来后重连隧道
+
+- 用户要求：开机自动开会话、后续 `harness` 复用老会话、harness 起来后自动重连阿里云转发。
+- 新增 `bin/dsh-web-run`、`dsh-remote serve-install|serve-status|serve-uninstall`；
+  `harness` 改三步（复用 / 交给服务 / 回退前台）+ 逃生阀 `DSH_REMOTE_HARNESS_NO_REUSE`。
+- **实测教训（H24）**：重连不能放 `ExecStartPost`（失败重试里也会跑 → 隧道每 30 秒被重启）；
+  改到 `dsh-web-run` 抓 token 之后，并加 O 节回归守卫。
+- 老 K 节 7 条用例被这次改动暴露：它们**碰巧**依赖"本机 3080 没人听"；夹具改到 3085 + 显式逃生阀。
+- 测试 400 → **420 通过 0 失败**。真机验证：复用分支 rc=0 不起新进程；服务 enable 后在
+  `activating` 等端口；活会话与隧道均未被打断（`NRestarts=0`）。

@@ -1,0 +1,94 @@
+#!/bin/sh
+# dsh-web-run —— `dsh web` 的常驻包装（给 systemd --user 用，`harness` 也会复用它）。
+#
+# 为什么要它：`npx @deepseek-ai/dsh web` 自己会起会话并打印一行带 token 的 URL，但
+#   * 前台跑 → 关掉终端会话就没了；
+#   * 没人把那个 token 记下来 → 云上 broker 没法 302（手机入口 503）。
+# 它做两件事：把 dsh web 跑在**前台**（systemd 才看得到进程），并把输出里的
+# `dsh web: http://…?token=…` 解析出来写进 state 目录。
+#
+# 与 env.zsh/env.bash 里 `harness` 函数的区别：**退出时不删 token 文件**
+# —— 服务是要一直活着的；重启服务会重新抓一次、覆盖旧 token。
+#
+# 用法：dsh-web-run [dsh web 的原生参数…]     例：dsh-web-run --port 3080
+set -u
+
+STATE_DIR=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
+TOK_FILE=$STATE_DIR/current-token.txt
+URL_FILE=$STATE_DIR/web-url.txt
+CONF_DIR=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}
+CONF=$CONF_DIR/remote.conf
+
+mkdir -p -- "$STATE_DIR" 2>/dev/null
+: >"$STATE_DIR/dsh-web-run.log" 2>/dev/null
+
+log() { printf '[dsh-web-run] %s\n' "$*"; }
+
+# ── 端口被占 = 已经有一个会话在跑：不要去抢，退出（systemd 会按 RestartSec 再来）────
+# 这条是有意的：用户在终端里手起的 harness/serve 不该被开机服务打断。
+# 等那个会话结束，服务下一次重试就会接管。
+PORT=3080
+_prev=
+for _a in "$@"; do
+    [ "$_prev" = "--port" ] && PORT=$_a
+    case $_a in --port=*) PORT=${_a#--port=} ;; esac
+    _prev=$_a
+done
+if [ -f "$CONF" ]; then
+    _lp=$(sed -n 's/^[[:space:]]*local_port[[:space:]]*=[[:space:]]*//p' "$CONF" | tail -n 1)
+    [ -n "$_lp" ] && PORT=$_lp
+fi
+_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT "
+    else
+        curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null
+    fi
+}
+if _listening; then
+    log "127.0.0.1:$PORT 已经有会话在跑（大概是手起的 harness/serve）。"
+    log "  不去抢端口 —— 等它结束我再接管；exit 1 让 systemd 按 RestartSec 重试。"
+    exit 1
+fi
+
+command -v npx >/dev/null 2>&1 || {
+    log 'PATH 里没有 npx（这套用法是 npx @deepseek-ai/dsh web）'
+    exit 127
+}
+
+log "启动：npx @deepseek-ai/dsh web $*（token 会写进 $TOK_FILE）"
+
+# npx 的输出边转发边解析。注意：**不要 exec**，exec 了就没有循环去抓 token 了。
+npx @deepseek-ai/dsh web "$@" 2>&1 | while IFS= read -r line; do
+    case $line in
+    *'dsh web: http'*)
+        # 那行长这样：dsh web: http://127.0.0.1:3080/?token=XXXX (LAN: …)
+        # 用 tr 切词后取**第一个**带 token 的 http URL —— 别用贪婪正则，会抓到行尾的 LAN 地址。
+        u=$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n '/^http:\/\/.*[?&]token=/p' | head -n 1)
+        case $u in
+        *token=*)
+            tok=${u##*token=}
+            printf '%s\n' "$tok" >"$TOK_FILE" && chmod 600 -- "$TOK_FILE" 2>/dev/null
+            printf '%s\n' "$u" >"$URL_FILE" && chmod 600 -- "$URL_FILE" 2>/dev/null
+            log "已捕获 token → $TOK_FILE"
+            pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null | tail -n 1)
+            [ -n "$pub" ] && log "手机固定地址：$pub（broker 会补 token）"
+            # 会话真的起来了 → 把去阿里云的隧道重连一次（这就是"harness 启动后自动触发重连"）。
+            # 放在这里而不是 systemd 的 ExecStartPost：只有**真起来**才重连，
+            # 端口被占的失败尝试不会去动隧道（2026-10-07 实测教训）。
+            if [ "${DSH_REMOTE_NO_TUNNEL_RESTART:-0}" != 1 ] && command -v systemctl >/dev/null 2>&1; then
+                if systemctl --user try-restart dsh-tunnel.service >/dev/null 2>&1; then
+                    log '已重连阿里云隧道（try-restart dsh-tunnel.service）'
+                else
+                    log '（隧道 try-restart 没成功；它自己的 Restart=always 会兜住）'
+                fi
+            fi
+            ;;
+        esac
+        ;;
+    esac
+    printf '%s\n' "$line"
+done
+
+# 走到这里说明 npx 退出了（systemd 的 Restart=always 会再拉起我们）。
+log 'dsh web 退出了（systemd 会按 Restart=always 重启；前台跑的话就是正常结束）'
