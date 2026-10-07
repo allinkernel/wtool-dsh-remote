@@ -18,8 +18,8 @@
 
 | # | 状态 | 事项 | 一句话 |
 |---|---|---|---|
-| U1 | 🟡 | **真机端到端**（往下拆成 U2/U3/U5） | 2026-10-07 中继在真阿里云上**装成并验到"经 Caddy 打到家里的 dsh web"**；还差安全组放行 + 真手机打开 |
-| U2 | 🟡 | **云端落地步骤** | IP 模式已在真机跑通（`--no-compose` 用户空间模式）；**安全组 8443 仍未放行**（用户自己在控制台点，见下） |
+| U1 | 🟢 | **真机端到端**（往下拆成 U2/U3/U5） | 2026-10-07 中继在真阿里云上装成，**从家里经公网 8443 已经走通到家里的 dsh web**；还差真手机打开（带 token） |
+| U2 | 🟢 | **云端落地步骤** | IP 模式已在真机跑通（`--no-compose` 用户空间模式）；**8443 从外面已经能连**（11:52 还连不上、12:03 通了，见下面那节） |
 | U3 | 🟡 | **隧道常驻 / 断线重连** | 2026-10-07 在家里用 tmux 起了 `ssh -N -R`，从云上验到 18080 通；**常驻/重连时长仍未做**（本机没 autossh） |
 | U4 | ⏸ | **钩子桥未证实会触发** | `check-hooks` 复查：触发 → 0，没触发 → 1；两条出路要用户选 |
 | U5 | ⬜ | **要 docker 的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；**假绿已修**（没 docker → `exit 77`），但"要不要让 D 节也显式挡 docker"仍待定 |
@@ -51,20 +51,38 @@
 | 5 | 再试 `caddy:2.11.4` | ❌ **还是失败**：不是配置错，是**没有 SNI 就选不出证书**（`internal error`）→ 第 4 步的 `default_sni` 修的就是这个 |
 | 6 | 把改完的 `cloud/` 传上去，用**项目自己的脚本**重装：<br>`sh relay.sh --ip 123.56.158.212 --port 8443 --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'` | ✅ **装成**：容器 `dsh-relay` Up（`caddy:2.11.4`，`--restart unless-stopped`）；脚本自检打印 `https 入口：401（basic auth 在挡着）✓` 和 `隧道出口：401 ✓` |
 | 7 | 家里在 tmux（会话 `dsh-tunnel`）里起 `ssh -N -T -E /tmp/dsh-tunnel.log -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -R 127.0.0.1:18080:127.0.0.1:3080 mindul@123.56.158.212` | ✅ 云上 `127.0.0.1:18080` 开始听；经 Caddy 带密码访问，**回的是家里 dsh web 的 401 原文**（`dsh web authentication required; reopen the URL printed by dsh web.`）→ 证明反代真的到了家里 |
-| 8 | 从家里打公网 `https://123.56.158.212:8443/` | ❌ **超时**（绑到 eth1 绕开本机 Clash 后 40s 无连接；同一路径打 80 端口 0.03s 就 200）→ **安全组没放行 8443**（见下） |
+| 8 | 从家里打公网 `https://123.56.158.212:8443/` | ❌ **11:52 时超时**（绑到 eth1 绕开本机 Clash 后 40s 无连接；同一路径打 80 端口 0.03s 就 200）→ 当时判定**安全组没放行 8443** |
+| 9 | **12:03 复测同一条路径** | ✅ **通了**：连打 3 次都是 `connect≈0.02s / 401`；带密码拿到的 body 是**家里 dsh web 的 401 原文**；不带密码是 `401 + WWW-Authenticate: Basic realm="restricted"`（Caddy 在挡）→ **从公网到家里这条链路已经完整走通** |
+
+**关于第 8→9 步的变化**：中间没有人通知改了什么东西，**助手没有动安全组 / 防火墙**（那是禁区）。
+两次观测都是同一条命令、同一条路径（`curl -sk --interface eth1`，SO_BINDTODEVICE 绕开本机 Clash TUN），
+差别只在时间 —— 结论只能写到这一步：**11:52 时外面连不上、12:03 时外面能连上**
+（大概率是用户自己在阿里云控制台把 8443 放行了；助手没有见证这个动作）。
+所以"安全组"这条**按"已放行"记**，但**没人核对过控制台里的规则原文**（来源段是不是只放了手机出口 IP，不知道）。
 
 **密码落在哪**：云上 `/home/mindul/dsh-relay/relay-password.txt`（**600**，里面有 URL / 用户名 /
 密码，以及"怎么改密码"三步）。仓库里没有密码（`git ls-files` 可验）。
 
-**⬜ 还差的一步（要用户自己在阿里云控制台点，助手不许动安全组）**：
-**放行 8443/tcp**。判据：本机 401/200 只说明"中继+隧道"好；**从外面连不上才是安全组**。
-放行后从家里应该看到 `curl -sk -u dsh:<pw> https://123.56.158.212:8443/` 返回家里的那个 401
-（而不是超时）。⚠️ 那台宿主上 `ufw.service` 是 active、但 `/etc/ufw/ufw.conf` 写着 `ENABLED=no`
-—— 非特权读不出实际规则，真放行后要是还不通，再让用户看一眼
-`sudo ufw status verbose` / `sudo iptables -S INPUT`（**助手不碰**）。
+**✅ 已经能用的判据**（2026-10-07 12:03 从家里实测）：
 
-**还没做的**：真手机打开（要用户拿手机 + 带 token 的地址）；域名模式（`--domain`）一次没跑过；
-安全组/防火墙的真实状态；隧道断线重连时长。
+```sh
+# 不带密码 → Caddy 的 401（有 WWW-Authenticate: Basic realm="restricted"）
+curl -sk -D - -o /dev/null https://123.56.158.212:8443/
+# 带密码 → 401 + 家里 dsh web 的原文（说明反代真的到了家里）
+curl -sk -u dsh:<pw> https://123.56.158.212:8443/
+#   → dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+⚠️ **必须是 https**：8443 上只有 TLS，`http://123.56.158.212:8443` 实测回 **400**。
+
+**⬜ 还差的最后一步（只有用户能做）**：手机上打开
+`https://123.56.158.212:8443` → 过自签证书警告 → 输 basic auth（`dsh` / 见上面那个文件）
+→ **再贴一次 `dsh web` 打印的带 token 地址**（token 只在用户浏览器的地址栏里；
+这台实例不是 `dsh-remote serve` 起的，`~/.local/state/dsh-remote/web-url.txt` 是空的）。
+带 token 之后能不能出界面、流式刷新正不正常 —— **没验过**。
+
+**还没做的**：真手机打开（上面那条）；域名模式（`--domain`）一次没跑过；
+安全组规则原文没人核对；隧道断线重连时长；隧道常驻（现在只有 tmux）。
 
 ---
 
