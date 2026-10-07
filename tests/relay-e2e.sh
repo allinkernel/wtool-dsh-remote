@@ -32,9 +32,10 @@ bad() {
     return 0
 }
 
+# 没有 docker = **没测**，不是"通过"：77 是跳过码（H8）。
 command -v docker >/dev/null 2>&1 || {
-    echo "没有 docker，跳过（这条是人工跑的 e2e）"
-    exit 0
+    echo "没有 docker，跳过（这条是人工跑的 e2e；exit 77 = 跳过码，不是通过）"
+    exit 77
 }
 
 pick_port() {

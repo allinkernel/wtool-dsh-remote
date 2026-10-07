@@ -248,6 +248,31 @@ rm -rf "$d"
 
 **验证程度**：本轮实测（PATH shim 复现 + 只读的 `docker images` / `docker ps -a` 确认）。
 
+**✅ 订正（2026-10-07，用户批准"按建议改" → 代码已改，以本段为准）**：
+
+上面「现象 / 根因 / 修法」是当时的记录，**现在两句都不成立了**：
+
+1. 两个 docker 脚本的"没 docker"分支已改成 **`exit 77`**（跳过码）：
+   `tests/caddy-validate.sh`、`tests/relay-e2e.sh`。77 是 autotools 的老约定，
+   放进 CI / `&&` 链里不会被当成通过。
+2. `tests/run_tests.sh` 文件头已改成"**不联网、不碰真 `$HOME`**"，另起一段明说
+   "**它会碰 docker**：装了 docker 时 D 节经 `relay.sh --dry-run` 真跑
+   `docker run --rm caddy:2 caddy validate`"。D 节的行为**没变**（仍然是本机有 docker
+   就会跑，没有就跳过校验），只是把话说明白了 —— 要不要让 D 节显式挡 docker，
+   归 `BACKLOG.md` U5 里那条"要不要"继续待定。
+
+**订正后的判据 / 复现**（同一条 shim，rc 从 0 变 77）：
+
+```sh
+d=$(mktemp -d)
+for t in mktemp rm sed cat grep printf echo pwd dirname id cut awk; do ln -sf "$(command -v $t)" "$d/$t"; done
+PATH="$d" /bin/sh tests/caddy-validate.sh; echo $?   # → 没有 docker，跳过 / 77（2026-10-07 实测）
+PATH="$d" /bin/sh tests/relay-e2e.sh;     echo $?   # → 没有 docker，跳过 / 77（2026-10-07 实测）
+rm -rf "$d"
+```
+
+**验证程度**：2026-10-07 实测 1 次（两个脚本都 rc=77）；`sh tests/run_tests.sh` → 185 通过 0 失败。
+
 ---
 
 ## H9. `dsh-remote status` 的"推送还没配"提示指向旧路径
@@ -275,6 +300,18 @@ T=$(mktemp -d); DSH_REMOTE_HOME=$T sh bin/dsh-remote status | grep 推送; rm -r
 ```
 
 **验证程度**：本轮实测 1 次。
+
+**✅ 订正（2026-10-07，用户批准"按建议改" → 代码已改，以本段为准）**：
+提示已改成 `$CONF_DIR/notify.conf`（即远端解析出来的落点，默认
+`~/.config/dsh-remote/notify.conf`），不再写死 `~/.dsh/notify.conf`。
+
+```sh
+T=$(mktemp -d); DSH_REMOTE_HOME=$T sh bin/dsh-remote status | grep 推送; rm -rf "$T"
+# 现在输出：推送       还没配（照 notify.conf.example 写 <$CONF_DIR>/notify.conf）
+```
+
+回归测试加在 `tests/run_tests.sh` E 节两条：提示里要出现 `$DSH_REMOTE_HOME/notify.conf`、
+且**不许**再出现 `~/.dsh/notify.conf`。
 
 ---
 
@@ -304,6 +341,29 @@ sh bin/dsh-remote help | tail -4
 后半句截断了（**不越界**，但少两行说明）。
 
 **验证程度**：本轮实测 1 次。
+
+**✅ 订正（2026-10-07，用户批准"按建议改" → 代码已改，以本段为准）**：
+
+两处 `usage()` 都改成**算范围**，不再写死行号：
+
+```sh
+awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" | sed 's/^# \{0,1\}//'
+```
+
+跳过 shebang，从第 2 行起**连着**以 `#` 开头的都打，碰到第一条正文就停。
+`dsh-remote help` 现在正好停在注释块末行（`安全边界、威胁模型、…见同目录 README.md。`），
+`dsh-notify --help` 现在带到"退出码永远是 0"那段的末句（`失败只写一行到 …notify.log。`）。
+
+⚠️ **订正过程中踩到的新坑（同一条 H10 的补记，别重犯）**：第一版修法写成
+`sed -n '2,/^[^#]/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'`，**是错的** ——
+`^[^#]` 要求"有一个不是 `#` 的字符"，**空行一个字符都没有、不匹配**，于是范围多吃了
+一行正文（`set -u`），`$d` 又把 `set -u` 删掉、只留下那个空行 → help 末尾多一个空行。
+是同一轮新加的断言（"help 最后一行就是注释块末行"）把它抓出来的。
+**判据**：`sh bin/dsh-remote help | tail -1` 必须直接是注释块末行，不能是空行。
+
+回归测试（`tests/run_tests.sh`，4 条）：
+C 节 `dsh-notify --help` 要含"失败只写一行到"、且不含 `set -u`；
+E 节 `dsh-remote help` 不含 `set -u`、且 `tail -1` 就是注释块末行。
 
 ---
 

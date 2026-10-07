@@ -137,7 +137,7 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 179 条（以跑出来的 PASS 行为准），秒级
+sh tests/run_tests.sh         # 185 条（以跑出来的 PASS 行为准），秒级
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
 sh tests/caddy-validate.sh    # 3 条，要 docker（caddy:2 镜像，本地没有会去拉）—— 人工跑
@@ -145,12 +145,13 @@ sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再�
 ```
 
 `run_tests.sh` 逐节（2026-10-07 实测）：A 语法 10 / B `env.*` 等价 6 /
-C `dsh-notify` 20 / D Caddyfile 渲染 21 / E 子命令 41 / F `cloud-install` 14 /
-G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 = **179**。
+C `dsh-notify` 22 / D Caddyfile 渲染 21 / E 子命令 45 / F `cloud-install` 14 /
+G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 53 = **185**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
 
-⚠️ 两个要 docker 的脚本**没有 docker 时会打印"跳过"并 `exit 0`**（假绿）：
-要么在有 docker 的机器上跑，要么看输出里有没有"跳过"（hazards H8）。
+⚠️ 两个要 docker 的脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码）：
+**77 是"没测"，不是通过**。以前是 `exit 0`（放进 CI / `&&` 链里空跑也算绿的假绿），
+2026-10-07 改成 77（hazards H8）。
 
 改了 `scripts/install.sh` / `env.zsh` / `env.bash` / `wtool.xml` **一定要跑
 `tests/run_tests.sh`**（I 节守的就是"命令真装得出来、源找不到不装假"）。

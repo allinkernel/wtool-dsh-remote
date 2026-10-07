@@ -13,7 +13,7 @@
 ## 🔴 仍未做 / 未验证（一览，2026-10-07 盘点）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 179 通过 0 失败，2026-10-07 复跑两轮），
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → 185 通过 0 失败，2026-10-07 复跑两轮），
 > 但**真机端到端从头到尾没跑过**。下表是"还剩什么"的全集，展开在后面的小节里。
 
 | # | 状态 | 事项 | 一句话 |
@@ -22,8 +22,8 @@
 | U2 | ⏸ | **云端落地步骤**（阿里云那台怎么装） | `relay.sh --domain/--ip`、安全组、域名备案 —— 要用户拍 |
 | U3 | ⬜ | **隧道常驻 / 断线重连** | systemd 单元只生成不 enable；本机没 autossh；重连时长没测过 |
 | U4 | ⏸ | **钩子桥未证实会触发** | `check-hooks` 复查：触发 → 0，没触发 → 1；两条出路要用户选 |
-| U5 | ⬜ | **要 docker / 要两台机器的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；没 docker 时会假绿 |
-| U6 | ⏸ | **三个代码小瑕疵** | `status` 提示指错路径 / `help` 输出越界 / docker 测试假绿 |
+| U5 | ⬜ | **要 docker 的测试只能人工跑** | `caddy-validate.sh`（3 条）、`relay-e2e.sh`（9 条）；**假绿已修**（没 docker → `exit 77`），但"要不要让 D 节也显式挡 docker"仍待定 |
+| U6 | ✅ | **三个代码小瑕疵**（2026-10-07 已修） | `status` 提示指错路径 / `help` 输出越界 / docker 测试假绿 —— 三条都改完，见下面 U6 那一节 |
 | U7 | ⏸ | 真 `$HOME` 里两条 2026-09-20 的老软链 | 要用户自己重跑一次 `wtool install` 才会纠正 |
 | U8 | ⏸ | "源找不到"要不要从警告改成 `exit 1` | 现在选的是"警告 + 继续"，三个仓库口径一致 |
 | U9 | ⏸ | `main` 与 `ds_dev` 的差距要不要合 | 助手不合并、不推送，由用户定 |
@@ -57,8 +57,9 @@
 
 **验证到什么程度**：
 
-- `sh tests/run_tests.sh` → **179 通过 0 失败**（两轮）；逐节 A 10 / B 6 / C 20 / D 21 /
-  E 41 / F 14 / G 8 / H 6 / I 53；跑完真 `$HOME` 指纹不变那条断言是绿的。
+- `sh tests/run_tests.sh` → **185 通过 0 失败**（2026-10-07 晚复跑；当时是 179 通过 —— 
+  后来的 U6 修复加了 6 条断言）；逐节 A 10 / B 6 / C 22 / D 21 /
+  E 45 / F 14 / G 8 / H 6 / I 53；跑完真 `$HOME` 指纹不变那条断言是绿的。
 - 文档里的每个"现状"都对着代码核过；与 README/AGENTS 的旧说法冲突处**按代码改文档**
   （README 共 10 处 + AGENTS 加了文档地图/硬规矩，逐条列在提交信息里；
   例如 README §5.6 原来写 `systemctl stop caddy`
@@ -306,8 +307,8 @@ sh tests/relay-e2e.sh         # 9 条：真起 caddy 容器（host 网络）+ �
                               #   compose down -v 撤干净（跑完自己收摊）
 ```
 
-⚠️ **没 docker 时这两条都打印"跳过"并 `exit 0`**（假绿，见 hazards H8）——
-所以要么在有 docker 的机器上跑，要么看输出里有没有"跳过"。
+⚠️ **没 docker 时这两条打印"跳过"并 `exit 77`**（跳过码 —— 2026-10-07 由 `exit 0`
+改来，见 hazards H8）—— 所以 `77` 是"**没测**"，别当通过。
 
 **要两台机器 / 要手机的（一条都没做过）**：
 
@@ -318,22 +319,36 @@ sh tests/relay-e2e.sh         # 9 条：真起 caddy 容器（host 网络）+ �
 - ⬜ 手机丢了/要断入口：`docker compose -f /opt/dsh-relay/docker-compose.yml down`
   （**不是** `systemctl stop caddy`，见 hazards H7）。
 
+**仍待用户拍的一条**：要不要让 `tests/run_tests.sh` 的 D 节也**显式挡住 docker**
+（现在装了 docker 就会真跑一次 `caddy validate`，只把话写在文件头了）。
+
 ---
 
-## ⏸ U6 三个代码小瑕疵（要改就是改代码行为 → 等用户拍）
+## ✅ U6 三个代码小瑕疵（2026-10-07 用户批准"按建议改" → 已修）
 
-| # | 在哪 | 现象 | 候选做法 |
+| # | 在哪 | 原现象 | 实际怎么改的 |
 |---|---|---|---|
-| 1 | `bin/dsh-remote:121` | `status` 在没配推送时提示"照 notify.conf.example 写 **`~/.dsh/notify.conf`**"，而落点是 `~/.config/dsh-remote/notify.conf`（只有 `migrate` 会读 `~/.dsh`） | 把提示改成 `$CONF_DIR/notify.conf`（hazards H9） |
-| 2 | `bin/dsh-remote` 的 `usage()` | `help` 打 `sed -n '2,25p'`，多打 `set -u` 和两行注释（注释块只到 21 行）；`dsh-notify --help` 是 `2,20p`，把"退出码永远是 0"那段截断 | 改成 `2,21p` / 加结束标记（hazards H10） |
-| 3 | `tests/caddy-validate.sh`、`tests/relay-e2e.sh` | 没 docker 时"跳过"并 `exit 0`，CI/`&&` 链里算通过 | 改成 `exit 77`（跳过码）或在输出里显式写"这段没测"（hazards H8） |
+| 1 | `bin/dsh-remote` 的 `status` | 没配推送时提示"照 notify.conf.example 写 **`~/.dsh/notify.conf`**"，而落点是 `~/.config/dsh-remote/notify.conf`（只有 `migrate` 会读 `~/.dsh`） | 提示改成 `$CONF_DIR/notify.conf`（hazards H9） |
+| 2 | `bin/dsh-remote` / `bin/dsh-notify` 的 `usage()` | `help` 打 `sed -n '2,25p'`，多打 `set -u` 和两行注释（注释块只到 21 行）；`dsh-notify --help` 是 `2,20p`，把"退出码永远是 0"那段截断 | 两处都改成**算范围**：`awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" \| sed 's/^# \{0,1\}//'`（hazards H10） |
+| 3 | `tests/caddy-validate.sh`、`tests/relay-e2e.sh` | 没 docker 时"跳过"并 `exit 0`，CI/`&&` 链里算通过 | 没 docker → **`exit 77`**（跳过码）（hazards H8） |
 
-三条都**不是**本次文档任务的范围（改代码行为要用户点头），先记在这儿。
+**验证到什么程度**（2026-10-07 实测）：
 
-**另一条要记账的口径**：`tests/run_tests.sh` 文件头写着"不碰 docker"，但本机装了
+- `sh tests/run_tests.sh` → **185 通过 0 失败**（A 10 / B 6 / C 22 / D 21 / E 45 / F 14 /
+  G 8 / H 6 / I 53）。比修复前多 6 条，全是新加的**回归断言**：
+  C 节 `--help` 要含"失败只写一行到"、不含 `set -u`；E 节 `help` 不含 `set -u`、
+  `tail -1` 就是注释块末行、`status` 提示落在 `$DSH_REMOTE_HOME/notify.conf`、
+  且不再出现 `~/.dsh/notify.conf`。
+- 两条 docker 脚本的 77 用 H8 那条 shim 复现（**不碰真 docker**），两个都实测 rc=77。
+- ⚠️ **第一版修法写错过一次并被抓出来**：`sed -n '2,/^[^#]/p'` 里空行不匹配 `^[^#]`，
+  会多吃一行正文 —— 是新加的那条断言（`tail -1` 必须是注释块末行）抓出来的。
+  细节记在 hazards H10 的订正段（**别重犯**）。
+
+**另一条口径也改了**：`tests/run_tests.sh` 文件头原来写"不碰 docker"，实际本机装了
 docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:2 caddy validate`
-（2026-10-07 实测：没拉镜像、没留下容器）。口径已改文档（README §6 / AGENTS.md /
-`architecture.md` §10 / hazards H8）；要不要把 D 节显式挡住 docker，同第 3 条一起定。
+（2026-10-07 实测：没拉镜像、没留下容器）。文件头已改成事实
+（"不联网、不碰真 `$HOME`" + 另起一段声明 D 节会碰 docker）。
+**D 节的行为没动** —— 要不要让它显式挡 docker，仍留在 U5。
 
 ---
 

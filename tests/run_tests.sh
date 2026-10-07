@@ -1,5 +1,9 @@
 #!/bin/sh
-# run_tests.sh —— tools/dsh-remote 的用例（**不联网、不碰 docker、不碰真 $HOME**）
+# run_tests.sh —— tools/dsh-remote 的用例（**不联网、不碰真 $HOME**）
+#
+# ⚠️ 它**会碰 docker**：本机装了 docker 时，D 节经 `cloud/relay.sh --dry-run`
+#    会真跑 `docker run --rm caddy:2 caddy validate`（要 caddy:2 镜像已在本地，
+#    没有会去拉）。别的节不碰 docker。见 hazards H8。
 #
 #   sh tests/run_tests.sh         # 全跑
 #   sh tests/run_tests.sh -v      # 每条都打印
@@ -12,6 +16,7 @@
 #   D cloud/relay.sh 的渲染：占位符替换干净、host/origin 改写、
 #     basic_auth、allow-ip、参数校验
 #   E dsh-remote 子命令：help/未知命令/status/notify-enable/notify-disable 幂等
+#     （help 不越界、status 提示的落点是我们自己的目录 —— H9/H10）
 #   F cloud-install（假 ssh/scp）
 #   G 目录边界：自己的东西不放 ~/.dsh
 #   H check-hooks
@@ -19,7 +24,8 @@
 #     WTOOL_HOME/WTOOL_PREFIX 推、换 WTOOL_HOME 装到别处、源找不到不建悬空链、
 #     --uninstall 撤干净 —— 全程临时 HOME（跑完比真 $HOME 的指纹）
 #
-# 真起 Caddy 校验 Caddyfile 的那条在 tests/caddy-validate.sh（要 docker）。
+# 要 docker 的两条在 tests/ 下单独放：caddy-validate.sh（3 条）、relay-e2e.sh（9 条）。
+# 它们**没有 docker 时 exit 77**（跳过码）—— 别把 77 当通过（H8）。
 
 set -u
 
@@ -141,6 +147,9 @@ if [ -s "$cfg" ]; then ok "接收端起来了（端口 $port）"; else bad "接�
 "$NOTIFY" --help >"$TMP/help" 2>&1
 check "--help 退出 0" "0" "$?"
 check_contains "--help 里有用法" "dsh-notify" "$(cat "$TMP/help")"
+# H10：范围写死成 2,20p 时，把"退出码永远是 0"那段的最后一截掉了
+check_contains '--help 不截断"退出码永远是 0"那段（H10）' "失败只写一行到" "$(cat "$TMP/help")"
+check_not_contains "--help 不越界（没有 set -u）" "set -u" "$(cat "$TMP/help")"
 
 : >"$sink_out"
 code=$(run_notify --test)
@@ -276,6 +285,10 @@ export DSH_NOTIFY_BIN="$NOTIFY"
 "$remote" help >"$TMP/help2" 2>&1
 check "help 退出 0" "0" "$?"
 check_contains "help 里有 status" "status" "$(cat "$TMP/help2")"
+# H10：范围写死成 2,25p 时会多打 `set -u` 和两行无关注释；末行应是注释块最后一行
+check_not_contains "help 不越界（没有 set -u）" "set -u" "$(cat "$TMP/help2")"
+check "help 最后一行就是注释块末行" \
+    "安全边界、威胁模型、为什么这么设计：见同目录 README.md。" "$(tail -n 1 "$TMP/help2")"
 
 "$remote" 不存在 >/dev/null 2>&1
 [ "$?" -ne 0 ] && ok "未知子命令非 0" || bad "未知子命令非 0"
@@ -284,6 +297,9 @@ check_contains "help 里有 status" "status" "$(cat "$TMP/help2")"
 DSH_REMOTE_HOME="$TMP/home" "$remote" status >"$TMP/st" 2>&1
 check "status（无配置）退出 0" "0" "$?"
 check_contains "status 会提示还没配置" "还没有" "$(cat "$TMP/st")"
+# H9：提示要指到我们自己的目录（DSH_REMOTE_HOME 之下），不是 ~/.dsh
+check_contains "status 提示的 notify.conf 落在我们自己的目录（H9）" "$TMP/home/notify.conf" "$(cat "$TMP/st")"
+check_not_contains "status 不再把人指向 ~/.dsh/notify.conf（H9）" "~/.dsh/notify.conf" "$(cat "$TMP/st")"
 check_contains "status 打印的项目目录是对的" "$proj" "$(cat "$TMP/st")"
 
 # 软链下也要能解出"我是谁"：真实用法就是 ~/.local/bin/dsh-remote 这种软链，

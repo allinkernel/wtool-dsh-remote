@@ -29,9 +29,11 @@ bad() {
     printf '  FAIL %s\n' "$1"
 }
 
+# 没有 docker = **没测**，不是"通过"：用 77 当跳过码（autotools 的老约定），
+# 这样 CI / `&&` 链不会把"一条都没跑"当成绿的（H8）。
 command -v docker >/dev/null 2>&1 || {
-    echo "没有 docker，跳过"
-    exit 0
+    echo "没有 docker，跳过（exit 77 = 跳过码，不是通过）"
+    exit 77
 }
 
 echo "== 渲染两份 Caddyfile"

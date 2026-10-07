@@ -57,8 +57,8 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 616 | 家里这头的主命令（14 个子命令） |
-| `bin/dsh-notify` | 236 | 推送脚本；也是 hook 桥调用的那个命令 |
+| `bin/dsh-remote` | 620 | 家里这头的主命令（14 个子命令） |
+| `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
 | `cloud/relay.sh` | 301 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检 |
 | `cloud/Caddyfile.domain` | 47 | 域名模式模板（占位符 `{{...}}`） |
@@ -69,9 +69,9 @@
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 31 | 隧道配置样板 |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 700 | 179 条，不联网 / 不碰 docker / 不碰真 `$HOME` |
-| `tests/caddy-validate.sh` | 70 | 3 条，用 `caddy:2` 真校验 Caddyfile（要 docker） |
-| `tests/relay-e2e.sh` | 138 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker） |
+| `tests/run_tests.sh` | 716 | 185 条（2026-10-07 实测），不联网 / 不碰真 `$HOME`；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2 caddy validate` |
+| `tests/caddy-validate.sh` | 72 | 3 条，用 `caddy:2` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
+| `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
 | `README.md` / `AGENTS.md` / `BACKLOG.md` / `architecture.md` / `journal.md` / `docs/` | — | 文档 |
 
@@ -150,7 +150,7 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 | `migrate` | 把旧版放在 `$DSH_HOME` 下的 `remote.conf` / `notify.conf` / `hooks.json` 搬到 `$CONF_DIR`，`notify.log` / `web.log` / `web-url.txt` 搬到 `$STATE_DIR`（目标已存在就不覆盖），顺手删掉 `$DSH_HOME/*.example`；搬了东西就提醒重跑 `notify-enable` 更新 patch 里的路径 | 0 |
 | `check-hooks` | 见 §9（一次性进程做对照实验，不动正在跑的实例） | 0 / 1 |
 | `log` | 把 `$STATE_DIR/notify.log` 和 `$STATE_DIR/web.log` 各 `tail -n 20`（有哪个看哪个）。**没有隧道日志** —— 隧道跑在 tmux/systemd 里，日志在那边 | 0 |
-| `help` / `--help` / `-h` / 无参数 | `sed -n '2,25p' "$0"` 打印脚本头部注释。**现状瑕疵**：第 23 行是 `set -u`，所以用法后面会多打印 `set -u` 和两行无关注释（见 hazards H10） | 0 |
+| `help` / `--help` / `-h` / 无参数 | 打印脚本头部注释块：`awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" \| sed 's/^# \{0,1\}//'` —— 跳过 shebang，从第 2 行起**连着**以 `#` 开头的都打，碰到第一条正文（**空行也算**）就停。范围是算出来的，往头部加/删注释行都不用改代码（2026-10-07 修 H10；此前写死 `sed -n '2,25p'`，越界多打了 `set -u` 和两行无关注释） | 0 |
 | 其它 | `die "不认识的命令：$1（dsh-remote help）"` | 1 |
 
 ### `notify-enable` 写进 profile patch 的那段（原文）
@@ -427,17 +427,19 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **179 通过 0 失败**（A 10 / B 6 / C 20 / D 21 / E 41 / F 14 / G 8 / H 6 / I 53） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景 |
-| `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2`）；没有 docker 时打印"跳过"并 **exit 0** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
-| `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 exit 0 | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
+| `tests/run_tests.sh` | **185 通过 0 失败**（A 10 / B 6 / C 22 / D 21 / E 45 / F 14 / G 8 / H 6 / I 53） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker** | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景 |
+| `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
+| `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
 
-⚠️ **两处跟 docker 有关的事实**（2026-10-07 实测，细节在 hazards H8）：
+⚠️ **跟 docker 有关的两件事**（2026-10-07 实测 + 当天修掉，细节在 hazards H8）：
 
 - `run_tests.sh` 在**装了 docker 的机器上**，D 节会经 `relay.sh --dry-run` 真跑
-  `docker run --rm caddy:2 caddy validate`（每轮 5 次；`caddy:2` 不在本地会去拉镜像）
-  —— 它的文件头写着"不碰 docker"，那句只在"机器上没有 docker"时成立；
-- 两个 docker 脚本**没有 docker 时打印"跳过"就 `exit 0`**（空跑也算通过）。
+  `docker run --rm caddy:2 caddy validate`（一轮 5 次；`caddy:2` 不在本地会去拉镜像）
+  —— 所以它的文件头现在写的是"**不联网、不碰真 `$HOME`**"，另起一段声明 D 节会碰 docker
+  （此前写"不碰 docker"，那句只在"机器上没有 docker"时成立）；
+- 两个 docker 脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码，不是通过）。
+  此前是 `exit 0` —— 放进 CI / `&&` 链里空跑也算绿，属于假绿。
 
 `run_tests.sh` 的 I 节（53 条）是 2026-10-04 那次修复的回归测试，五个场景：
 ①引擎调用（`WTOOL_PROJECT_DIR`，引擎内部那格故意埋一份假的可执行文件）

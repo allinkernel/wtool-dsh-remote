@@ -134,3 +134,37 @@ exit 2、`install.sh` 根本没机会跑），旧标签 `<env src= shells=>` 换
 隧道常驻/断线重连缺实测（本机没 autossh、systemd 只生成不 enable）；
 钩子桥未证实；`tests/relay-e2e.sh` / `caddy-validate.sh` 要 docker、只能人工跑；
 三个代码小瑕疵（status 文案 / help 越界 / docker 测试假绿）待用户决定要不要改代码。
+
+---
+
+## 2026-10-07（第二轮）—— 修 U6 三个代码小瑕疵（用户批准"按建议改"）
+
+**谁**：助手（用户在同一轮里还派了另外两件事：往 `harness/dsh-conf/AGENTS.md` 记阿里云服务器信息、
+在真阿里云上把中继部署起来；那两件不记在这个仓的流水里）。
+
+**改了什么**（全部在 `ds_dev`，`bin/` 与 `tests/` 与文档同一个提交）：
+
+1. `bin/dsh-remote` 的 `status`：推送那行提示 `~/.dsh/notify.conf` → `$CONF_DIR/notify.conf`（H9）。
+2. 两处 `usage()`（`bin/dsh-remote` / `bin/dsh-notify`）改成**算范围**：
+   `awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" | sed 's/^# \{0,1\}//'`（H10）。
+3. `tests/caddy-validate.sh` / `tests/relay-e2e.sh`：没 docker 时 `exit 0` → **`exit 77`**（H8）。
+4. `tests/run_tests.sh` 文件头"不碰 docker"改成事实（另起一段声明 D 节会真跑 `caddy validate`）。
+
+**怎么验证的**：
+
+- `sh tests/run_tests.sh` → **185 通过 0 失败**（比改前 +6 条，全是新加的回归断言；
+  逐节 A 10 / B 6 / C 22 / D 21 / E 45 / F 14 / G 8 / H 6 / I 53）。
+- `PATH=<shim，挡掉 docker>` `/bin/sh tests/caddy-validate.sh` → rc **77**；
+  同法 `tests/relay-e2e.sh` → rc **77**（改前两个都是 rc 0）。
+- `sh bin/dsh-remote help | tail -1` → `安全边界、威胁模型、为什么这么设计：见同目录 README.md。`
+  （不再多打 `set -u`）；`sh bin/dsh-notify --help | tail -1` → `只依赖 curl；…"只发事件名"。`
+  （"退出码永远是 0"那段完整了）。
+- 真 `$HOME` 指纹断言（I 节最后一条）仍然是绿的。
+
+**如实记账：第一版修法写错过一次**。`sed -n '2,/^[^#]/p' "$0" | sed -e '$d' …` 里
+`^[^#]` 要求"有一个不是 # 的字符"，**空行不匹配** → 范围多吃一行正文，
+`$d` 又把那行删掉、只剩空行 → `help` 末尾多一个空行。是同一轮新加的
+"help 最后一行就是注释块末行"那条断言抓出来的（第一次跑 183 通过 2 失败）。
+改用 awk 后 185 全绿；教训写进 hazards H10 的订正段（含"别用 `sed -n '2,/^[^#]/p'`"）。
+
+**没做的**：D 节要不要显式挡 docker（仍留 U5）；`main` 没动、没有 push。

@@ -245,15 +245,15 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 179 条（以输出为准），不联网、不碰真 $HOME
+sh tests/run_tests.sh        # 185 条（以输出为准），不联网、不碰真 $HOME
                              #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
                              #   跑一次 docker run … caddy validate（要求 caddy:2 已在本地）
 sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
 sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密码错 / 撤干净），要 docker，人工跑
 ```
 
-⚠️ 后两条**没有 docker 时会打印"跳过"然后 `exit 0`** —— 别只看退出码，
-看输出里有没有"跳过"（`docs/hazards.md` H8）。
+⚠️ 后两条**没有 docker 时打印"跳过"并 `exit 77`** —— **77 是"没测"，不是通过**
+（以前是 `exit 0`，放进 CI / `&&` 链里空跑也算绿；见 `docs/hazards.md` H8）。
 
 `run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、
 `dsh-notify` 真发一条到本地 HTTP 接收端（含 `--hook` 解析、`on_stop` 开关、
@@ -275,8 +275,8 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **179**）：语法 A 10 / `env` 两份 B 6 /
-`dsh-notify` C 20 / Caddyfile 渲染 D 21 / 子命令 E 41 / `cloud-install` F 14 /
+逐节条数（2026-10-07 实测，合计 **185**）：语法 A 10 / `env` 两份 B 6 /
+`dsh-notify` C 22 / Caddyfile 渲染 D 21 / 子命令 E 45 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 53。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
