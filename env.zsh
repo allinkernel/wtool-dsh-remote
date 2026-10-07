@@ -42,6 +42,7 @@ export DSH_REMOTE_STATE_DIR=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.loc
 # 先 `unalias harness` —— 本文件在 source 时也会替你 unalias 一次。
 # 想在后台起、不占用终端，用 `dsh-remote serve`（它同样把 token 存进 web-url.txt，
 # 但它在后台跑、不接管当前终端）。
+unalias harness 2>/dev/null || true
 harness() {
     unalias harness 2>/dev/null || true
     if ! command -v npx >/dev/null 2>&1; then

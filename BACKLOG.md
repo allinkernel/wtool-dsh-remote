@@ -569,3 +569,17 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
 - ⏸ **U8**：`scripts/install.sh` 的"源找不到"现在是**警告 + 继续 + 末尾交代**，
   要不要改成 `exit 1`（三个仓库现在口径一致，都选了警告）。
 - ⏸ **U9**：`main` 与 `ds_dev` 的差距要不要合 —— 助手不合并、不推送。
+
+## ✅ 2026-10-07：env.zsh / env.bash 里 `harness` 定义前先 `unalias`（本机真装时暴露）
+
+- **现象**：本机（真 WSL）装完 `wtool bootstrap` 后，新开 zsh 报
+  `env.zsh:45: defining function based on alias 'harness'` + `parse error near '()'`，
+  该文件（以及它后面 load 的东西）**整个不生效**。
+- **根因**：用户在 `~/.zshrc:39` 写过 `alias harness='npx @deepseek-ai/dsh web'`；
+  zsh 不允许在别名存在时定义同名**函数**。文件自己在函数体**里**做了 `unalias`，
+  但那时解析已经失败了 —— 顺序错了。
+- **修法**：把 `unalias harness 2>/dev/null || true` 提到**函数定义之前**（两个 shell 文件都改）。
+- **判据**：`zsh -lic 'type harness'` → `harness is a shell function from …/env.zsh`（不再报 parse error）；
+  `zsh -n env.zsh` / `bash -n env.bash` 过；`sh tests/run_tests.sh` 全绿。
+- **注意**：这会让用户 `.zshrc` 里那条别名失效（这正是项目文档要求的口径：
+  "别名优先于函数，先 unalias"）；用户若要保留别名，把这两行删掉即可。
