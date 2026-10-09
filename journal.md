@@ -727,3 +727,101 @@ token 只在它内存里，H22/H29）；③ `dsh-web.service` `NRestarts=108`、
 真抓到新 token）**没在真机上验**（会打断用户会话，用户没让做）；"npx 绑不上端口会不会先
 打印 token"**没复现**（H31 里按"一次观察"写）；`/reset` 在隧道正断着时打开会 502（页面里
 写了要等一下再刷）。
+
+---
+
+## 2026-10-09（第 25 轮）`harness` 重做成"本地管理器" + 新增 `harness-remote`（ADR-0024）
+
+**用户口径（这轮的唯一验收标准，逐字照做）**：
+
+> 任意时刻执行 `harness`，它**立刻检查系统有没有启动 `dsh web`，有就立刻打开浏览器**；
+> **如果没有就自己打开一个**。systemd 自启动服务已经起了一个 `dsh web` 的话，
+> `harness` **就不需要再启动了，立刻打开浏览器就好了。就是这么简单。**
+> **不许再有"等 20 秒"那种行为。** `harness` 是本地管理这些服务，
+> `harness-remote` 命令就是管理阿里云服务器上 8443 端口的服务。
+
+**做了什么**
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | `harness` 重写成两条路：**① 端口有人听 → 一行状态 + 立刻开浏览器 + return 0（不起第二个、不等待、不写任何文件）② 没人听 → 优先 `dsh-web.service`（`start --no-block` + 最多等 10s 看端口出现），没有单元/命令行换端口则前台 `npx … --port`（端口一出现就开浏览器，退出时按标记删自己写的 token）** | `env.zsh` + `env.bash`（逐字等价，只差第 1 行标题；484 行） |
+| 2 | **开浏览器**（关键新能力）：`_hr_open` + `_hr_open_pkg`，三档退、**全程 argv、绝不拼 shell 字符串**；失败不算失败（rc 恒 0） | 同上 |
+| 3 | 输出压到 **≤3 行**；`DSH_REMOTE_HARNESS_NO_REUSE` **删除**；新增 `DSH_REMOTE_HARNESS_UNIT`（给不存在的单元名 = 强制前台） | 同上 |
+| 4 | 新增 `bin/harness-remote`（**薄封装 + 6 个子命令**）：`status` ≤6 行 / `open` / `reset`（安全档，拒绝 `--restart-web`）/ `passwd`（原样转发）/ `url` / `qr`；`DSH_REMOTE_BIN` 可换被转发的命令（测试用） | `bin/harness-remote`（新，426 行） |
+| 5 | `scripts/install.sh` 把 `harness-remote` 软链进 `$WTOOL_PREFIX/bin`（装/幂等/卸载三处一起） | `scripts/install.sh` |
+| 6 | O 节重写（79 条：六种情形 + opener 三档）+ **新增 Q 节**（65 条：`harness-remote` 六个子命令全用桩）+ I 节计数跟着改 | `tests/run_tests.sh`（684 条） |
+
+**真机验收（3082，用户明确授权；3080/3181 全程只读）**
+
+```
+$ （先在 3082 起一个真 dsh web：nohup npx @deepseek-ai/dsh web --port 3082 --no-open）
+$ harness --port 3082                 # ① 端口上已有实例
+harness: dsh web 已在跑 ✓  http://127.0.0.1:3082/（PID 268102，手工起的）
+URL: http://127.0.0.1:3082/
+harness: 已用 node + open 包 打开浏览器
+rc=0
+```
+- 判据（"绝不起第二个"）：`ss -ltnp | grep ':3082 '` 的 PID 前后**同一个 268102**。
+- 判据（"URL 原样、没经 shell"）：桩 opener 收到 `argc=1`、第一个参数**逐字节**等于
+  `http://127.0.0.1:3082/`；`DSH_HARNESS_OPENER_LOG` 里记的是 `url=<http://127.0.0.1:3082/>`。
+- 判据（"真打开了浏览器"）：跑之前/之后各对 Windows 进程表取一次快照，
+  **多出一个 chrome renderer**；**没有**出现那个 `Windows 找不到文件 'http \127.0.0.1 …'` 框。
+- ② 3082 空时（`kill 268102` 之后）：`harness --port 3082 --no-open` 走前台 npx，
+  打印 `端口 3082 上没人听；命令行换了端口，前台跑 npx（dsh-web.service 钉的是 3080）`
+  → `URL: …` → `已用 … 打开浏览器`；桩 npx 收到的参数是 `… web --no-open --port 3082`
+  （原样透传）；退出后 `current-token.txt` 按约定清掉。**测完只杀了自己起的那个 PID。**
+- ③ opener 缺失/quiet/空：只打印 `URL:` 行、rc 仍 0。
+
+**`harness-remote` 各子命令（真跑，只读/安全档）**
+
+- `status`（真 remote.conf，只读；去掉了 ssh 只读那一档的耗时后约 7s）六行：
+  隧道 ✓（云上 `18080✓ 18081✓`）/ broker ✓（**token ✗ 过期（401）** —— 就是 H22/H29 那个
+  手工实例的现状）/ web `!` 手工实例 PID 17169 / 入口 `123.56.158.212:8443` 公网 ✓ 401 /
+  容器 `dsh-relay running|caddy:2.11.4` / 结论 + 下一步。
+- `open`：`URL: https://123.56.158.212:8443` + `已用 node + open 包 打开浏览器`（真开出一个
+  Chrome renderer；argv 记录 `url=<https://123.56.158.212:8443>`）。
+- `reset`：真安全档（`reset-failed` + 重启 `dsh-tunnel`/`dsh-token-broker` → 云上复验 2/2 →
+  本地/token/公网），**3080 的 PID 前后都是 17169**；`--restart-web --yes` 被**拒绝**。
+- `passwd --dry-run`：打印五步，**一个字节没改**（云上 `Caddyfile` / `relay-password.txt`
+  的 mtime 还是 21:23，没动）。`url` / `qr`（没有二维码时 rc=1 并说去哪生成）。
+
+**"3080 PID 未变"那笔判据（铁律）**
+
+- 整轮开始前：`ss -ltnp | grep ':3080 '` → **pid=17169**。
+- 全量测试（`sh tests/run_tests.sh`，跑了 6 遍）+ 3082 人工验收 + `harness-remote` 真跑
+  （含 `reset`）之后：**还是 pid=17169**。3181 那个是**别人的**实例，全程只读、没碰。
+- 另外：本轮的测试进程一律用 `timeout` 兜底（有一次桩 npx 的端口被上一轮残留占着，
+  桩自己不退 → harness 等满窗口，整节挂住；加了 `timeout` + 桩"绑不上就立刻退"之后好了）。
+
+**踩到的坑（详细版在 hazards H32/H33）**
+
+- `cmd /c start "$url"` 这条路在 WSL 下会把 URL 变成 `http \127.0.0.1 3984\token=MTOK`
+  —— **错在"经 shell"，不是 opener 选错**；改成 `node <tmp.mjs> <url>` + `open@11` 包。
+- `node --input-type=module --eval '<程序>' -- <url> <root>` 里 `process.argv` **不含那个 `--`**，
+  位置容易错；改成"写临时 `.mjs`"最稳。
+- 裸路径 `import('/path/node_modules/open/index.js')` → `ERR_UNSUPPORTED_ESM_URL_SCHEME`
+  （`Received protocol 'https:'`）；要 `pathToFileURL(...).href`。
+- `case` 模式改丢了开头的引号（`*"start …"*)` → `*start …*)`）→ dash 报
+  `Syntax error: word unexpected`，而 **`sh -n` 查不出来**（真跑才炸）。
+- 测试里连踩四个"环境"坑：dash 下 `V=值 函数` 前缀赋值不进函数环境、`env PATH=…` 被
+  `/mnt/c/Program Files` 里的空格拆开、`export $_ev`（空）把全环境打到 stdout 被 `$()`
+  收走、`unset $(…)` 误伤了前缀赋值传进来的变量。
+
+**测试**
+
+`sh tests/run_tests.sh` → **684 通过 0 失败**。逐节（`-v` 实测）：
+A 14（新增 `bin/harness-remote`、`bin/dsh-web-run` 的 `sh -n`/`bash -n`）/
+B 6 / C 22 / D 34 / E 53 / F 14 / G 8 / H 6 / I 56 / J 100 / **K 57** / L 17 / M 46 / N 22 /
+**O 79**（重写：六种情形 + opener 三档）/ **P 85** / **Q 65**（新增：`harness-remote`）。
+
+**没验 / 风险**
+
+- **真·零 opener**（PATH 里一个 opener 都没有）**离线造不出来**：这台机器上 `ss`/`grep`
+  和 `xdg-open` 同在 `/usr/bin`，把 PATH 收窄到"没有 opener"就等于连 `ss` 都没有。
+  自动测的只有"用空字符串覆盖"那一档（走同一段输出）；真·零 opener 是人工看过一次。
+- `explorer.exe <url>` **单独**用时不一定真开浏览器（本轮观察到一次，没定位原因）——
+  它只是第②档兜底。
+- `harness-remote status` 的 `容器` 那一行是**真 ssh 上云只读**跑的（一次成功）；
+  `ssh` 不通时它会打印"探不到 + 判据"，那条**没在断网情况下验过**。
+- `passwd` **只跑了 `--dry-run`**（用户明令：绝不许改密码）；真改密码那条路这轮没走。
+- 真手机端到端（扫码 / 拿真 token 从公网走完整一遍）仍然**没做**（老缺口，见 U1）。

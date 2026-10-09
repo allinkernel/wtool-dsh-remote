@@ -38,6 +38,7 @@
 | U16 | ✅ | **隧道自我维持成风暴 + 没有自愈** | 2026-10-09：`StartLimitIntervalSec=300` + `StartLimitBurst=10` + `RestartSec=5`，并加一个 5 分钟一次的自愈 timer（见下面 U16 节） |
 | U17 | ✅ | **`harness` 输出"状态 + 原因" + 堵住坏代理卡死服务** | 2026-10-09 用户要求：明确说清服务起没起来、为什么；四态 + 判据命令（ADR-0020）。同时 `dsh-web-run` 起 npx 前默认清空代理（ADR-0021、hazards H28）。见下面 U17 节 |
 | U18 | ✅ | **一键强制重置 + 手机上的按钮** | 2026-10-09 用户批准"要有强制重置按钮"：`force-restart-dsh-remote`（安全档绝不碰 `dsh web`；`--restart-web --yes` 是受限例外）+ 云上 `/reset`（确认页 + POST，走 broker、异步、一次性 nonce）。真机 + 真公网实测。见下面 U18 节（ADR-0022/0023、hazards H29/H30） |
+| U20 | ✅ | **`harness` 重做成"本地管理器" + 新增 `harness-remote`** | 2026-10-09 用户重做（ADR-0024）：`harness` = **有则开、无则起、绝不起第二个、不等待**（`ss -ltnp` 先看端口；有 → 一行状态 + 立刻开浏览器；没有 → 优先 `dsh-web.service`，最多等 10s 端口出现，或前台 `npx … --port`），输出 **≤3 行**，**开浏览器绝不经 shell**（node+`open` 包 → explorer.exe/wslview/xdg-open → 只打印 URL，失败不算失败）；新增用户点名的 `harness-remote`（云上那半：`status`/`open`/`url`/`qr`/`reset`/`passwd`，薄封装转发给现成的 `dsh-remote` 子命令）。**验证程度**：3082 真跑（端口上原 PID 前后同一个 = 没起第二个；桩 opener 收到 argv 逐字节 `argc=1`；真 `open` 包开出一个 Chrome 新标签）；`harness-remote status/open/reset/passwd --dry-run` 各真跑一次（status 只读、reset 走安全档、passwd **只 `--dry-run`**、**没改密码**）；`tests/run_tests.sh` **684 通过 0 失败**（O 节 79 + 新增 Q 节 65）；**3080 的 PID（17169）全程没变**。见下面 U20 节 |
 | U19 | ✅ | **`harness` "没起来"那一档不许再含糊** | 2026-10-09 用户现场发火：超时分支只会说"端口被占 / npx 卡住都可能是这个"。改成**先看端口**（有人听 = "被别人占着 + 实测 PID + 那个实例的 token 验没验过"），没人听才分"服务失败 exit N / 还在起第 N 次重试 / 服务没在跑"三档，每档一条判据命令。3181+ 上验过四档（见下面 U19 节）。另记一条 hazard H31：**打印了 URL ≠ 这个实例活着** |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
@@ -609,7 +610,8 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
   2. 新子命令 `serve-install` / `serve-status` / `serve-uninstall` → 单元
      `~/.config/systemd/user/dsh-web.service`（`Restart=always`、`RestartSec=30`、`WantedBy=default.target`）；
   3. `harness`（env.zsh/env.bash 逐字相同）改成三步：**① 复用 ② 交给服务 ③ 回退前台**；
-     逃生阀 `DSH_REMOTE_HARNESS_NO_REUSE=1`。
+     逃生阀 `DSH_REMOTE_HARNESS_NO_REUSE=1`（**这个阀和"三步"都已被 U20 / ADR-0024 取代**，
+     见下面 U20 节）。
 - **踩到的坑（H24）**：第一版把重连写成单元的 `ExecStartPost` —— "端口被占→服务立刻退出→每 30 秒重试"
   时它**也会跑**，于是隧道被反复重启、手机链路每 30 秒断一次（实测看到隧道 `ActiveEnterTimestamp`
   被刷新）。重连挪进 `dsh-web-run`，并加**回归守卫**（O 节断言单元里没有行首 `ExecStartPost=`）。
@@ -695,6 +697,11 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
 **用户 2026-10-09 原话**：`harness` "打印的废话太多"，要"**明确地指出：dsh 服务到底起来没有；
 没起来的原因是什么（是后台 systemd 已经自动起来了？还是一直在等待远端？）"。
 外加把之前答应的一处加固（任务 ②，坏代理）一起做掉。
+
+> ⚠️ **这一节记的是当时的做法（U17，2026-10-09 上午）。同一天下午 U20（ADR-0024）把
+> `harness` 重做成"有则开、无则起、绝不起第二个、不等待、≤3 行"** —— 下面的"四态输出"
+> "等 systemd 写出地址（最多 20s）""`DSH_REMOTE_HARNESS_NO_REUSE`"都以 U20 / ADR-0024 为准。
+> 里面 `dsh-web-run` 的代理那部分（第 5、6 条）**没变**，仍然有效。
 
 **改了什么**
 

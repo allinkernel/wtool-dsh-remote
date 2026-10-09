@@ -24,45 +24,58 @@ export DSH_REMOTE_CONF_DIR=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.conf
 export DSH_REMOTE_STATE_DIR=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
 
 # --------------------------------------------------------------- harness 函数
-# `harness` = 起 dsh web，并把它启动时打印的 token 捕获下来。
+# `harness` = **本地管理器**：有 `dsh web` 就立刻开浏览器；没有才起一个。
 #
-# 为什么要包一层：`dsh web` 的 token 是**每个进程随机、只在内存里**的（32 字节
-# base64url；`dsh web --help` 和 harness 源码里都没有"固定 token / 关鉴权"的开关，
-# 2026-10-07 查过 dsh-client-connection 的 processLaunchToken）。手机要访问的固定
-# 地址靠家里的 token broker（`dsh-remote broker-install`，默认 127.0.0.1:3081）
-# 302 到当前 token —— 所以 token 必须落到一个文件里，就是下面这个函数干的。
+# 这是 2026-10-09 用户明确重做的语义（ADR-0024），一句话：
+#   "任意时刻执行 harness，它立刻检查有没有 dsh web，有就立刻打开浏览器，
+#    没有就自己打开一个。**不许再有'等 20 秒'那种行为。**"
+# 所以这个函数只有两条路：
+#   ① 127.0.0.1:<端口> 已经有人听 → 打**一行**状态（是 systemd 托管还是手工起的）
+#      → 立刻开浏览器 → return 0。**不再起第二个、不等待、不重启**。
+#   ② 没人听 → 起一个（优先 dsh-web.service，它才会把 token 抓成文件；
+#      没有那个单元就用命令行给的端口走前台 `npx … dsh web`）→ 端口一出现
+#      （最多 DSH_REMOTE_HARNESS_WAIT 秒，默认 10）→ 打一行状态 → 开浏览器。
+#
+# 开浏览器（②③ 两路都要）：依次试 wslview → cmd.exe → explorer.exe → xdg-open，
+# 谁都不在就只打印地址。**打开失败不算失败**（rc 仍是 0，只多一行提示）——
+# 这个命令的职责是"让会话起来并给出地址"，浏览器只是顺手（ADR-0024）。
+#
+# 输出契约（ADR-0020 的"状态 + 原因 + 判据"风格，**整条命令 ≤3 行**）：
+#   harness: dsh web 已在跑 ✓  http://127.0.0.1:3080/（PID 152050，systemd 托管 / 手工起的）
+#   URL: http://127.0.0.1:3080/（+ 一行 opener 结果，或"没有 opener，自己去开"）
+#
+# `dsh web` 的 token 是**每个进程随机、只在它内存里**的（H22），所以：
+#   * 地址优先用 web-url.txt 里那份（带了 token，本机直接可用）；
+#     没有就退回 http://127.0.0.1:<端口>/ —— 浏览器通常已经有 30 天 cookie，
+#     服务托管那条路上 broker 也会把不带 token 的入口 302 到当前 token。
+#   * **不**为了凑 token 去多等：`--no-open` 是给 npx 的，浏览器由我们开。
+#
+# 参数：`--port <n>` 由我们接下来（默认取 remote.conf 的 local_port，再默认 3080），
+# **其余原样透传**给 `npx @deepseek-ai/dsh web`（例如 `--no-open`）。
+#
+# 为什么还要包一层（老理由，仍然成立）：`dsh web` 的 token 是**每个进程随机、
+# 只在内存里**的（32 字节 base64url；`dsh web --help` 和 dsh-client-connection 的
+# `processLaunchToken` 里都没有"固定 token / 关鉴权"的开关，2026-10-07 查过）。
+# 手机要访问的固定地址靠家里的 token broker（`dsh-remote broker-install`，默认
+# 127.0.0.1:3081）302 到当前 token —— 走服务那条路是 `dsh-web-run` 在写：
 #
 #   $DSH_REMOTE_STATE_DIR/current-token.txt      只有 token 一行（600）—— broker 的数据源
 #   $DSH_REMOTE_STATE_DIR/web-url.txt            带 token 的完整地址（600，和 `dsh-remote serve` 同一份）
-#   $DSH_REMOTE_STATE_DIR/.harness-wrote-token   "这份是我写的"标记（退出时 cmp 过才删）
-#   $DSH_REMOTE_STATE_DIR/.harness-wait-start    等 systemd 写地址的起点（判 web-url.txt 是不是**刚**写的）
+#   $DSH_REMOTE_STATE_DIR/.harness-wrote-token   "这份是我写的"标记（本函数退出时 cmp 过才删）
 #
-# **输出契约（2026-10-09 用户要求；见 docs/adr/0020-harness-status-output-contract.md）**：
-# 正常最多 4–5 行、每行都要有信息量，第一行永远是**状态 + 为什么** ——
-# 不许"交给常驻服务 dsh-web.service…"然后沉默等待：
-#
-#   harness: dsh web 已在跑 ✓  http://127.0.0.1:3080（PID 152050，非 systemd）
-#   harness: dsh web 已由 systemd 拉起 ✓  http://127.0.0.1:3080/?token=…（PID 152051，dsh-web.service）
-#   harness: dsh web 没起来 ✗ 原因：<实测出来的那一条>
-#   harness:   判据：<自己复现这个结论的命令>
-#
-# **原因不许猜**，全都来自实测：`ss -ltnp`（谁占着端口）、
-# `systemctl --user is-active / show -p SubState/NRestarts/ExecMainStatus/MainPID`、
-# `journalctl -o cat -n 1`（最后一行原文），以及拿真请求探一次 token
-# （无效 = 401、有效 = 303/200，2026-10-09 在本机实测）。
-#
-# 退出时删掉 current-token.txt：宁可让 broker 回 503「还没起」，也别 302 到一个死 token。
-# 参数原样透传（`harness --no-open` / `harness --port 3090` 都行）。
+# 只有"没有 dsh-web.service、必须前台起 npx"那条路才由本函数自己抓 token；
+# 抓到了就留着（这样 broker 能用），退出时按标记删掉自己写的那一份。
 #
 # 环境变量：
-#   DSH_REMOTE_HARNESS_NO_REUSE=1   跳过"复用/交给服务"，永远走前台
-#                                   （测试用它验前台抓 token；"我就想再起一个"也用它）
-#   DSH_REMOTE_HARNESS_WAIT=<秒>    systemd 那条最多等多久写出地址（默认 20；测试用它跑快）
+#   DSH_HARNESS_OPENER=<命令名>   指定开浏览器用的命令（**没设 = 按顺序自动探**；
+#                                 设成 `quiet` / `none` / 空 = 什么都不试，直接打印 URL）
+#                                 例：DSH_HARNESS_OPENER=/tmp/我的opener
+#   DSH_REMOTE_HARNESS_WAIT=<秒>  ②那条最多等端口出现多久（默认 10；0 = 不等）
+#   DSH_REMOTE_HARNESS_UNIT=<单元名>  换一个单元名（给一个不存在的 = 强制前台起 npx）
 #
 # ⚠️ **别名优先于函数**：如果你（或旧文档）写过 `alias harness='npx @deepseek-ai/dsh web'`，
 # 先 `unalias harness` —— 本文件在 source 时也会替你 unalias 一次。
-# 想在后台起、不占用终端，用 `dsh-remote serve`（它同样把 token 存进 web-url.txt，
-# 但它在后台跑、不接管当前终端）。
+# 想在后台起、不占用终端，用 `dsh-remote serve`（它同样把 token 存进 web-url.txt）。
 unalias harness 2>/dev/null || true
 
 # ---- harness 用的**只读**探测（两份 env 逐字相同；一个字节都不写）------------
@@ -101,312 +114,371 @@ _hr_port_taken() { # 这个端口上有人听吗（任何地址 —— 那正是
     _hr_listening "$1"   # 没有 ss 时退回 curl 那一招
 }
 
-_hr_unit_prop() { # $1=单元 $2=属性（MainPID/SubState/NRestarts/ExecMainStatus/RestartUSec…）
+_hr_unit_prop() { # $1=单元 $2=属性（MainPID/SubState/…）—— 拿不到就打印空
     local _v
     _v=$(_hr_sctl show "$1" -p "$2" --value 2>/dev/null | head -n 1)
     [ -n "${_v}" ] || _v=$(_hr_sctl show "$1" -p "$2" 2>/dev/null | head -n 1 | sed "s/^$2=//")
     printf '%s' "${_v}"
 }
 
-_hr_pid_in_unit() { # 这个 PID 跑在这个单元里吗（cgroup 里带单元名 —— 比只比 MainPID 稳）
+_hr_pid_in_unit() { # $1=PID $2=单元名：这个 PID 跑在那个单元里吗（cgroup 比只比 MainPID 稳）
     [ -n "${1:-}" ] || return 1
     [ -n "${2:-}" ] || return 1
     grep -qF -- "$2" "/proc/$1/cgroup" 2>/dev/null
 }
 
-_hr_journal_last() { # journal 最后一行原文（拿不到就是空）
-    command -v journalctl >/dev/null 2>&1 || return 0
-    journalctl --user -u "$1" -n 1 --no-pager -o cat 2>/dev/null | tail -n 1
+_hr_url_of() { # $1=端口 $2=web-url.txt → 能打开的地址。文件里有**这个端口**的地址就用它
+    # 带了 token 的地址优先（H22：token 只在内存里，文件里那份可能已经作废，
+    # 但对自己起的实例它是对的；验 token 要多打一次请求，这里不为此多等）。
+    # 端口对不上就别用 —— 那多半是别的实例上一次留下的（ADR-0024）。
+    if [ -s "${2:-}" ]; then
+        local _u
+        _u=$(head -n 1 "$2" 2>/dev/null)
+        case $_u in
+        *":$1/"* | *":$1?"*) printf '%s' "$_u" && return 0 ;;
+        esac
+    fi
+    printf 'http://127.0.0.1:%s/' "$1"
 }
 
-_hr_url_fresh() { # 地址文件是"这次刚写的"吗：$1=web-url.txt $2=起点标记 $3=起点时的内容
-    # 两条判据取或：**比标记新**，或者**内容变了**。只比 mtime 不够 —— 同一毫秒里
-    # 写完两个文件时 mtime 会一模一样（文件时间戳用的是粗粒度时钟），`-nt` 就假阴性。
-    [ -s "$1" ] || return 1
-    [ "$1" -nt "$2" ] && return 0
-    [ "$(cat "$1" 2>/dev/null)" != "$3" ] && return 0
-    return 1
-}
-
-_hr_token_probe() { # $1=端口 $2=token → ok / bad / 空。dsh web 对无效 token 回 401（本机实测）
-    command -v curl >/dev/null 2>&1 || return 0
-    local _c
-    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$1/?token=$2" 2>/dev/null)
-    case ${_c} in
-    2*|3*) printf 'ok' ;;
-    4*|5*) printf 'bad' ;;
-    esac
-}
-
-_hr_svc_note() { # 单元的实测状态拼一句人话（带 SubState / 重试次数 / RestartSec）
-    local _s=${1:-} _sub=${2:-} _n=${3:-} _rs=${4:-}
-    [ -n "${_s}" ] || _s=未知
-    [ -n "${_sub}" ] && [ "${_sub}" != "${_s}" ] && _s="${_s}/${_sub}"
-    # "还没到最终状态"才有重试次数可讲；inactive/failed 是终态，带上反而误导
-    case ${_s} in
-    activating*)
-        if [ -n "${_n}" ]; then
-            printf '%s（已重试 %s 次%s）' "${_s}" "${_n}" "${_rs:+，每 ${_rs} 一次}"
-        else
-            printf '%s' "${_s}"
+# ---- 开浏览器（三档，**全程不经 shell 拼 URL**；打不开不算失败）--------------
+# 2026-10-09 用户实测踩到的坑：把 URL 拼进 shell 字符串（`cmd /c start "$url"`）
+# 会被 WSL 的路径转换糟蹋成 `http \127.0.0.1 3984\token=MTOK`，Windows 弹
+# "找不到文件"框。**这条路的错在"经 shell"，不是错在 opener 选得不对。**
+# 所以照 DSH 自己的做法（@deepseek-ai/dsh-web-app：`spawn(node, […,'--',url])`
+# + 用 npm 的 `open@11` 包 + 起之前 scrub 掉代理）：
+#   ① 首选：`node <临时脚本> <url> <open 包根>` —— 脚本里 `import open`，
+#      纯 argv、绝不过 shell；`open` 包自己会按平台/WSL 选 opener 并正确传参。
+#   ② 退档：`explorer.exe` / `wslview` / `xdg-open` —— 也是 exec **一个 argv
+#      数组**（`"$_o" "$_url"`），不拼字符串。
+#   ③ 再退：什么都不试，只打印地址（**rc 恒 0**）。
+# 环境变量：
+#   DSH_HARNESS_OPENER=<命令名>    只用这个命令开（**只换命令，URL 仍是 argv**；
+#                                  测试就靠它桩掉）。quiet / none / 空 = 第③档。
+#   DSH_HARNESS_OPEN_ROOT=<npx 缓存目录>  显式指定 `open` 包在哪儿（跳过探测）
+#   DSH_HARNESS_OPENER_LOG=<文件>  把"本来要 spawn 什么"记一行（现场排障用）
+_hr_open_pkg() { # 找 npx 缓存里的 `open` 包根（找到打印，找不到打印空）
+    local _p
+    if [ -n "${DSH_HARNESS_OPEN_ROOT:-}" ]; then
+        if [ -f "${DSH_HARNESS_OPEN_ROOT}/node_modules/open/index.js" ]; then
+            printf '%s' "${DSH_HARNESS_OPEN_ROOT}"
         fi
+        return 0
+    fi
+    for _p in "${HOME:-$PWD}"/.npm/_npx/*; do
+        [ -f "$_p/node_modules/open/index.js" ] || continue
+        printf '%s' "$_p"
+        return 0
+    done
+    return 0
+}
+
+_hr_open() {
+    local _url=$1 _o= _rc=1 _mode= _root= _js= _cand= _log=${DSH_HARNESS_OPENER_LOG:-}
+    [ -n "${_log}" ] && printf 'opener=%s url=<%s>\n' "${DSH_HARNESS_OPENER-unset}" "${_url}" >>"$_log" 2>/dev/null
+
+    local _want=${DSH_HARNESS_OPENER-unset}
+    case ${_want} in
+    quiet | none | '')
+        printf 'harness: 没开浏览器（DSH_HARNESS_OPENER=%s）—— 自己去开上面那个地址\n' "${_want:-空}"
+        return 0
         ;;
-    *) printf '%s' "${_s}" ;;
+    unset) ;;
+    *) _o=$_want ;;
     esac
+
+    # ① node + open 包（无 shell）。open 的入口走**文件 URL**，不能用裸路径 import。
+    if [ -z "${_o}" ] && command -v node >/dev/null 2>&1; then
+        _root=$(_hr_open_pkg)
+        if [ -n "${_root}" ]; then
+            _js=${TMPDIR:-/tmp}/.harness-open.$$.mjs
+            if cat >"$_js" 2>/dev/null <<'JSEOF'
+const argv = process.argv.slice(2);
+const [url, root] = argv;
+for (const k of Object.keys(process.env)) {
+    if (k === 'no_proxy' || k === 'NO_PROXY') continue;
+    if (/^(https?|all)_proxy$/i.test(k)) delete process.env[k];
+}
+const { pathToFileURL } = await import('node:url');
+const mod = await import(pathToFileURL(root + '/node_modules/open/index.js').href);
+await mod.default(url, { wait: false });
+process.exit(0);
+JSEOF
+            then
+                if node "$_js" "$_url" "$_root" >/dev/null 2>&1; then
+                    _rc=0
+                    _mode='node + open 包'
+                fi
+            fi
+            rm -f -- "$_js" 2>/dev/null
+        fi
+    fi
+
+    # ② explorer.exe / wslview / xdg-open（只传 argv，绝不拼字符串）。
+    #    ⚠️ 循环里**一旦把某个候选清成空就必须 break** —— 否则后面 `command -v ""`
+    #    会报错，还继续拿清空的 `_o` 往下走（2026-10-09 实测：`command -v` 的
+    #    退出码被误当成"这个命令在"）。
+    if [ "${_rc}" != 0 ] && [ -z "${_o}" ]; then
+        for _cand in explorer.exe wslview xdg-open; do
+            if command -v "$_cand" >/dev/null 2>&1; then
+                _o=$_cand
+                break
+            fi
+        done
+    fi
+    if [ "${_rc}" != 0 ] && [ -n "${_o}" ]; then
+        if command -v "$_o" >/dev/null 2>&1; then
+            [ -n "${_mode}" ] || _mode=$_o
+            "$_o" "$_url" >/dev/null 2>&1 && _rc=0
+        else
+            _mode="$_o 不在"
+            _rc=1
+        fi
+    fi
+
+    # ③ 结果（一行；开不了也 rc=0 —— 会话已经起来了，地址也打出来了）
+    if [ "${_rc}" = 0 ]; then
+        printf 'harness: 已用 %s 打开浏览器\n' "${_mode}"
+    else
+        printf 'harness: 开不了浏览器（试过 %s）—— 自己去开上面那个地址\n' "${_mode:-没有 opener}"
+    fi
+    return 0
 }
 
 harness() {
     unalias harness 2>/dev/null || true
-    if ! command -v npx >/dev/null 2>&1; then
-        printf 'harness：PATH 里没有 npx（这套用法是 npx @deepseek-ai/dsh web）\n' >&2
-        return 127
-    fi
-    local _hr_state _hr_tok _hr_url _hr_conf _hr_line _hr_u _hr_pub _hr_mark _hr_lp _hr_live _hr_i
-    local _hr_unit _hr_have_unit _hr_svc _hr_sub _hr_main _hr_pid _hr_pid_txt _hr_managed _hr_tokfile
-    local _hr_wait_start _hr_wait _hr_fresh _hr_code _hr_restarts _hr_rsec _hr_jlast _hr_url_before
+    local _hr_state _hr_tok _hr_url _hr_conf _hr_unit _hr_lp _hr_have_unit _hr_args
+    local _hr_i _hr_wait _hr_url_before _hr_pid _hr_pid_txt _hr_managed _hr_mark _hr_u _hr_runner
+    local _hr_line _hr_cfg_lp _hr_wp _hr_svc _hr_svc_state _hr_npx_pid _hr_fargs _a _hr_log
     _hr_state=${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
     _hr_tok=$_hr_state/current-token.txt
     _hr_url=$_hr_state/web-url.txt
-    # 只有"这次真的抓到了 token"才在退出时删 token 文件。标记文件里存我们写进去的那一刻
-    # 的值：抓取循环在子 shell 里（变量传不出来），而且**端口被占时这个函数会什么都没抓到**
-    # —— 那时绝不能去删别人（另一个正在跑的实例）写的 token 文件，否则 broker 又回 503。
-    _hr_mark=$_hr_state/.harness-wrote-token
-    _hr_wait_start=$_hr_state/.harness-wait-start
-    rm -f -- "$_hr_mark" "$_hr_wait_start" 2>/dev/null
+    _hr_mark=$_hr_state/.harness-wrote-token     # "这份 token 是我写的"（退出时 cmp 过才删）
     _hr_conf=${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}/remote.conf
+    # 本仓规矩：常驻由服务负责（ADR-0017）。DSH_REMOTE_HARNESS_UNIT 可以换一个
+    # **不存在的**单元名 → 走到"没有服务、前台起 npx"那条（测试离线验它用；
+    # 也可用于"我就是要手工起、别碰服务"）。
+    _hr_unit=${DSH_REMOTE_HARNESS_UNIT:-dsh-web.service}
+    _hr_log=$_hr_state/harness-npx.log           # 前台那条路的 npx 输出（抓 token 靠它）
     mkdir -p -- "$_hr_state" 2>/dev/null
+    rm -f -- "$_hr_mark" 2>/dev/null
 
-    _hr_unit=dsh-web.service
-    _hr_lp=$(sed -n 's/^[[:space:]]*local_port[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+    # ① 定端口：remote.conf 的 local_port（默认 3080）→ 命令行 --port 覆盖它。
+    #    其余参数**一个字节都不动**往下透传（`harness --no-open` 这种）。
+    _hr_args=
+    _hr_lp=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --port)
+            _hr_lp=${2:-}
+            shift 2
+            ;;
+        --port=*)
+            _hr_lp=${1#--port=}
+            shift
+            ;;
+        *)
+            _hr_args="$_hr_args $1"
+            shift
+            ;;
+        esac
+    done
+    if [ -z "${_hr_lp}" ] && [ -f "$_hr_conf" ]; then
+        _hr_lp=$(sed -n 's/^[[:space:]]*local_port[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+    fi
     [ -n "${_hr_lp}" ] || _hr_lp=3080
-    _hr_pub=$(sed -n 's/^[[:space:]]*public_url[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
-    # systemd 那个单元装着没有（没 systemctl / 没单元 = 走前台，和以前一样）
+
+    # 这个单元装着没有（没 systemctl / 没单元 = 只能走前台）
     _hr_have_unit=0
     if command -v systemctl >/dev/null 2>&1 && _hr_sctl cat "$_hr_unit" >/dev/null 2>&1; then
         _hr_have_unit=1
     fi
 
-    # ── ① 已经有会话在跑 → 复用（绝不起第二个）──────────────────────────────
-    _hr_live=0
-    _hr_listening "${_hr_lp}" && _hr_live=1
-    # 逃生阀：DSH_REMOTE_HARNESS_NO_REUSE=1 → 不做"复用/交给服务"，就走下面的前台路。
-    # 用途：测试（用例要验前台抓 token）、以及"我就是想再起一个新的"这种特殊场合。
-    if [ "${DSH_REMOTE_HARNESS_NO_REUSE:-0}" = 1 ]; then _hr_live=0; fi
-    if [ "${_hr_live}" = 1 ]; then
-        _hr_pid=$(_hr_port_pid "${_hr_lp}")
+    # ── ② 探测：127.0.0.1:<端口> 有人听吗（ss -ltnp）────────────────────────
+    #    有人听 = 已经有了（systemd 的、或谁手工起的）→ **只认它，绝不起第二个**
+    #    —— 这是用户 2026-10-09 的原话："有就立刻打开浏览器……就是这么简单"。
+    _hr_pid=$(_hr_port_pid "${_hr_lp}")
+    if _hr_listening "${_hr_lp}"; then
         if [ -n "${_hr_pid}" ]; then _hr_pid_txt="PID ${_hr_pid}"; else _hr_pid_txt='PID 拿不到（ss -ltnp 看不到）'; fi
-        _hr_svc=
-        _hr_main=0
-        _hr_sub=
-        _hr_restarts=
-        _hr_rsec=
-        if [ "${_hr_have_unit}" = 1 ]; then
-            _hr_svc=$(_hr_sctl is-active "$_hr_unit" 2>/dev/null || true)
-            _hr_main=$(_hr_unit_prop "$_hr_unit" MainPID)
-            _hr_sub=$(_hr_unit_prop "$_hr_unit" SubState)
-            _hr_restarts=$(_hr_unit_prop "$_hr_unit" NRestarts)
-            _hr_rsec=$(_hr_unit_prop "$_hr_unit" RestartUSec)
-        fi
-        # 端口上那个是不是 systemd 那个单元在服务？（cgroup 认得更准）
         _hr_managed=0
-        if [ "${_hr_svc}" = active ] && [ -n "${_hr_pid}" ] \
-            && { [ "${_hr_main}" = "${_hr_pid}" ] || _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; }; then
+        if [ "${_hr_have_unit}" = 1 ] && [ -n "${_hr_pid}" ] \
+            && { [ "$(_hr_unit_prop "$_hr_unit" MainPID)" = "${_hr_pid}" ] || _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; }; then
             _hr_managed=1
         fi
         if [ "${_hr_managed}" = 1 ]; then
-            # systemd 那个单元在服务，web-url.txt / current-token.txt 就是它写的
-            if [ -s "$_hr_url" ]; then
-                _hr_u=$(cat "$_hr_url")
-            elif [ -s "$_hr_tok" ]; then
-                _hr_u="http://127.0.0.1:${_hr_lp}/?token=$(tr -d '\n' <"$_hr_tok")"
-            else
-                _hr_u="http://127.0.0.1:${_hr_lp}/"
-            fi
-            printf 'harness: dsh web 已在跑 ✓  %s（PID %s，%s 托管）\n' "${_hr_u}" "${_hr_pid}" "${_hr_unit}"
-            [ -n "${_hr_pub}" ] && printf 'harness: 手机 %s\n' "${_hr_pub}"
-            return 0
-        fi
-        # 端口上那个**不是** systemd 管的。两种情形：
-        #   ① 单元没装、或它是 inactive/unknown → 本来就是"手起的实例在跑"，这就是正常复用
-        #   ② 单元装着但起不来（activating/failed）→ **服务没起来**，原因就是端口被占
-        _hr_tokfile=
-        if [ -s "$_hr_tok" ]; then
-            _hr_tokfile=$(tr -d '\n' <"$_hr_tok")
-        elif [ -s "$_hr_url" ]; then
-            _hr_tokfile=$(sed -n 's/.*[?&]token=\([^&[:space:]]*\).*/\1/p' "$_hr_url" | head -n 1)
-        fi
-        if [ "${_hr_have_unit}" = 1 ] && [ -n "${_hr_svc}" ] \
-            && [ "${_hr_svc}" != inactive ] && [ "${_hr_svc}" != unknown ]; then
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 被另一个实例占着（%s，不是 systemd 管的）\n' \
-                "${_hr_lp}" "${_hr_pid_txt}"
-            # 那个实例的 token 只在它内存里才一定准 —— 拿真请求验一次再打（H22）
-            if [ -n "${_hr_tokfile}" ] && [ "$(_hr_token_probe "${_hr_lp}" "${_hr_tokfile}")" = ok ]; then
-                printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/?token=%s（token 实测有效）\n' \
-                    "${_hr_lp}" "${_hr_tokfile}"
-            else
-                printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/（token 没记下或实测已失效 —— 那个实例不是这里起的）\n' \
-                    "${_hr_lp}"
-            fi
-            printf 'harness:   → 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的\n'
-            printf 'harness:   systemd: %s  看：journalctl --user -u %s -n 20\n' \
-                "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")" "${_hr_unit}"
-            [ -n "${_hr_pub}" ] && printf 'harness: 手机 %s\n' "${_hr_pub}"
-            return 0
-        fi
-        # 情形 ①：手起的实例在跑，没有服务要它让位
-        printf 'harness: dsh web 已在跑 ✓  http://127.0.0.1:%s/（%s，非 systemd）\n' "${_hr_lp}" "${_hr_pid_txt}"
-        if [ -n "${_hr_tokfile}" ]; then
-            case $(_hr_token_probe "${_hr_lp}" "${_hr_tokfile}") in
-            ok) printf 'harness:   带 token 的入口（实测有效）：http://127.0.0.1:%s/?token=%s\n' "${_hr_lp}" "${_hr_tokfile}" ;;
-            bad) printf 'harness:   本地 token 文件里那个实测已失效（401）—— 这个实例不是这里起的，它的 token 只在它内存里\n' ;;
-            *) printf 'harness:   带 token 的入口（没验过，取自 %s）：http://127.0.0.1:%s/?token=%s\n' "$_hr_tok" "${_hr_lp}" "${_hr_tokfile}" ;;
-            esac
+            printf 'harness: dsh web 已在跑 ✓  http://127.0.0.1:%s/（%s，systemd 托管）\n' "${_hr_lp}" "${_hr_pid_txt}"
         else
-            printf 'harness:   没记下这个实例的 token（不是这里起的；手机走固定地址即可）\n'
+            printf 'harness: dsh web 已在跑 ✓  http://127.0.0.1:%s/（%s，手工起的）\n' "${_hr_lp}" "${_hr_pid_txt}"
         fi
-        [ -n "${_hr_pub}" ] && printf 'harness: 手机 %s\n' "${_hr_pub}"
-        [ "${_hr_have_unit}" = 1 ] || printf 'harness: 想让它开机自动起：dsh-remote serve-install\n'
+        _hr_u=$(_hr_url_of "${_hr_lp}" "$_hr_url")
+        printf 'URL: %s\n' "${_hr_u}"
+        _hr_open "${_hr_u}"
         return 0
     fi
 
-    # ── ② 装了 dsh-web.service 但没跑 → 起来（后台常驻，退出 shell 也不停）────
-    if [ "${DSH_REMOTE_HARNESS_NO_REUSE:-0}" != 1 ] && [ "${_hr_have_unit}" = 1 ]; then
-        _hr_wait=$(printf '%s' "${DSH_REMOTE_HARNESS_WAIT:-20}" | tr -cd '0-9')
-        [ -n "${_hr_wait}" ] || _hr_wait=20
-        [ "${_hr_wait}" -gt 0 ] 2>/dev/null || _hr_wait=20
-        printf 'harness: 等 systemd 写出地址（最多 %ss）…\n' "${_hr_wait}"
-        # 起点标记 + 起点内容：只有"这次刚写的" web-url.txt 才算数。旧文件不算 ——
-        # 否则上一次留下的死地址会被当成"刚起来"的证据，那正是"看不出来起没起来"的来源。
-        _hr_url_before=
-        [ -s "$_hr_url" ] && _hr_url_before=$(cat "$_hr_url")
-        : >"$_hr_wait_start" 2>/dev/null
-        # --no-block：服务是 Type=simple，若端口被别的会话占着它会立刻退出并等重试，
+    # ── ③ 没人听 → 起一个 ────────────────────────────────────────────────
+    #    优先 dsh-web.service：它会（经 dsh-web-run）把 token 抓成文件，而且本仓的
+    #    规矩就是"常驻由服务负责、前台只是没装服务时的退路"（ADR-0017）。
+    #    命令行显式换了端口（≠ remote.conf 的 local_port）时**不走服务** ——
+    #    单元里钉的是配置文件那个端口，拿它去起只会起在别处、还报个假成功。
+    _hr_cfg_lp=
+    [ -f "$_hr_conf" ] && _hr_cfg_lp=$(sed -n 's/^[[:space:]]*local_port[[:space:]]*=[[:space:]]*//p' "$_hr_conf" 2>/dev/null | tail -n 1)
+    [ -n "${_hr_cfg_lp}" ] || _hr_cfg_lp=3080
+    # DSH_REMOTE_HARNESS_WAIT=0 是**合法值**（= 不等待，直接看现在有没有人听；测试用它跑快）。
+    # 只有"没设"或"设了但不是数字"才退回默认 10。
+    if [ -n "${DSH_REMOTE_HARNESS_WAIT:-}" ]; then
+        _hr_wait=$(printf '%s' "${DSH_REMOTE_HARNESS_WAIT}" | tr -cd '0-9')
+        [ -n "${_hr_wait}" ] || _hr_wait=10
+    else
+        _hr_wait=10
+    fi
+
+    if [ "${_hr_have_unit}" = 1 ] && [ "${_hr_lp}" = "${_hr_cfg_lp}" ]; then
+        # --no-block：Type=simple 的单元若绑不上端口会立刻退出并等重试，
         # 同步 start 会把那种情况报成"失败"（其实 systemd 正在按 RestartSec 重试）。
-        _hr_sctl start --no-block "$_hr_unit" 2>/dev/null || true
+        _hr_sctl start --no-block "$_hr_unit" >/dev/null 2>&1 || true
+    elif [ "${_hr_have_unit}" = 1 ]; then
+        command -v npx >/dev/null 2>&1 || {
+            printf 'harness: 端口 %s 上没人听；%s 钉的是 %s，起不到 %s 上 ✗\n' \
+                "${_hr_lp}" "${_hr_unit}" "${_hr_cfg_lp}" "${_hr_lp}"
+            printf 'harness:   要么改 remote.conf 的 local_port，要么把 npx 放进 PATH 走前台\n' >&2
+            return 127
+        }
+        _hr_runner=npx
+    else
+        command -v npx >/dev/null 2>&1 || {
+            printf 'harness: 端口 %s 上没人听，PATH 里也没有 npx ✗（这套用法是 npx @deepseek-ai/dsh web）\n' "${_hr_lp}"
+            printf 'harness:   有 dsh-web.service 就能走服务：dsh-remote serve-install\n' >&2
+            return 127
+        }
+        _hr_runner=npx
+    fi
+
+    # 前台那条路：`npx … dsh web [参数] --port <端口>`，输出边转发边抓 token。
+    # 浏览器**不等 npx 退出**：端口一出现就开（ADR-0024），npx 之后继续占着终端。
+    if [ "${_hr_runner}" = npx ]; then
+        # 参数透传：按字符收集再整体展开（`$_fargs` 不加引号）—— 不做 eval，
+        # 也不去引号，`--no-open`、`--trusted-host x` 这种原样带过去。
+        _hr_fargs=
+        for _a in $_hr_args; do
+            _hr_fargs="$_hr_fargs $_a"
+        done
+        if [ "${_hr_have_unit}" = 1 ]; then
+            printf 'harness: 端口 %s 上没人听；命令行换了端口，前台跑 npx（%s 钉的是 %s）\n' \
+                "${_hr_lp}" "${_hr_unit}" "${_hr_cfg_lp}"
+        else
+            printf 'harness: 端口 %s 上没人听，也没有 %s → 前台跑 npx @deepseek-ai/dsh web\n' \
+                "${_hr_lp}" "${_hr_unit}"
+        fi
+        # shellcheck disable=SC2086
+        npx @deepseek-ai/dsh web $_hr_fargs --port "${_hr_lp}" >"$_hr_log" 2>&1 &
+        _hr_npx_pid=$!
         _hr_i=0
-        _hr_fresh=0
         while [ "${_hr_i}" -lt "${_hr_wait}" ]; do
-            if _hr_url_fresh "$_hr_url" "$_hr_wait_start" "$_hr_url_before" && _hr_listening "${_hr_lp}"; then
-                _hr_fresh=1
-                break
-            fi
+            _hr_listening "${_hr_lp}" && break
             sleep 1
             _hr_i=$((_hr_i + 1))
-            # 早停：单元已经 failed —— 不用把等待等满，原因现在就拿得到
-            [ "$(_hr_sctl is-active "$_hr_unit" 2>/dev/null || true)" = failed ] && break
         done
-        _hr_svc=$(_hr_sctl is-active "$_hr_unit" 2>/dev/null || true)
-        _hr_sub=$(_hr_unit_prop "$_hr_unit" SubState)
-        _hr_restarts=$(_hr_unit_prop "$_hr_unit" NRestarts)
-        _hr_rsec=$(_hr_unit_prop "$_hr_unit" RestartUSec)
-        _hr_main=$(_hr_unit_prop "$_hr_unit" MainPID)
-        rm -f -- "$_hr_wait_start" 2>/dev/null
-        if [ "${_hr_fresh}" = 1 ]; then
-            _hr_pid=${_hr_main}
-            if [ -z "${_hr_pid}" ] || [ "${_hr_pid}" = 0 ]; then _hr_pid=$(_hr_port_pid "${_hr_lp}"); fi
-            printf 'harness: dsh web 已由 systemd 拉起 ✓  %s（PID %s，%s）\n' \
-                "$(cat "$_hr_url")" "${_hr_pid:-未知}" "${_hr_unit}"
-            [ -n "${_hr_pub}" ] && printf 'harness: 手机 %s\n' "${_hr_pub}"
-            return 0
+        if _hr_listening "${_hr_lp}"; then
+            _hr_u=$(_hr_url_of "${_hr_lp}" "$_hr_url")
+            printf 'URL: %s\n' "${_hr_u}"
+            _hr_open "${_hr_u}"
         fi
-        # 没等到地址 → 报**实测出来的**原因，不许猜（2026-10-09 用户要求：
-        # 先看端口有没有人听 —— 有人听就是"端口被占"这一档，原因就确定了，别再写
-        # "端口被占 / npx 卡住都可能是这个"；没人听才去看 systemd，分三档，
-        # 每档都给一条能原地复现的判据命令）。
-        _hr_pid=$(_hr_port_pid "${_hr_lp}")
-        _hr_jlast=$(_hr_journal_last "$_hr_unit")
-        _hr_tokfile=
-        if [ -s "$_hr_tok" ]; then
-            _hr_tokfile=$(tr -d '\n' <"$_hr_tok")
-        elif [ -s "$_hr_url" ]; then
-            _hr_tokfile=$(sed -n 's/.*[?&]token=\([^&[:space:]]*\).*/\1/p' "$_hr_url" | head -n 1)
-        fi
-        if _hr_port_taken "${_hr_lp}"; then
-            if [ -n "${_hr_pid}" ]; then _hr_pid_txt="PID ${_hr_pid}"; else _hr_pid_txt='PID 拿不到（ss -ltnp 看不到）'; fi
-            if [ -n "${_hr_pid}" ] && _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; then
-                # 端口上是**服务自己**的人，却没写出新地址（罕见，别赖到"端口被占"上）
-                printf 'harness: dsh web 没起来 ✗ 原因：%s 上在听的那个 %s 属于 %s，但 %ss 内没写出新地址\n' \
-                    "${_hr_lp}" "${_hr_pid_txt}" "${_hr_unit}" "${_hr_wait}"
-                printf 'harness:   判据：ss -ltnp | grep -E "[:.]%s "；ls -l %s；journalctl --user -u %s -n 20\n' \
-                    "${_hr_lp}" "$_hr_url" "${_hr_unit}"
-            else
-                printf 'harness: dsh web 没起来 ✗ 原因：%s 被别人占着（%s，不是 systemd 管的）—— 服务只能等它让位\n' \
-                    "${_hr_lp}" "${_hr_pid_txt}"
-                # 那个实例的 token 只在它内存里才一定准 —— 拿真请求验一次再打（H22）
-                if [ -n "${_hr_tokfile}" ] && [ "$(_hr_token_probe "${_hr_lp}" "${_hr_tokfile}")" = ok ]; then
-                    printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/?token=%s（token 实测有效）\n' \
-                        "${_hr_lp}" "${_hr_tokfile}"
-                else
-                    printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/（token 没记下或实测已失效 —— 那个实例不是这里起的，它的 token 只在它内存里）\n' \
-                        "${_hr_lp}"
-                fi
-                printf 'harness:   → 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的\n'
-                printf 'harness:   判据：ss -ltnp | grep -E "[:.]%s "   # 这一行就是占着它的那个进程\n' "${_hr_lp}"
-            fi
-            printf 'harness:   systemd: %s  看：journalctl --user -u %s -n 20\n' \
-                "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")" "${_hr_unit}"
-        elif [ "${_hr_svc}" = failed ]; then
-            _hr_code=$(_hr_unit_prop "$_hr_unit" ExecMainStatus)
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 失败（exit %s），端口 %s 上没人听 —— 日志最后一行：%s\n' \
-                "${_hr_unit}" "${_hr_code:-未知}" "${_hr_lp}" "${_hr_jlast:-（journalctl 没给出内容）}"
-            printf 'harness:   判据：systemctl --user show -p ExecMainStatus -p NRestarts --value %s；journalctl --user -u %s -n 1 -o cat\n' \
-                "${_hr_unit}" "${_hr_unit}"
-        elif [ "${_hr_svc}" = activating ] || [ "${_hr_svc}" = active ]; then
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 还在起（%s），端口 %s 上没人听 —— 日志最后一行：%s\n' \
-                "${_hr_unit}" "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")" \
-                "${_hr_lp}" "${_hr_jlast:-（journalctl 没给出内容）}"
-            printf 'harness:   判据：systemctl --user show -p NRestarts -p RestartUSec --value %s；journalctl --user -u %s -n 1 -o cat\n' \
-                "${_hr_unit}" "${_hr_unit}"
+        wait "$_hr_npx_pid" 2>/dev/null
+        # 抓 token 交给**等它退出之后**的文件解析（不再用管道 + 子 shell：
+        # 那样循环里的变量传不出来，等一下都不好加）。
+        _hr_line=$(sed -n 's/^.*\(http:\/\/[^ ]*[?&]token=[^ ]*\).*$/\1/p' "$_hr_log" 2>/dev/null | head -n 1)
+        case $_hr_line in
+        *token=*)
+            printf '%s\n' "${_hr_line##*token=}" >"$_hr_tok" && chmod 600 -- "$_hr_tok" 2>/dev/null
+            printf '%s\n' "$_hr_line" >"$_hr_url" && chmod 600 -- "$_hr_url" 2>/dev/null
+            cp -f -- "$_hr_tok" "$_hr_mark" 2>/dev/null && chmod 600 -- "$_hr_mark" 2>/dev/null
+            printf 'harness: 已捕获 token → %s\n' "$_hr_tok"
+            ;;
+        esac
+        # npx 的输出原样转给用户（桩 npx / 真 npx 都一样：先看它说了什么）
+        if [ -s "$_hr_log" ]; then
+            cat -- "$_hr_log"
         else
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 没在跑（is-active=%s：没装 / 没 enable / 自己退了），端口 %s 上也没人听\n' \
-                "${_hr_unit}" "${_hr_svc:-空}" "${_hr_lp}"
-            printf 'harness:   日志最后一行：%s\n' "${_hr_jlast:-（journalctl 没给出内容）}"
-            printf 'harness:   判据：systemctl --user is-active %s；ss -ltn | grep -E "[:.]%s "；journalctl --user -u %s -n 1 -o cat\n' \
-                "${_hr_unit}" "${_hr_lp}" "${_hr_unit}"
-            printf 'harness:   → 起它：systemctl --user start %s（要开机自动起：dsh-remote serve-install）\n' "${_hr_unit}"
+            printf 'harness: npx 一行输出都没有（起得来吗？）；日志：%s\n' "$_hr_log" >&2
         fi
-        if ! _hr_port_taken "${_hr_lp}" && [ -s "$_hr_url" ]; then
-            printf 'harness:   （web-url.txt 还是上一次的，没被重写）\n'
+        if [ -f "$_hr_mark" ] && [ -s "$_hr_tok" ] && cmp -s -- "$_hr_mark" "$_hr_tok"; then
+            rm -f -- "$_hr_tok" "$_hr_mark"
+            printf 'harness: npx 退出；token 文件已清掉（broker 回 503，不会 302 到死 token）\n'
+        else
+            rm -f -- "$_hr_mark" 2>/dev/null
+            printf 'harness: 没抓到 token —— 原来的 token 文件**保持不动**（broker 不会因此 503）\n' >&2
         fi
         return 0
     fi
 
-    # ── ③ 没有常驻服务（或 NO_REUSE）→ 前台起（老行为：抓 token，退出即清）────
-    if [ "${DSH_REMOTE_HARNESS_NO_REUSE:-0}" = 1 ]; then
-        printf 'harness: DSH_REMOTE_HARNESS_NO_REUSE=1 → 不复用、也不交给服务，前台起新的\n'
-    else
-        printf 'harness: 没有 %s（没装/没 enable）→ 前台跑 npx @deepseek-ai/dsh web（这个终端退出就没了；常驻用 dsh-remote serve-install）\n' \
-            "${_hr_unit}"
-    fi
-    npx @deepseek-ai/dsh web "$@" 2>&1 | while IFS= read -r _hr_line; do
-        case $_hr_line in
-        *'dsh web: http'*)
-            # 那行长这样：dsh web: http://127.0.0.1:3080/?token=XXXX (LAN: …)
-            # 按空格切成词，取**第一个** http URL —— 别用贪婪的 `.*\(...\)`：
-            # 那会抓到行尾那个 LAN 地址（实测踩过）。
-            _hr_u=$(printf '%s\n' "$_hr_line" | tr ' ' '\n' |
-                sed -n '/^http:\/\/.*[?&]token=/p' | head -n 1)
-            case $_hr_u in
-            *token=*)
-                printf '%s\n' "${_hr_u##*token=}" >"$_hr_tok" && chmod 600 -- "$_hr_tok" 2>/dev/null
-                printf '%s\n' "$_hr_u" >"$_hr_url" && chmod 600 -- "$_hr_url" 2>/dev/null
-                cp -f -- "$_hr_tok" "$_hr_mark" 2>/dev/null && chmod 600 -- "$_hr_mark" 2>/dev/null
-                printf 'harness: 已捕获 token → %s\n' "$_hr_tok"
-                if [ -n "${_hr_pub}" ]; then
-                    printf 'harness: 手机 %s（broker 会补 token；收藏这个就行）\n' "${_hr_pub}"
-                fi
-                ;;
-            esac
-            ;;
-        esac
-        printf '%s\n' "$_hr_line"
+    # ── ④ 服务那条路：**最多等 ~10s 端口出现**（不为 token 多等，ADR-0024）─────
+    _hr_url_before=
+    [ -s "$_hr_url" ] && _hr_url_before=$(head -n 1 "$_hr_url" 2>/dev/null)
+    _hr_i=0
+    while [ "${_hr_i}" -lt "${_hr_wait}" ]; do
+        _hr_listening "${_hr_lp}" && break
+        sleep 1
+        _hr_i=$((_hr_i + 1))
     done
-
-    if [ -f "$_hr_mark" ] && [ -s "$_hr_tok" ] && cmp -s -- "$_hr_mark" "$_hr_tok"; then
-        rm -f -- "$_hr_tok" "$_hr_mark"
-        printf 'harness: npx 退出；token 文件已清掉（broker 回 503，不会 302 到死 token）\n'
-    else
-        rm -f -- "$_hr_mark" 2>/dev/null
-        printf 'harness: 没抓到 token（端口被占 / 没起来？）—— 原来的 token 文件**保持不动**（broker 不会因此 503）\n' >&2
+    if _hr_listening "${_hr_lp}"; then
+        _hr_pid=$(_hr_port_pid "${_hr_lp}")
+        _hr_managed=0
+        if [ -n "${_hr_pid}" ] && { [ "$(_hr_unit_prop "$_hr_unit" MainPID)" = "${_hr_pid}" ] || _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; }; then
+            _hr_managed=1
+        fi
+        _hr_svc_state=$(_hr_sctl is-active "$_hr_unit" 2>/dev/null || printf '未知')
+        if [ -n "${_hr_pid}" ]; then _hr_pid_txt="PID ${_hr_pid}"; else _hr_pid_txt='PID 拿不到（ss -ltnp 看不到）'; fi
+        if [ "${_hr_managed}" = 1 ]; then
+            printf 'harness: dsh web 已由 systemd 拉起 ✓  http://127.0.0.1:%s/（%s，%s）\n' \
+                "${_hr_lp}" "${_hr_pid_txt}" "${_hr_unit}"
+        elif [ "${_hr_svc_state}" = active ] || [ "${_hr_svc_state}" = activating ]; then
+            # 这次是我们自己 start 的，而单元 active/activating、端口也在听 ——
+            # 只是 `ss -ltnp` 看不到 pid 或 pid 对不上 MainPID（拿不到 ptrace 权限时常见）。
+            # 判据：`systemctl --user show -p MainPID --value <单元>` 与 `ss -ltnp` 对一下。
+            printf 'harness: dsh web 已由 systemd 拉起 ✓  http://127.0.0.1:%s/（%s，%s is-active=%s）\n' \
+                "${_hr_lp}" "${_hr_pid_txt}" "${_hr_unit}" "${_hr_svc_state}"
+        else
+            # 服务自己不在活跃状态（端口是别人抢的）—— 端口上**确实有东西能服务**，照开
+            printf 'harness: 端口 %s 上已有实例在跑 ✓（%s，%s 现在是 %s）\n' \
+                "${_hr_lp}" "${_hr_pid_txt}" "${_hr_unit}" "${_hr_svc_state}"
+        fi
+        _hr_u=$(_hr_url_of "${_hr_lp}" "$_hr_url")
+        printf 'URL: %s\n' "${_hr_u}"
+        _hr_open "${_hr_u}"
+        return 0
     fi
+
+    # ── ⑤ 等不到端口：**说清实测到的原因**，别装成成功；还在起就照常报成功 ──
+    _hr_wp=$(_hr_port_line "${_hr_lp}")          # 任何地址上有人在听吗（不只是回环）
+    _hr_svc=$(_hr_sctl is-active "$_hr_unit" 2>/dev/null || printf '未知')
+    _hr_next=
+    if [ -n "${_hr_url_before}" ]; then
+        _hr_next="上一份地址（可能是旧的）：${_hr_url_before}"
+    else
+        _hr_next="看日志：journalctl --user -u ${_hr_unit} -n 20"
+    fi
+    if [ -n "${_hr_wp}" ]; then
+        # 端口在听，但 `_hr_listening` 说回环上没人 —— 多半是别的东西占着这个端口号
+        printf 'harness: dsh web 没起来 ✗ 原因：%s 被别人占着（%s，不是回环上的 dsh web）\n' \
+            "${_hr_lp}" "$(_hr_port_pid "${_hr_lp}" | sed 's/^/PID /')"
+        printf 'harness:   判据：ss -ltnp | grep -E "[:.]%s "；journalctl --user -u %s -n 20\n' "${_hr_lp}" "${_hr_unit}"
+        printf 'harness:   %s\n' "${_hr_next}"
+        return 1
+    fi
+    case ${_hr_svc} in
+    activating | active)
+        # 服务还在起（Type=simple + 冷启动的 npx 可能超过等待窗口）：**这不是失败**
+        printf 'harness: dsh web 还在起 … 等了 %ss，%s 上还没人听（%s is-active=%s）；它自己会继续\n' \
+            "${_hr_wait}" "${_hr_lp}" "${_hr_unit}" "${_hr_svc}"
+        printf 'harness:   判据：ss -ltn | grep -E "[:.]%s "；journalctl --user -u %s -n 20\n' "${_hr_lp}" "${_hr_unit}"
+        printf 'harness:   %s\n' "${_hr_next}"
+        return 0
+        ;;
+    esac
+    printf 'harness: dsh web 没起来 ✗ 原因：%s 上没人听，%s is-active=%s\n' \
+        "${_hr_lp}" "${_hr_unit}" "${_hr_svc}"
+    printf 'harness:   判据：systemctl --user is-active %s；ss -ltn | grep -E "[:.]%s "\n' "${_hr_unit}" "${_hr_lp}"
+    printf 'harness:   %s\n' "${_hr_next}"
+    return 1
 }

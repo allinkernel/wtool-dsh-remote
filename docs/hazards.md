@@ -1136,3 +1136,89 @@ grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run
 - **验证程度**：现象是用户 2026-10-09 的实测（拿到的 token 本地 401）；
   `401` 那条判据本轮在真机上复现过（H29 现场：43 字节的 `current-token.txt` → 401）。
   "npx 绑不上端口会不会先打印 token"**没有复现**，按上面反例里写的那样标注。
+
+---
+
+## H32. **「经 shell 拼 URL」在 WSL 下会把地址糟蹋掉** —— 开浏览器必须传 argv
+
+- **现象**（2026-10-09 用户实测）：`harness` 用
+  `cmd.exe /c start '' <url>` 这种"把 URL 拼进 shell 字符串"的路子开浏览器时，
+  Windows 弹框：`Windows 找不到文件 'http \127.0.0.1 3984\token=MTOK'`
+  —— URL 里的 `//` 被转成 `\`、`:` 变成空格、`?` 变成 `\`。
+- **根因**：**错在"经 shell"，不在 opener 选得不对**。WSL 的 interop 会对经过 shell /
+  参数再解析的路径做转换。DSH 自己（`@deepseek-ai/dsh-web-app/lib/index.js`）的做法是
+  **不经 shell**：`spawn(process.execPath, ['--input-type=module','--eval',程序,'--',url])`
+  + npm 的 `open@11` 包（它自己按平台/WSL 选 opener 并按 URL 正确传参）+ 起之前 scrub 父环境。
+- **修法（现状）**：`env.zsh` / `env.bash` 的 `_hr_open` 与 `bin/harness-remote` 的 `hr_open`
+  三档，**全程 argv**：
+  1. 写一个临时 `.mjs`，`node <tmp.mjs> <url> <open 包根>`：里面
+     `import(pathToFileURL(root + '/node_modules/open/index.js').href)`
+     —— **裸路径 import 会被当成协议**（`ERR_UNSUPPORTED_ESM_URL_SCHEME:
+     Received protocol 'https:'`，本轮实测）；起之前删掉
+     `http_proxy/https_proxy/all_proxy/HTTP(S)_PROXY/ALL_PROXY`（`no_proxy` 保留）。
+  2. `explorer.exe <url>` / `wslview <url>` / `xdg-open <url>`（exec 一个 argv 数组）。
+  3. 只打印 `URL:` 行。
+- **判据（能原地复现）**：
+
+  ```sh
+  # ① argv 是不是逐字节的（桩 opener 把它收到的第一个参数写文件）
+  cat >/tmp/opener <<'EOF'
+  #!/bin/sh
+  printf 'argc=%s\n%s\n' "$#" "$1" >"$OPEN_ARGV"
+  EOF
+  chmod +x /tmp/opener
+  printf 'local_port=3082\n' >/tmp/conf/remote.conf
+  OPEN_ARGV=/tmp/argv.txt DSH_HARNESS_OPENER=/tmp/opener DSH_REMOTE_CONF_DIR=/tmp/conf \
+    bash -c '. <本项目>/env.bash; harness --port 3082'
+  cat /tmp/argv.txt        # → argc=1 / http://127.0.0.1:3082/（逐字节相等）
+
+  # ② 记一行"本来要 spawn 什么"（现场排障用）
+  DSH_HARNESS_OPENER_LOG=/tmp/opener.log … ; cat /tmp/opener.log   # → url=<http://127.0.0.1:3082/>
+
+  # ③ 真开一次：浏览器进程表里该多一个窗口/renderer，而且**不许**出现那个 Windows 框
+  ```
+  实测（2026-10-09，3082 上）：走 node + `open` 包那一路，Chrome 进程表里多出一个
+  renderer；`argc=1`、第一个参数逐字节等于 `http://127.0.0.1:3082/`。
+- **注意（一条没定位的观察）**：`explorer.exe <url>` 单独试的时候**不一定真开浏览器**
+  （当时进程表里没多出浏览器）—— 所以它只是第②档兜底，不是首选。这是**一轮的观察**，
+  没定位到原因，别写成"explorer.exe 不能用"。
+- **验证程度**：坑是用户实测；三条判据 2026-10-09 在 3082 上做过（① 两个 shell 各一次、
+  ② 一次、③ 一次）。"零 opener"那一档只有"空字符串覆盖"是自动测的（见 H33 ④）。
+
+## H33. 测试里的五个坑：**前缀赋值 / `env PATH=` / 空 `export` / `unset $_ev` / 桩的模式**
+
+这一轮在 `tests/run_tests.sh` 里连踩五次，都是"看起来对但不生效"，写成一条：
+
+1. **`V=值 函数名`（前缀赋值调用函数）在 dash 下不进函数环境**：函数里 `$V` 会
+   `parameter not set`（`set -u` 直接退出）。判据：
+   `sh -c 'f(){ echo "[${V:-unset}]"; }; V=x f'` → 本轮实测 dash 打印 `[unset]`。
+   修法：**显式 `export V=…` 再调用**（`PATH="$stub:$PATH" sh script` 这种"前缀赋值 + 外部命令"
+   是另一回事，照常能用）。
+2. **`env PATH=/a:/b cmd`**：这台机器的 PATH 里有 `/mnt/c/Program Files/...`（**带空格**），
+   `env` 会把它拆成两个参数 → `env: 'Files': No such file or directory`。
+   修法：别用 `env` 传 PATH；在 shell 里 `export PATH=…` 再跑，或从一份"干净的 BASE PATH"重建。
+3. **`export $_ev`（`$_ev` 为空时）**：`export` 不带参数会把**全部环境变量**打到 stdout，
+   `$(函数 …)` 会把它当结果收走（本轮表现为 `Q⑥：url 打印固定地址` 期望一个 URL、
+   实际是一整屏 `export ALL_PROXY=…`）。修法：`[ -n "$_ev" ] && export $_ev`。
+4. **`unset $(… $_ev 里的名字)`**：会把"调用方通过前缀赋值/别处 export 进来的变量"
+   （如桩 opener 要用的 `OPEN_ARGV`）一起 unset 掉 —— 本轮就是这么把桩的文件弄没的。
+   测试助手函数里**别 unset 任何东西**。
+5. **桩 `systemctl` 的 `case` 必须用通配**：真调用是 `--user start --no-block dsh-web.service`，
+   以 `start` 打头的**精确模式**匹配不上 → 桩什么都不做、测试红得莫名其妙。
+   而且**改模式时别把开头那个引号改丢**（`*"start …"*)` 写成 `*start …*)` 会让 dash 报
+   `Syntax error: word unexpected`，**`sh -n` 查不出来**（本轮就这么踩的）——
+   所以 `sh -n` 过了也要真跑一遍。
+   另：桩 npx 里 **token 那行必须在"绑端口 / exec"之前打**（`exec python3 …` 会把 shell
+   换掉，后面的 `echo` 永远不执行）。
+
+- **验证程度**：五条都是 2026-10-09 本轮实测撞到并修掉的（每条都有当时那次红的断言）。
+
+## H22 补记（2026-10-09，`harness` 重做之后）：手工实例的 token 只在它内存里 → 开浏览器优先用 cookie
+
+`harness` 不再为了"验 token"多打一次请求、也不再多等：**它开浏览器时优先用
+`web-url.txt` 里那份（带 token），但只在该文件里的端口 == 本次端口时才用** ——
+否则会用上一个实例留下的死 token（H22/H29 的同一件事）。退回
+`http://127.0.0.1:<端口>/` 的底气是 **H22 那条实测结论：换到的 cookie 有 30 天、
+签名密钥是持久的，所以同一个 `DSH_HOME` 下浏览器早就带着有效 cookie**。
+要"这个 token 现在还有没有效"就再敲一条命令：`harness-remote status`（它里面那步
+token 新鲜度会真打一次看 401/303）。ADR-0024。

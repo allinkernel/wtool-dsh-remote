@@ -57,22 +57,23 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 2176 | 家里这头的主命令（23 个子命令） |
+| `bin/dsh-remote` | 2777 | 家里这头的主命令（24 个子命令） |
 | `bin/dsh-token-broker` | 386 | **固定地址的入口小服务**（纯 python 标准库）：不带 token 的 `/` 与 `/go` 做 302；**带 `dsh-auth-*` cookie 的 `GET /` 先探测一次、有效就把这一条首页代发**（见 §3.2，ADR-0018） |
 | `bin/dsh-qr` | 573 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
 | `bin/dsh-remote-server` | 8 | `dsh-remote server` 的薄封装（用户先说的是这个名字，两个入口等价） |
+| `bin/harness-remote` | 426 | **云上那半的管理器**（2026-10-09 加，ADR-0024）：`status`/`open`/`reset`/`passwd`/`url`/`qr`，薄封装转发给 `dsh-remote` 的现成子命令 + 同一套 opener；见 §3.6 |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
-| `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
+| `scripts/install.sh` | 215 | `wtool install` 调它：铺命令软链（含 `harness-remote`）+ 配置/日志软链 |
 | `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
 | `cloud/Caddyfile.domain` | 74 | 域名模式模板（占位符 `{{...}}`） |
 | `cloud/Caddyfile.ip` | 77 | IP 模式模板（`tls internal` 自签 + `default_sni`） |
 | `cloud/docker-compose.yml` | 41 | 中继器：一个 `caddy:2.11.4` 容器（host 网络）+ 两个命名卷 |
 | `hooks/claude-hooks.json` | 27 | hook 桥模板（`__DSH_NOTIFY__` 由 `notify-enable` 替换成实际命令） |
-| `env.zsh` / `env.bash` | 365 / 365 | shell 集成：导出三个目录变量 + **`harness` 函数**（含它的只读探测小工具 `_hr_*`）；两份**逐字等价**（只差第 1 行标题），必须同改 |
+| `env.zsh` / `env.bash` | 484 / 484 | shell 集成：导出三个目录变量 + **`harness` 函数**（本地管理器：只读探测 `_hr_*` + 开浏览器 `_hr_open`/`_hr_open_pkg`）；两份**逐字等价**（只差第 1 行标题），必须同改 |
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 58 | 隧道配置样板（含 `web_proxy=`：常驻服务里 npx 的代理开关，默认清空） |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 2321 | **675 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/run_tests.sh` | 2573 | **684 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
 | `tests/fake_dsh_web.py` | 194 | 测试零件：假 `dsh web`（按 cookie 的值造 200/401/303/500/慢响应；只给 K 节用，见 §10） |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
@@ -129,7 +130,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：27 个子命令的真实行为
+## 3. `bin/dsh-remote`：24 个子命令的真实行为（另有两条用户可见命令：`harness` 是 shell 函数、`harness-remote` 是薄封装 —— 见 §3.5.1 / §3.5.3）
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -318,16 +319,17 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
       之后 / 带 cookie → broker 探测 200 → 首页 200（**0 次跳转**，循环到此终止）
 ```
 
-- **`harness` 函数**（`env.zsh` / `env.bash`，两份逐字等价）：包装
-  `npx @deepseek-ai/dsh web "$@"`，把 stdout 里 `dsh web: http://…/?token=…` 的
-  token 写进 `$STATE_DIR/current-token.txt`、完整 URL 写进 `web-url.txt`（都 600），
-  并把 `remote.conf` 里的 `public_url` 打出来提示"收藏这个"。
-  退出时**只删"这次自己写过的那份"**：抓取时同时写一个 `.harness-wrote-token` 标记
-  （内容 = 那一刻的 token），退出时 `cmp` 一下 —— 只有还相等才 `rm`。
-  **没抓到 token（端口被占 / 没起来）就什么都不动**并打一行说明：不然会把另一个
-  正在跑的实例写的 token 文件删掉，broker 又回 503（2026-10-07 实测踩到过）。
+- **`harness` 函数**（`env.zsh` / `env.bash`，两份逐字等价）：**只有"没有
+  `dsh-web.service`、必须前台起 npx"那条路**才由它自己抓 token —— 它把 `npx` 的输出
+  落进 `$STATE_DIR/harness-npx.log`，从里面取出 `dsh web: http://…/?token=…`（**取行首
+  那个，不是行尾 LAN 那个**），token 写 `current-token.txt`、完整 URL 写 `web-url.txt`
+  （都 600）。退出时**只删"这次自己写过的那份"**：抓取时同时写一个
+  `.harness-wrote-token` 标记（内容 = 那一刻的 token），退出时 `cmp` 一下 —— 只有还相等
+  才 `rm`。**没抓到 token 就什么都不动**并打一行说明：不然会把另一个正在跑的实例写的
+  token 文件删掉，broker 又回 503（2026-10-07 实测踩到过）。
+  服务托管那条路上 token 是 `dsh-web-run` 写的（§3.5），`harness` 一个字节都不写。
   文件在 source 时还会 `unalias harness`（别名优先于函数，用户原来那条 alias 会盖住它）。
-  **输出契约见 §3.5**（状态行 + 原因行 + 判据命令；ADR-0020）。
+  **语义与输出见 §3.5.1**（ADR-0024；再打 `public_url`/"token 实测"那种话已经没有了）。
 - **`bin/dsh-token-broker`**（`dsh-remote broker-install` 装成 `dsh-token-broker.service`）：
   只绑 `127.0.0.1:3081`。`GET /go` → 302 `/?token=<当前值>`；`GET /` 按上面那四种走；
   读不到 token 文件、或（没 cookie 时）`dsh web` 端口没在听 → **503 + 一句人话**；
@@ -381,7 +383,8 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
   远程输出**先落文件再判 rc**（管道 + `tee` 会把失败吞掉，H20）。装完立刻再打一次入口
   （401 = basic auth 在挡 / 302 = broker 在补 token）。
 - **家里**：`broker-install` + `tunnel-install`（两个 systemd 单元；ADR-0013/0014）。
-- **harness**：`local_port` 上已经有人在听 → **不动它**，只报告"token 有没有被捕获"；
+- **harness**：`local_port` 上已经有人在听 → **不动它**（新语义下这条更简单：
+  `harness` 自己就是"有人听就只开浏览器"）；
   否则 `exec <shell> -c ". env.<shell>; harness --no-open --port <local_port>"`
   （用 `env.*` 里那个函数，token 才会被 broker 看见）。
 - **二维码**：有 `qrencode` 就用它，否则 `python3 bin/dsh-qr --ecc M --border 2
@@ -422,7 +425,7 @@ compose，命令还是折行的、只复制了半行" → 做成一条命令（A
 ---
 
 
-### 3.5 dsh web 常驻：`dsh-web.service` + `dsh-web-run` + `harness` 的输出契约（2026-10-09 重做）
+### 3.5 dsh web 常驻：`dsh-web.service` + `dsh-web-run` + `harness`（2026-10-09 重做）
 
 **谁在跑会话**：`~/.config/systemd/user/dsh-web.service`（`WantedBy=default.target`，配 linger → 开机自启）：
 
@@ -437,53 +440,64 @@ RestartSec=30          # 端口被手起的会话占着时，不必每 3 秒去�
 **退出不删** token（服务语义；重启覆盖）。它还在**真抓到 token 之后**做一次
 `systemctl --user try-restart dsh-tunnel.service` —— 这就是"会话起来后自动重连阿里云转发"。
 端口已有人听 → 打印说明并 **exit 1**（让 systemd 按 `RestartSec=30` 重试，绝不抢）。
-它还在起 npx **之前**显式处理代理环境（默认清空，见下面"代理"一段；ADR-0021）。
+它还在起 npx **之前**显式处理代理环境（默认清空，见 §3.5.2；ADR-0021）。
 
-#### 3.5.1 `harness` 的输出契约（ADR-0020）
+#### 3.5.1 `harness` 的语义与输出契约（ADR-0024）
 
-用户 2026-10-09 明确要求：**"一眼知道起来没有 + 为什么"**，不许"交给常驻服务…"然后沉默等待。
-所以正常 2–5 行、每行都要有信息量，**第一行永远是状态 + 原因**：
+用户 2026-10-09 的口径："任意时刻执行 `harness`，**有 `dsh web` 就立刻打开浏览器**，
+**没有就自己起一个**；**不许再有'等 20 秒'那种行为**"。所以这个函数的重心不是"起服务"
+而是"**把浏览器指到已经在跑的那个会话上**"。只有两条路：
 
-| 场景 | 第一行（`harness: ` 前缀） |
-|---|---|
-| 手起/复用（端口有人听，没有 systemd 的份） | `dsh web 已在跑 ✓  http://127.0.0.1:3080（PID 152050，非 systemd）` |
-| systemd 那个单元正在服务 | `dsh web 已在跑 ✓  <web-url.txt>（PID 152051，dsh-web.service 托管）` |
-| 刚被 systemd 拉起（这次 start 后写出地址） | `dsh web 已由 systemd 拉起 ✓  <web-url.txt>（PID …，dsh-web.service）` |
-| 服务起不来 | `dsh web 没起来 ✗ 原因：<实测那一条>` + `判据：<命令>` / `看：journalctl …` |
-
-**分支与判据（全部实测，不许猜）**：
-
-| 顺序 | 条件 | 行为 |
+| 顺序 | 条件（全部实测） | 行为 |
 |---|---|---|
-| ① | `local_port` 已有人听（`ss -ltn`，没有 `ss` 用 `curl`） | **复用**，绝不起第二个。再分：端口上那个 PID 是不是单元的 `MainPID`（或 `/proc/<pid>/cgroup` 里有 `dsh-web.service`）—— 是 → "托管 ✓"；不是且单元在 `activating/failed` → 打 **`没起来 ✗ 原因：<端口> 被另一个实例占着（PID …，不是 systemd 管的）`** + 接管办法 + `systemd: activating/auto-restart（已重试 N 次，每 30s 一次）`；不是且单元 `inactive/没装` → 就是普通"已在跑 ✓（非 systemd）" |
-| ② | 没人在听，但 `dsh-web.service` 装了 | 先打一行 **`等 systemd 写出地址（最多 20s）…`**，`start --no-block`，然后逐秒等 —— 成功判据是 `web-url.txt` **这次刚写的**（比起点标记新，**或**内容变了；只比 mtime 会假阴性，见下）**且**端口真在听。等不到 → **先看端口有没有人听**（`_hr_port_taken`：`ss -ltnp \| grep -E '[:.]<端口> '` 有输出，或退回 `curl` 敲门），有人听 → 一档；没人听 → 按 `is-active` 分三档（见下表，每档都带能原地复现的判据命令） |
-| ③ | 上面都不成立（没装单元），或 `DSH_REMOTE_HARNESS_NO_REUSE=1` | 退回**原来**的前台行为（`npx dsh web` + 抓 token + 退出时清 token），先打一行说明走的哪条路 |
+| ① | `127.0.0.1:<端口>` 有人听（`ss -ltn`；没有 `ss` 退回 `curl`） | 打**一行**状态 → **立刻开浏览器** → `return 0`。**不起第二个、不等待、不重启、一个字节都不写**。那一行说清是 `systemd 托管` 还是 `手工起的`（判据：单元 `MainPID` 命中，或 `/proc/<pid>/cgroup` 里带 `dsh-web.service`） |
+| ② | 没人听 | 起一个：**优先 `dsh-web.service`**（`start --no-block`，逐秒最多等 `DSH_REMOTE_HARNESS_WAIT` 秒 = 默认 10，看端口出现）→ 端口一出现就打一行状态 + 开浏览器；**等不到**时按实测分两种：服务还 `active`/`activating` → 打"还在起…" **返回 0**（那不是失败）；其它 → 打实测原因 + 判据，返回 1 |
 
-**②等不到地址时的四档**（2026-10-09 用户要求"原因要确定，别写'可能是这个可能是那个'"）：
+**端口优先级**：命令行 `--port` > `remote.conf` 的 `local_port` > `3080`。
+**其余参数原样透传**给 `npx @deepseek-ai/dsh web`（`--no-open` 这种一个字节都不动）。
 
-| 档 | 判据（先端口，后 systemd） | 打出来的话 |
+**②里"命令行换了端口就不走服务"**：单元的 `ExecStart` 钉的是 `remote.conf` 那个端口
+（ADR-0017），拿它去顶 `--port 3082` 只会起在 3080 再报一个假成功。所以那种情况退回
+**前台** `npx @deepseek-ai/dsh web [参数] --port <端口>`：端口一出现就开浏览器，npx
+继续占着这个终端；它退出时按 `.harness-wrote-token` 标记删掉**自己写的**那一份 token
+（broker 宁可回 503，也别 302 到死 token）。**没有单元**时也走这条路。
+
+**输出 ≤3 行**：
+
+```
+harness: dsh web 已在跑 ✓  http://127.0.0.1:3080/（PID 152050，手工起的）
+URL: http://127.0.0.1:3080/
+harness: 已用 node + open 包 打开浏览器
+```
+
+- 地址优先 `$DSH_REMOTE_STATE_DIR/web-url.txt` 里那份（带 token），**但只在该文件里的
+  端口 == 本次端口时才用** —— 否则会拿上一个实例的死 token（H22）。退回
+  `http://127.0.0.1:<端口>/`：浏览器通常已经有 30 天 cookie（H22 的实测结论）。
+- **放弃的东西**（ADR-0024 有意砍的，不是漏了）：手机固定地址那一行、token 实测那一行
+  （原来要 `curl` 打一次看 401/303）、"想让它开机自动起"的提示。
+  **要体检走 `harness-remote status`（§3.5.3）或 `dsh-remote tunnel-status --probe`。**
+
+**开浏览器（关键新能力；`_hr_open` + `_hr_open_pkg`）**：**绝不把 URL 拼进 shell**
+（`cmd /c start "$url"` 在 WSL 下会把 URL 转成 `http \127.0.0.1 3984\token=MTOK`，
+Windows 弹"找不到文件"框 —— 用户实测，H32）。三档退：
+
+| 档 | 怎么起 | 说明 |
 |---|---|---|
-| 端口被别人占着 | `ss -ltnp \| grep -E '[:.]<lp> '` 有输出，且那个 PID 既不是 `MainPID`、cgroup 里也没有 `dsh-web.service` | `没起来 ✗ 原因：<lp> 被别人占着（PID x，不是 systemd 管的）—— 服务只能等它让位` + `现在能用的还是那个实例：http://127.0.0.1:<lp>/`（token 拿真请求验过才打带 token 的地址）+ `→ 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的` + 判据 `ss -ltnp \| grep -E '[:.]<lp> '` + `systemd: <状态>` |
-| 服务失败 | 没人听 + `is-active=failed` | `没起来 ✗ 原因：dsh-web.service 失败（exit N），端口 <lp> 上没人听 —— 日志最后一行：<journalctl -o cat 最后一行原文>` + 判据（`show -p ExecMainStatus -p NRestarts` / `journalctl … -n 1 -o cat`） |
-| 服务还在起 | 没人听 + `is-active=activating`（或 `active`） | `没起来 ✗ 原因：dsh-web.service 还在起（activating/auto-restart（已重试 N 次，每 30s 一次）），端口 <lp> 上没人听 —— 日志最后一行：…` + 判据（`show -p NRestarts -p RestartUSec` / `journalctl … -n 1 -o cat`） |
-| 服务没在跑 | 没人听 + 其它状态（`inactive`/空/`unknown`） | `没起来 ✗ 原因：dsh-web.service 没在跑（is-active=inactive：没装 / 没 enable / 自己退了），端口 <lp> 上也没人听` + `日志最后一行：…` + 判据（`is-active` / `ss -ltn \| grep -E '[:.]<lp> '` / `journalctl … -n 1 -o cat`）+ `→ 起它：systemctl --user start dsh-web.service` |
+| ① | `node <临时 .mjs> <url> <open 包根>` | .mjs 里 `import(pathToFileURL(root + '/node_modules/open/index.js').href)`（npx 缓存里的 `open@11`；**裸路径 import 会被当协议**）；起之前清掉 `http_proxy/https_proxy/all_proxy/HTTP(S)_PROXY/ALL_PROXY`（`no_proxy` 保留）——照抄 DSH 自己的 `spawn(node, […,'--',url])` 做法 |
+| ② | `explorer.exe <url>` / `wslview <url>` / `xdg-open <url>` | exec 一个 argv 数组，不拼字符串 |
+| ③ | 只打印 `URL:` 行 | 一个 opener 都没有时 |
 
-（四档都会补一行 `（web-url.txt 还是上一次的，没被重写）` —— 不许拿旧文件冒充"刚起来"。）
+**打开失败不算失败**（rc 恒 0，只多一行提示）—— 这个命令的职责是"让会话起来 + 把地址
+给出来"，浏览器只是顺手。环境变量：`DSH_HARNESS_OPENER=<命令名>` 覆盖第①②档
+（**只换命令，URL 仍是 argv**；`quiet`/`none`/空 = 第③档）；`DSH_HARNESS_OPEN_ROOT=<npx 缓存目录>`
+显式指定 `open` 包在哪；`DSH_HARNESS_OPENER_LOG=<文件>` 记一行"本来要 spawn 什么 argv"
+（现场排障 / 证明 URL 没被转换）。
 
-- **PID 来自 `ss -ltnp`**；拿不到就写 `PID 拿不到（ss -ltnp 看不到）`，不编一个。
-- **token 只打"验过的"**：复用别人（非 systemd）那个实例时，本地 token 文件可能是旧的
-  （H22：正在跑的实例 token 只在它内存里），所以拿真请求探一次
-  `GET /?token=<值>` —— 303/200 → `token 实测有效` 才打；401 → 只说"实测已失效"；
-  判断不出（非 HTTP 端口）→ 说"没验过"。
-- **"刚写的"为什么不能只比 mtime**：文件时间戳是粗粒度时钟（同一次时钟 tick 内写两个
-  文件会拿到**一模一样**的 mtime），`test -nt` 会假阴性 → 所以取"比标记新 **或** 内容变了"。
-- 环境变量：`DSH_REMOTE_HARNESS_NO_REUSE=1`（跳过 ①②，永远前台）；
-  `DSH_REMOTE_HARNESS_WAIT=<秒>`（②的等待上限，默认 20，测试用它跑快）。
-- 相关的只读探测都在 env 里，前缀 `_hr_`（`_hr_sctl` / `_hr_listening` / `_hr_port_pid` /
-  `_hr_unit_prop` / `_hr_pid_in_unit` / `_hr_journal_last` / `_hr_token_probe` /
-  `_hr_url_fresh` / `_hr_svc_note`）—— **一个字节都不写**；`_hr_sctl` 在
-  `XDG_RUNTIME_DIR` 为空时按 logind 约定补 `/run/user/<uid>`（非登录 shell 里
-  `systemctl --user` 会报 "Failed to connect to bus"，而用户管理器其实活着）。
+**另有两条环境变量**：`DSH_REMOTE_HARNESS_WAIT=<秒>`（②的等待上限，默认 10；`0` = 不等，
+测试用它跑快）、`DSH_REMOTE_HARNESS_UNIT=<单元名>`（给一个**不存在**的单元名 = 强制走
+前台那条路；测试离线验前台用它，也可以用于"我就是要手工起"）。
+**`DSH_REMOTE_HARNESS_NO_REUSE=1` 已经不存在了** —— 它的语义就是"再起一个"，
+正是这次要禁止的行为。
 
 #### 3.5.2 `dsh-web-run` 的代理策略（ADR-0021、hazards H28）
 
@@ -499,17 +513,40 @@ RestartSec=30          # 端口被手起的会话占着时，不必每 3 秒去�
 **现状（2026-10-09 实测，别当成"坏了"）**：本机的 `dsh-web.service` 长期停在
 **`activating`**（`SubState=auto-restart`，`NRestarts` 已经 100+）—— 因为用户手工起的
 那个 `npx dsh web --port 3080` 还占着 `local_port`（3080），`dsh-web-run` 每次都按设计
-**exit 1**、systemd 每 30 秒重试一次。这时候 `harness` 会直接说出这个原因（`没起来 ✗
-原因：3080 被另一个实例占着（PID 152050，不是 systemd 管的）`），**在跑的会话完全不受
-影响**（那是用户正在用的实例，谁都不许抢）。要不要"自动接管"仍是**待用户决定**的事
-（`BACKLOG.md` U15），现状是保持不动。可复现判据：
+**exit 1**、systemd 每 30 秒重试一次。**新语义下 `harness` 根本不看 systemd**：它先
+`ss -ltnp`，看到 3080 有人听就认出"手工起的实例"、打一行、开浏览器（ADR-0024）。
+`没起来 ✗ 原因…`那一套现在活在 `harness-remote status`（§3.5.3）和
+`dsh-remote tunnel-status --probe` 里。**在跑的会话完全不受影响**（那是用户正在用的实例，
+谁都不许抢）。可复现判据：
 
 ```sh
 systemctl --user is-active dsh-web.service      # activating
 systemctl --user show dsh-web.service -p SubState -p NRestarts --value   # auto-restart / 100+
 ss -ltnp | grep ':3080'                          # 有人听（PID 是手起那个，不在 dsh-web.service 的 cgroup 里）
-bash -c '. ~/self/wtool/tools/dsh-remote/env.bash; harness'   # 直接打印上面那条原因
+bash -c '. ~/self/wtool/tools/dsh-remote/env.bash; harness'   # 一行"已在跑 ✓（…手工起的）"+ 开浏览器
 ```
+
+#### 3.5.3 `harness-remote`：云上那半的管理器（ADR-0024）
+
+`bin/harness-remote`（**薄封装，不写第二套逻辑**）：每条子命令都转发给已经存在、
+已经测过的 `dsh-remote` 子命令，只做三件这里才有价值的事：**压行**、**开浏览器**
+（和 `harness` 同一套三档，`hr_open`/`hr_open_pkg` 是同一份实现的有意重复）、
+**说清云上地址是哪来的**。
+
+| 子命令 | 做什么 | 退出码 |
+|---|---|---|
+| `status` | **≤6 行**：隧道（含云上两个 `-R` 口）/ broker（含 token 新鲜度）/ web / 入口（含公网 HTTP 码）/ `dsh-relay` 容器 / 结论+下一步。数据来自 `dsh-remote tunnel-status --probe` + `dsh-remote force-restart-dsh-remote --json` 的**现成输出**（`fr_field` 按 `"step":"<键>"` 取值），再跑一次只读 `ssh … docker ps` | 0 |
+| `open` | 打印并打开 `https://<host>:<port>/`（`public_url` 有就用它；否则 `cloud_host` + `public_port`，默认 8443） | 0 |
+| `reset` | `exec dsh-remote force-restart-dsh-remote`（**安全档，绝不碰 dsh web**）。带 `--restart-web` / `--yes` = **直接拒绝**并指路（ADR-0022 的唯一例外必须人在机器上敲） | 0 / 1 |
+| `passwd` | `exec dsh-remote passwd "$@"`（**原样转发**，含 `--dry-run` / `--user` / `--password`） | 转发 |
+| `url` / `qr` | 只打印固定地址 / 二维码文件路径（`<state>/phone-qr.png|.svg`） | 0 / 1 |
+
+- `DSH_REMOTE_BIN=<路径>` 指定被转发的 `dsh-remote`（默认兄弟 `bin/dsh-remote`，再退 PATH）——
+  测试靠它把真命令换成桩。
+- 安装：`scripts/install.sh` 把它软链进 `$WTOOL_PREFIX/bin`（和 `dsh-remote-server` /
+  `dsh-force-restart-dsh-remote` 同一个模式），`--uninstall` 一起撤。
+- **边界**：它不管家里那半（那是 `harness`）、不直连云上（云上写操作只有
+  `dsh-remote cloud-install` / `server` 会做）、不允许从云上重启 `dsh web`。
 
 ## 4. `cloud-install`：会碰云上那台机器的唯一子命令
 
@@ -825,7 +862,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-09 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **675 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / **J 100** / **K 55** / **L 17** / M 46 / **N 22** / **O 142** / **P 85**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节：harness 函数两个 shell 各抓一次 token / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + harness 四态输出契约 + 代理（O 节，142 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；四态之外还有"等超时"的四档（端口被别人占 / 服务失败 exit N / 还在起第 N 次重试 / 服务没在跑），每档都断言"原因 + 判据命令"、且不许再出现含糊话；`dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）**、**一键强制重置 + 手机 `/reset`（P 节，85 条：`--help` 与薄封装等价、安全档在"隧道健康/不健康""token 有效/过期""端口有人听/没人听"几种桩状态下输出的关键行、`--restart-web` 无 `--yes` 拒绝 + `--yes` 只 SIGTERM 那一个真 PID、cmdline 不含 dsh 时拒绝杀、`DSH_REMOTE_FROM_BROKER=1` 下不重启 broker 也拒绝 `--restart-web`、`--json` 每行合法、broker 真进程的 `GET/POST /reset`（nonce 一次性、重放 403、结果页渲染、两处都无 token/密码泄漏）、两份 Caddyfile 的 `@reset` 位置）** |
+| `tests/run_tests.sh` | **684 通过 0 失败**（A 14 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 56 / **J 100** / **K 57** / **L 17** / M 46 / **N 22** / **O 79** / **P 85** / **Q 65**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节，57 条：harness 前台那条路两个 shell 各抓一次 token 并验"退出即清" / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + `harness` 的新语义（O 节，79 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；**六种情形** = 端口有人听（手工起的）／端口有人听且是 systemd 托管／有**本端口**的 `web-url.txt` 就开那个／没人听但有单元（`start` 之后端口出现）／没人听也没单元（前台 npx：端口一出现就开浏览器 + 参数原样透传 + token 抓/清）／命令行换了端口（不拿服务去顶）；两条硬判据 = **那个端口上的 PID 前后不变**（证明没起第二个）+ 桩 opener 收到的第一个参数**逐字节**等于完整 URL、`argc=1`；外加 opener 三档退与 `dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）**、**一键强制重置 + 手机 `/reset`（P 节，85 条：`--help` 与薄封装等价、安全档在"隧道健康/不健康""token 有效/过期""端口有人听/没人听"几种桩状态下输出的关键行、`--restart-web` 无 `--yes` 拒绝 + `--yes` 只 SIGTERM 那一个真 PID、cmdline 不含 dsh 时拒绝杀、`DSH_REMOTE_FROM_BROKER=1` 下不重启 broker 也拒绝 `--restart-web`、`--json` 每行合法、broker 真进程的 `GET/POST /reset`（nonce 一次性、重放 403、结果页渲染、两处都无 token/密码泄漏）、两份 Caddyfile 的 `@reset` 位置）**、**`harness-remote`（Q 节，65 条：`--help` 说清"本地那半是 harness"／`status` ≤6 行且数据来自 `tunnel-status --probe` + `force-restart --json` 两条现成输出（调用数用桩记账断言）／`open` 用同一套 opener（argv 逐字节）／`reset` 走安全档且**拒绝** `--restart-web`（调用数不涨）／`passwd` 原样转发／`url`/`qr`／参数写错要指路 —— 全程桩 `dsh-remote`，绝不碰云上）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -853,9 +890,10 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
   `{{BROKER_PORT}}` + `@go`，而且 **`@entry` 里不许再出现 `not header Cookie`**
   （针带缩进 —— 模板注释里解释了"为什么不能写"，只搜字面词会误报，这一条第一次就是这么红的）；
   `relay.sh` 里的 `{{BROKER_PORT}}` 替换与 `--broker-port`；
-  `harness` 函数在 **bash 和 zsh 两份**里各用假 `npx` 抓一次 token（写文件 → 退出时删掉，
-  抓的是行首那个不是 LAN 那个）；还有一条容错回归：**没抓到 token 时不许把别人写的
-  token 文件清掉**。
+  `harness` 函数在 **bash 和 zsh 两份**里各用假 `npx` 走一次前台那条路、抓一次 token
+  （退出时删掉，抓的是行首那个不是 LAN 那个；`DSH_REMOTE_HARNESS_UNIT=none` 强制走前台，
+  桩 `npx` 会真绑一下回环端口 —— 新版是"端口一出现就开浏览器"）；还有一条容错回归：
+  **没抓到 token 时不许把别人写的 token 文件清掉**。
   **broker 起真进程**（python3）+ **假 `dsh web` 夹具** `tests/fake_dsh_web.py`
   （按 cookie 的值造 200 首页 / 401 / 303 回入口 / 500 / 拖过超时）：
   验 302/404/405/503 与"只绑回环"；**过期 cookie → 302 + `Set-Cookie` 清掉那条**；
@@ -932,6 +970,12 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `DSH_REMOTE_BROKER_PORT` | dsh-token-broker | broker 监听端口（默认 3081；一般由 `broker-install` 用 `--port` 传） |
 | `DSH_REMOTE_FROM_BROKER` | dsh-remote（`force-restart-dsh-remote`） | 由 broker 的 `/reset` 起子进程时置 1：**不许** `--restart-web`、**跳过**重启 broker 自己（它就是发起者） |
 | `DSH_REMOTE_RESET_DELAY` | dsh-token-broker | `/reset` 起的那次 run 先睡几秒再动隧道（默认 2 —— 让 POST 的 202 先发出去） |
+| `DSH_REMOTE_HARNESS_WAIT` | `harness`（env.*） | ②那条最多等端口出现多久（默认 10；`0` = 不等） |
+| `DSH_REMOTE_HARNESS_UNIT` | `harness`（env.*） | 换一个单元名；给**不存在**的名字 = 强制走前台 npx（测试/手工起用） |
+| `DSH_HARNESS_OPENER` | `harness`、`harness-remote` | 开浏览器用哪个命令（默认按顺序自动探；`quiet`/`none`/空 = 不开） |
+| `DSH_HARNESS_OPEN_ROOT` | `harness`、`harness-remote` | 显式指定 `open` npm 包在哪个 npx 缓存目录下 |
+| `DSH_HARNESS_OPENER_LOG` | `harness`、`harness-remote` | 把"本来要 spawn 什么 argv"记一行（现场排障） |
+| `DSH_REMOTE_BIN` | `harness-remote` | 被转发的 `dsh-remote` 路径（测试用桩） |
 | `DSH_REMOTE_IFACE` | dsh-remote（`passwd` 的验证那步） | 给 `curl` 绑网卡（本机绕开 Clash 用 `eth1`，见 hazards H11） |
 | `relay_dir` / `RELAY_DIR`（conf 键） | dsh-remote passwd | 云上中继目录，默认 `/home/mindul/dsh-relay` |
 
@@ -954,10 +998,10 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `~/.config/systemd/user/dsh-token-broker.service` | **token broker 单元**（`broker-install` 渲染；同目录可能留 `.bak-<时间戳>`） |
 | `~/.local/lib/dsh-remote/tunnel-watch.sh` | **自愈检查脚本**（内部件，`tunnel-install` 渲染，0755；`--no-watch` 不装）。**不在 `PATH` 上**，见 §3.1.1 |
 | `~/.config/systemd/user/dsh-tunnel-watch.service` / `.timer` | 自愈件的 oneshot 单元 + 5 分钟一次的 timer（同上；`tunnel-uninstall` 一起撤） |
-| `$WTOOL_PREFIX/var/dsh-remote/current-token.txt` | **当前 token**（`harness` 函数写，broker 读；只存 token 一行，600，harness 退出即删） |
+| `$WTOOL_PREFIX/var/dsh-remote/current-token.txt` | **当前 token**（服务的 `dsh-web-run`，或 `harness` 前台那条路写；broker 读；只存 token 一行，600） |
 | `$WTOOL_PREFIX/var/dsh-remote/web-url.txt` | 带 token 的完整地址（`harness` 函数 / `dsh-remote serve` / `dsh-web-run` 都写这一份） |
 | `$WTOOL_PREFIX/var/dsh-remote/.harness-wrote-token` | `harness` 的"这份是我写的"标记（内容 = 那一刻的 token；退出时 `cmp` 相等才删 token 文件） |
-| `$WTOOL_PREFIX/var/dsh-remote/.harness-wait-start` | `harness` 等 systemd 写地址的**起点标记**（只有比它新的 `web-url.txt` 才算"刚写的"；用完即删） |
+| `$WTOOL_PREFIX/var/dsh-remote/harness-npx.log` | `harness` 前台那条路的 `npx` 输出（抓 token 靠它；每次前台启动覆盖） |
 | `$WTOOL_PREFIX/var/dsh-remote/dsh-web-run.log` | `dsh-web-run` 自己的日志（服务那边主要看 journald；含"代理: …"那一行） |
 | `$WTOOL_PREFIX/var/dsh-remote/reset-last.jsonl` | **手机 `/reset` 那次的输出**（一行一条 JSON：`head`/`step`/`summary`；broker 的页面渲染它。不是第二套状态 —— token 仍然只有 `current-token.txt` 一份） |
 | `$WTOOL_PREFIX/var/dsh-remote/reset-last.err` | 同一次的 stderr（正常是空的） |
