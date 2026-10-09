@@ -825,3 +825,9 @@ B 6 / C 22 / D 34 / E 53 / F 14 / G 8 / H 6 / I 56 / J 100 / **K 57** / L 17 / M
   `ssh` 不通时它会打印"探不到 + 判据"，那条**没在断网情况下验过**。
 - `passwd` **只跑了 `--dry-run`**（用户明令：绝不许改密码）；真改密码那条路这轮没走。
 - 真手机端到端（扫码 / 拿真 token 从公网走完整一遍）仍然**没做**（老缺口，见 U1）。
+
+**提交信息里的一个错字（不改历史，在这里订正）**：`b169b4a` 的正文里把 systemd 单元的
+`ExecStart` 写成了 `ExecPort`（"单元 ExecPort 钉的是 remote.conf 那个"）——
+**以 `ExecStart` 为准**（`dsh-web.service` 里是
+`ExecStart=…/dsh-web-run --port <local_port>`）。按仓库规矩：不许为改一句话
+rewrite 历史，所以在这里点名那个提交。
