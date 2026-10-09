@@ -58,21 +58,22 @@
 | 文件 | 行数 | 是什么 |
 |---|---|---|
 | `bin/dsh-remote` | 1844 | 家里这头的主命令（23 个子命令） |
-| `bin/dsh-token-broker` | 172 | **token 重定向小服务**（纯 python 标准库；只做 302，不代理，见 §3.2） |
+| `bin/dsh-token-broker` | 386 | **固定地址的入口小服务**（纯 python 标准库）：不带 token 的 `/` 与 `/go` 做 302；**带 `dsh-auth-*` cookie 的 `GET /` 先探测一次、有效就把这一条首页代发**（见 §3.2，ADR-0018） |
 | `bin/dsh-qr` | 573 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
 | `bin/dsh-remote-server` | 8 | `dsh-remote server` 的薄封装（用户先说的是这个名字，两个入口等价） |
 | `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
 | `scripts/install.sh` | 210 | `wtool install` 调它：铺命令软链 + 配置/日志软链 |
 | `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
-| `cloud/Caddyfile.domain` | 47 | 域名模式模板（占位符 `{{...}}`） |
-| `cloud/Caddyfile.ip` | 50 | IP 模式模板（`tls internal` 自签 + `default_sni`） |
+| `cloud/Caddyfile.domain` | 74 | 域名模式模板（占位符 `{{...}}`） |
+| `cloud/Caddyfile.ip` | 77 | IP 模式模板（`tls internal` 自签 + `default_sni`） |
 | `cloud/docker-compose.yml` | 41 | 中继器：一个 `caddy:2.11.4` 容器（host 网络）+ 两个命名卷 |
 | `hooks/claude-hooks.json` | 27 | hook 桥模板（`__DSH_NOTIFY__` 由 `notify-enable` 替换成实际命令） |
 | `env.zsh` / `env.bash` | 24 / 24 | shell 集成：只导出三个目录变量；两份必须同改 |
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 31 | 隧道配置样板 |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 1271 | **362 条**（2026-10-07 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/run_tests.sh` | 1609 | **437 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/fake_dsh_web.py` | 194 | 测试零件：假 `dsh web`（按 cookie 的值造 200/401/303/500/慢响应；只给 K 节用，见 §10） |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
@@ -108,10 +109,11 @@
    （默认只认回环 / 本机 LAN / `--trusted-host`）就认这个请求，**不用重启 harness**。
    会话界面是流式的：`flush_interval -1` + `read_timeout 0`。
 5. 18080 是**云上 sshd 的 `-R` 监听口**，只绑 `127.0.0.1`（安全组里没有它）。
-   同一条 ssh 上还有 18081 → 家里的 **token broker**（只做 302，见 §3.2）：
+   同一条 ssh 上还有 18081 → 家里的 **token broker**（见 §3.2）：
    `dsh web` 的 token 每个进程随机、只在内存里，所以手机收藏的固定地址
-   `https://<入口>/`（不带 token）由 Caddy 交给 broker，broker 302 到
-   `/?token=<当前值>`；拿 token 换到 30 天的签名 cookie 之后，`/` 就直连 dsh web 了。
+   `https://<入口>/`（不带 token）由 Caddy 交给 broker —— 没有 cookie 就 302 到
+   `/?token=<当前值>`；带着 cookie 就先拿它探一次家里的 `dsh web`，有效就把这一条
+   `GET /` 代发回来（会话/SSE/WebSocket 不经过它），过期就再补一次 token（ADR-0018）。
 6. 隧道另一头是家里的一条 **systemd `--user` 常驻服务** `dsh-tunnel.service`：
    `ssh -N -T … -R 127.0.0.1:18080:127.0.0.1:3080 <云上用户>@<云上主机>`
    （由 `dsh-remote tunnel-install` 渲染 + `enable --now`，见 §3.1）。
@@ -160,7 +162,7 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 | `notify-enable` | ①`mkdir -p $CONF_DIR $DSH_HOME/profiles/web` ②把 `hooks/claude-hooks.json` 里的 `__DSH_NOTIFY__` 换成 `$NOTIFY` 写进 `$CONF_DIR/hooks.json`（模板不在就 `die`）③`$DSH_HOME/profiles/web/cordis.patch.yml` 不存在就先建一个 `# 注释` + `[]` ④里面没有 `# >>> dsh-remote notify` 标记时：先备份成 `$pf.bak-dsh-remote`，文件里**整行是 `[]`** 就把 `[]` 换成那段块（YAML 里两个顶层值会打架），否则直接追加 ⑤打印验证命令 `dsh --profile web --dump-config \| grep -A3 hooks-claude-code`。**幂等**（标记在就跳过） | 0 / 1 |
 | `notify-disable` | 用 `awk` 把 `# >>> dsh-remote notify` 到 `# <<< dsh-remote notify` 之间那段删掉；删完如果只剩注释/空行，补回一行 `[]`（profile 的空 patch 层会让 boot 失败）。`hooks.json` 留着不删 | 0 / 1 |
 | `server` | **一条命令装好**（2026-10-07 加，ADR-0015）：问/收参数（`--host` `--ssh-user` `--ssh-port` `--port` `--web-user` `--password` `--dir` `--docker-cmd` `--tunnel-port` `--broker-port` `--local-port` `--broker-local-port`；`--yes` 全默认、`--dry-run` 只打印、`--skip-deploy` / `--skip-local` / `--no-harness` 分段跑）→ **自检**（免密 ssh + 远端 `id -un` 必须等于 `--ssh-user`；`docker info` 与 `sudo -n docker info` **分开探**；对外端口没被别人占；从家里 `curl` 看安全组；认出已装的 `dsh-relay`）→ **云上部署**（`scp -r cloud/` + `relay.sh --no-compose` 用户空间模式，失败**不再被管道吞掉**）→ 写回 `remote.conf` → 家里 `broker-install` + `tunnel-install` → `local_port` 没人听才用 `harness` 函数起 harness → 打印固定地址 + 二维码 + 改密码/停/看日志三条命令 | 0 / 1 |
-| `token-broker` | **前台**跑 broker（`--port` / `--web-port` / `--token-file` 可覆盖）；常驻用 `broker-install`。它自己 `exec python3 bin/dsh-token-broker` | 循环 / 1 |
+| `token-broker` | **前台**跑 broker（`--port` / `--web-port` / `--token-file` / `--probe-timeout` 可覆盖）；常驻用 `broker-install`。它自己 `exec python3 bin/dsh-token-broker` | 循环 / 1 |
 | `broker-install` | 渲染并装 `~/.config/systemd/user/dsh-token-broker.service`（`ExecStart=<python3> <PROJ_DIR>/bin/dsh-token-broker --port <broker_local_port> --web-port <local_port> --token-file <token_file>`；`Restart=always` / `RestartSec=3` / `StartLimitIntervalSec=0` / journald）→ `daemon-reload` → `enable --now` → 停 2 秒打印判据（含 `curl http://127.0.0.1:<port>/` 的 302/503 判读）。`--no-enable` / `--dry-run` | 0 / 1 |
 | `broker-uninstall` | `disable --now` + 删单元 + `daemon-reload`；token 文件留着（`harness` 函数还在写） | 0 |
 | `cloud-setup` | **只打印**要人在云上敲的 scp / ssh 命令（值从 `remote.conf` 取，缺的用 `<你的阿里云公网 IP>` / `root` / `18080` / `3080` 占位），末尾提醒安全组只开 22 + 443/8443，**绝不要开 18080 和 3080** | 0 |
@@ -253,24 +255,29 @@ WantedBy=default.target
 和它自己的 `enable` 软链；`systemctl --user daemon-reload` / `enable --now` /
 `disable --now` / `restart`。**不碰 `/etc/systemd`**、不碰系统级 unit。
 
-### 3.2 手机固定地址：`harness` 函数 + token broker + Caddy 两条路由（2026-10-07 加）
+### 3.2 手机固定地址：`harness` 函数 + token broker + Caddy 三条路由（2026-10-09 更新）
 
 **要解决的问题**：`dsh web` 的 token 是**每个进程随机、只在内存里**的
 （`processLaunchToken`，32 字节 base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关 ——
-hazards H22），所以"家里重启一次 harness，手机上的地址就作废"。做法见 ADR-0014：
+hazards H22），所以"家里重启一次 harness，手机上的地址就作废"。做法见 ADR-0014，
+"cookie 还有效吗"那半见 **ADR-0018**：
 
 ```
 手机 → https://<入口>/（不带 token，Caddy 先过 basic auth）
-        │  Caddy @entry：path / 且没有 token 参数 且 没有 dsh-auth-* cookie
+        │  Caddy @entry：path / 且没有 token 参数（**不按 cookie 排除**）
         ▼
       云上 127.0.0.1:18081 ──（同一条 ssh 的第二条 -R）──▶ 家里 127.0.0.1:3081
         │                                                     dsh-token-broker
-        │  302 Location: /?token=<当前值>                      读 current-token.txt
+        │  没有 dsh-auth-* cookie：302 Location: /?token=<当前值>
+        │  有 dsh-auth-* cookie：拿它 GET 一次 127.0.0.1:3080/
+        │        探测 2xx/3xx → 把这条 GET / 代发，响应原样回（Set-Cookie 透传）
+        │        探测 401/403 → 302 /?token=<当前值> + Set-Cookie 清掉失效的那条
+        │        连不上/超时/别的状态码 → 503（不跳，怕转圈）
         ▼
       再打 https://<入口>/?token=… → Caddy 直连 18080 → 家里 dsh web
         │  303 ./  +  Set-Cookie: dsh-auth-<authority>=…（30 天）
         ▼
-      之后 / 带 cookie → Caddy 的 @entry 不匹配 → 直连 dsh web → 200（0 次跳转）
+      之后 / 带 cookie → broker 探测 200 → 首页 200（**0 次跳转**，循环到此终止）
 ```
 
 - **`harness` 函数**（`env.zsh` / `env.bash`，两份逐字等价）：包装
@@ -283,13 +290,20 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
   正在跑的实例写的 token 文件删掉，broker 又回 503（2026-10-07 实测踩到过）。
   文件在 source 时还会 `unalias harness`（别名优先于函数，用户原来那条 alias 会盖住它）。
 - **`bin/dsh-token-broker`**（`dsh-remote broker-install` 装成 `dsh-token-broker.service`）：
-  只绑 `127.0.0.1:3081`；`GET /`（不带 token）与 `GET /go` → 302 `/?token=<当前值>`；
-  读不到 token 文件、或 `dsh web` 端口没在听 → **503 + 一句人话**；别的路径 404 / 方法 405。
-  **不代理任何应用流量**（SSE/WebSocket 走 Caddy 直连那条路）。
-- **Caddy 那两条 `not` 缺一不可**（`path /` + `not query token=*` +
-  `not header Cookie *dsh-auth-*`）：少第一条，带 token 的请求会被反复 302；
-  少第二条就是死循环（`/` → broker → `/?token` → 303 `./` → `/` → broker → …）。
-  两条路由的原文见 §6。
+  只绑 `127.0.0.1:3081`。`GET /go` → 302 `/?token=<当前值>`；`GET /` 按上面那四种走；
+  读不到 token 文件、或（没 cookie 时）`dsh web` 端口没在听 → **503 + 一句人话**；
+  别的路径 404 / 方法 405。**只代理这一条 `GET /`**（探测超时 3s、代发 30s、
+  响应体上限 8MB）；`--probe-timeout` 可调（默认 3，K 节用它把"超时 → 503"跑快）。
+  cookie 只认形状对得上的（`dsh-auth-` + base64url），别人家的 cookie 当"没有 cookie"。
+- **Caddy 只按 token 排，不按 cookie 排**（`path /` + `not query token=*`）：
+  少了 `not query token=*` 带 token 的请求会被反复 302；而
+  **不能再加 `not header Cookie *dsh-auth-*`** —— Caddy 只看"有没有这个头"、不验签，
+  那条会把"带着过期 cookie 的浏览器"永远挡在 broker 门外，用户只看到 `dsh web` 的 401
+  （2026-10-09 用户手机实测；hazards H25、ADR-0018）。三条路由的原文见 §6。
+- **不转圈的三道闸**：① 带 token 的 `/` 不经 broker（Caddy 那条 `not`）；
+  ② cookie 有效时代发首页、**不再**跳转（`dsh web` 换完 cookie 后 `/` 回 200 ——
+  链路逐步实测见 journal 第 21 轮）；③ 万一上游回了"指回入口"的 3xx，
+  broker 把它换成 token 跳转，不原样转发。
 - `tunnel-status` 会把 broker 单元状态、token 文件有没有、`127.0.0.1:3081` 在不在听
   一起打出来；`--probe` 还会在云上只读地打一次 `127.0.0.1:18081/`（302 = 好、503 = 没 token）。
 
@@ -500,12 +514,14 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
     encode zstd gzip
     basic_auth { {{USER}} {{HASH}} }
     {{ALLOW_BLOCK}}                      # 没给 --allow-ip 时整行消失
-    # ① 不带 token 的入口 → 家里的 token broker（它 302 到 /?token=<当前值>）
-    #    两条 not 缺一不可，少一条就是 302 死循环（ADR-0014）
+    # ① 不带 token 的入口 → 家里的 token broker：没 cookie 就 302 到 /?token=<当前值>；
+    #    带 cookie 就先探测、有效则代发首页（ADR-0018）。**只剩一条 not**：
+    #    带 token 的请求要直连 dsh web。**不能**按 cookie 排除
+    #    （`not header Cookie *dsh-auth-*`）—— Caddy 只看有没有这个头、不验签，
+    #    那条会让"带着过期 cookie 的浏览器"永远拿不到跳转（hazards H25）
     @entry {
         path /
         not query token=*
-        not header Cookie *dsh-auth-*
     }
     reverse_proxy @entry 127.0.0.1:{{BROKER_PORT}} {
         header_up Host 127.0.0.1:{{LOCAL_PORT}}
@@ -515,7 +531,7 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
     reverse_proxy @go 127.0.0.1:{{BROKER_PORT}} {
         header_up Host 127.0.0.1:{{LOCAL_PORT}}
     }
-    # ③ 其余（带 token / 带 cookie 的 /、会话、SSE、WebSocket）直连 dsh web
+    # ③ 其余（带 token 的 /、会话、SSE、WebSocket）直连 dsh web
     reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
         header_up Host   127.0.0.1:{{LOCAL_PORT}}
         header_up Origin http://127.0.0.1:{{LOCAL_PORT}}
@@ -527,8 +543,10 @@ dsh-remote cloud-install [--domain D] [--ip I] [--email E] [--port P]
 }
 ```
 
-两条模板的站点块**逐字一样**（都用 `{{BROKER_PORT}}`；broker 那条是 2026-10-07 加的，
-ADR-0014）；`cloud/Caddyfile.ip` 只有四处不同：没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
+两条模板的站点块**逐字一样**（都用 `{{BROKER_PORT}}`；broker 那条是 2026-10-07 加的
+（ADR-0014），`@entry` 里那条 `not header Cookie` 是 2026-10-09 删掉的（ADR-0018）——
+**改一条必须改另一条**，K 节对两份模板做同一组断言）；`cloud/Caddyfile.ip` 只有四处不同：
+没有全局 `email`、站点名是 `{{IP}}:{{PORT}}`、
 多一行 `tls internal`，以及全局块里多一行 **`default_sni {{IP}}`**。
 最后这行是**必须的**：浏览器连 `https://<IP>:8443` 时**不发 SNI**
 （RFC 6066 不允许 SNI 放 IP 字面量），没有它 Caddy 选不出证书、握手直接
@@ -686,12 +704,13 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 ## 10. 测试（现状）
 
-| 脚本 | 条数（2026-10-07 实测 / 静态数） | 要什么 | 覆盖 |
+| 脚本 | 条数（2026-10-09 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **400 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / K 38 / **L 17** / M 46 / **N 22**；2026-10-07 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**token 固定地址（K 节：harness 函数两个 shell 各抓一次 token / broker 的 302 与 503 反例 / Caddyfile 的两条 `not`）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）** |
+| `tests/run_tests.sh` | **437 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / J 69 / **K 55** / **L 17** / M 46 / **N 22** / **O 20**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载（J 节，单元落点与 systemctl/tmux 全是桩）、**固定地址那条链路（K 节：harness 函数两个 shell 各抓一次 token / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + harness 复用（O 节）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
+| `tests/fake_dsh_web.py` | — | `python3` | 测试零件（2026-10-09 加）：假 `dsh web` —— `?token=` 换 cookie（303）、按 `dsh-auth-*` cookie 的值回 200 首页 / 401 / 303 回入口 / 500 / 拖过超时；`--log` 记每条请求，给 K 节数"探测+代发"用。只绑 127.0.0.1 |
 
 ⚠️ **跟 docker 有关的两件事**（2026-10-07 实测 + 当天修掉，细节在 hazards H8）：
 
@@ -703,14 +722,21 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 - 两个 docker 脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码，不是通过）。
   此前是 `exit 0` —— 放进 CI / `&&` 链里空跑也算绿，属于假绿。
 
-`run_tests.sh` 的 **K / L / M 三节（2026-10-07 加，共 93 条）**：
+`run_tests.sh` 的 **K / L / M / N / O 五节（K 是 2026-10-07 加、2026-10-09 扩到 55 条）**：
 
-- **K（token 重定向，38 条）**：Caddyfile 两份模板都必须有 `path /` + `not query token=*` +
-  `not header Cookie *dsh-auth-*` + `{{BROKER_PORT}}` + `@go`；`relay.sh` 里的
-  `{{BROKER_PORT}}` 替换与 `--broker-port`；`harness` 函数在 **bash 和 zsh 两份**里
-  各用假 `npx` 抓一次 token（写文件 → 退出时删掉，抓的是行首那个不是 LAN 那个）；
-  **broker 起真进程**（python3）验 302/404/405/503 与"只绑回环"；
-  还有一条容错回归：**没抓到 token 时不许把别人写的 token 文件清掉**。
+- **K（固定地址那条链路，55 条）**：Caddyfile 两份模板都必须有 `path /` + `not query token=*` +
+  `{{BROKER_PORT}}` + `@go`，而且 **`@entry` 里不许再出现 `not header Cookie`**
+  （针带缩进 —— 模板注释里解释了"为什么不能写"，只搜字面词会误报，这一条第一次就是这么红的）；
+  `relay.sh` 里的 `{{BROKER_PORT}}` 替换与 `--broker-port`；
+  `harness` 函数在 **bash 和 zsh 两份**里各用假 `npx` 抓一次 token（写文件 → 退出时删掉，
+  抓的是行首那个不是 LAN 那个）；还有一条容错回归：**没抓到 token 时不许把别人写的
+  token 文件清掉**。
+  **broker 起真进程**（python3）+ **假 `dsh web` 夹具** `tests/fake_dsh_web.py`
+  （按 cookie 的值造 200 首页 / 401 / 303 回入口 / 500 / 拖过超时）：
+  验 302/404/405/503 与"只绑回环"；**过期 cookie → 302 + `Set-Cookie` 清掉那条**；
+  **有效 cookie → 200 + 首页 title + 上游 `Set-Cookie` 透传 + 恰好 2 条请求（探测+代发）**；
+  3xx 指回入口 → 换成 token 跳转；500 / 探测超时 → 503；别人家的 cookie 当没有 cookie；
+  没有 token 文件 → 503（带不带 cookie 都是，而且**一次都不碰** `dsh web`）。
 - **L（二维码）**：`dsh-qr` 的矩阵 sha256 与独立实现（npm 那份 JS）对过账的向量、
   中文/emoji 能编、太长必须报错、终端半块画、PNG 头与尺寸、SVG 文本。
 - **M（`server`）**：假 ssh/scp/curl + 临时 unit 目录，验"四类自检失败都给指引"、

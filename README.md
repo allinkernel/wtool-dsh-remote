@@ -18,8 +18,9 @@
         │  容器名 dsh-relay，镜像 caddy:2.11.4，--network=host，--restart unless-stopped
         │  文件全在 /home/mindul/dsh-relay/（Caddyfile / 密码文件 / data / config / logs）
         │  宿主上**不装 caddy 包、没有 caddy.service**（hazards H7）
-        │  按条件转发：不带 token 的 / → 家里的 token broker（302 补 token）；
-        │  其余（会话 / SSE / WebSocket / 带 token 或 cookie 的 /）→ 127.0.0.1:18080
+        │  按条件转发：不带 token 的 / → 家里的 token broker（没 cookie 就 302 补 token；
+        │  带着 cookie 就先探一次，有效就把首页代发回来）；
+        │  其余（会话 / SSE / WebSocket / 带 token 的 /）→ 127.0.0.1:18080
         │  （顺手把 Host/Origin/Referer 改写成回环，见 §4）
         ▼
    云上 sshd 的反向隧道端            ← 云上不用开新端口，家主动连出去
@@ -28,7 +29,8 @@
         │
    家里这台机器                     ← 只有这条出站连接，家里不需要公网 IP、不用端口映射
         │  127.0.0.1:3080 = dsh web（会话界面）
-        │  127.0.0.1:3081 = token broker（只做 302，把固定地址补成带 token 的地址）
+        │  127.0.0.1:3081 = token broker（管"固定地址"：该补 token 就补，
+        │                     cookie 还有效就直接把首页给它）
         ▼
    DSH 会话（就是你现在用的这个界面）
 ```
@@ -82,9 +84,10 @@ dsh-remote status                                  # 总览：harness / 隧道 /
 ```
 
 手机上：打开 `public_url`（**不带 token 的固定地址**）→ 输一次 basic auth 的用户名密码
-→ 就能进。`dsh web` 自己的 token 由家里的 **token broker** 自动补上（它把 `/` 302 到
-`/?token=<当前值>`，浏览器拿到 30 天的 cookie 之后就一直直连了），所以**家里重启
-harness 也不用改手机上的链接**。
+→ 就能进。`dsh web` 自己的 token 由家里的 **token broker** 自动补上（没 cookie 时它把 `/`
+302 到 `/?token=<当前值>`，浏览器拿到 30 天的 cookie 之后就一直直连了），所以**家里重启
+harness 也不用改手机上的链接**。cookie 过期了也不用管：broker 会拿它探一次 `dsh web`，
+过期就再补一次 token 并把失效的那条 cookie 清掉 —— **不用清站点数据、不用换地址**。
 
 要让 broker 知道"当前 token"是什么，harness 得用 `dsh-remote` 装的那两个 shell 里的
 **`harness` 函数**起（`env.zsh` / `env.bash`，它会把 token 写进
@@ -138,7 +141,7 @@ dsh-remote serve-uninstall   # 撤掉常驻服务（**不动**正在跑的会话
 | `dsh-remote tunnel-uninstall` | 撤掉它（`disable --now` + 删单元文件） |
 | `dsh-remote tunnel-status` | 看单元/进程/端口/云上隧道口/公网；`--probe` 会 ssh 上云做**只读**检查 |
 | `dsh-remote systemd` | 旧名字：只生成单元不 enable（= `tunnel-install --no-enable`） |
-| `dsh-remote token-broker` | 前台跑"把不带 token 的 `/` 302 到当前 token"的小服务（常驻用 `broker-install`） |
+| `dsh-remote token-broker` | 前台跑"固定地址"那个小服务：没 cookie 就 302 补 token，带 cookie 就先探一次、有效就把首页代发（常驻用 `broker-install`） |
 | `dsh-remote broker-install` / `broker-uninstall` | 把 token broker 装成 / 撤出 systemd `--user` 常驻 |
 | `dsh-remote server` | **一条命令装好**：自检 → 云上中继 → 家里常驻隧道 + broker → 起 harness → 打印固定地址 + 二维码（`dsh-remote-server` 是等价入口） |
 | `dsh-remote passwd` | **改中继密码**（在家里一条命令）：云上算哈希 → 只改 Caddyfile 里那一行 → 重启容器 → 验"旧密码被拒 + 新密码能过" → 同步云上的密码文件 |
@@ -357,10 +360,14 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-07 实测，合计 **400**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-09 实测，合计 **437**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 69** /
-**token 固定地址 K 38** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22**。
+**固定地址那条链路 K 55** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22** /
+**dsh web 常驻 O 20**。
+K 节里 broker 起**真进程**、`dsh web` 用 `tests/fake_dsh_web.py` 这个**假夹具**
+（按 cookie 的值造 200/401/303/500/慢响应），所以"过期 cookie → 跳转""有效 cookie →
+代发首页""判断不出来 → 503"三条都**离线**测得出来。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 

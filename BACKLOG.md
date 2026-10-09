@@ -10,11 +10,12 @@
 
 ---
 
-## 🔴 仍未做 / 未验证（一览，2026-10-07 盘点）
+## 🔴 仍未做 / 未验证（一览，2026-10-09 更新）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **268 通过 0 失败**，2026-10-07 实跑），
-> 真机端到端也在 2026-10-07 当天走通了（中继 + 公网 + 常驻隧道）。
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **437 通过 0 失败**，2026-10-09 实跑），
+> 真机端到端也在 2026-10-07 当天走通了（中继 + 公网 + 常驻隧道），
+> 2026-10-09 又按"固定地址"那 7 条判据从家里经公网复验了一遍。
 > 下表是"还剩什么"的全集，展开在后面的小节里。
 
 | # | 状态 | 事项 | 一句话 |
@@ -31,12 +32,15 @@
 | U10 | ✅ | **手机固定地址**（不用再抄 token） | `harness` 函数抓 token + 家里 broker 302 + Caddy 两条 `not`；本机同构 Caddy 实测 302→303→200 与"换 token 后固定 URL 仍可用"（见下面 U10 节） |
 | U11 | ✅ | **一条命令装好**（`dsh-remote server` + 二维码） | 自检 → 部署 → 家里两个常驻单元 → 起 harness → 打印固定地址 + 自绘二维码；真机幂等跑通（见下面 U11 节） |
 | U12 | ✅ | **用户实测的两条反馈**（二维码太小 / 改密码教程看不懂） | 图片放大到短边 ≥1024px（每模块整数倍、静默区 4）；新增 `dsh-remote passwd` 一条命令改密码（只换那一行哈希）+ `relay.sh` 提示语改一行给全（见下面 U12 节） |
+| U13 | ✅ | **过期 cookie 让固定地址失效（只在手机上表现为 401）** | 用户手机实测撞到；2026-10-09 把"cookie 还有效吗"从 Caddy 挪进 broker（ADR-0018），真机 7 条判据全过（见下面 U13 节） |
+| U14 | ⏸ | `passwd` 的密码白名单拒掉 `#` | **待用户决定**：① 只改提示语；② 放宽成"只拒引号/反斜杠/空白"（改行为）。判据与背景见 hazards H26 |
+| U15 | ⏸ | `dsh-web.service` 长期停在 `activating`（在等 3080 空出来） | **待用户决定**：① 保持现状（只在 `serve-status` 里说清）；② 加"提示用户手动重启那个实例"；③ 自动接管（**会打断在跑的会话，默认不做**） |
+| U16 | ✅ | **隧道自我维持成风暴 + 没有自愈** | 2026-10-09：`StartLimitIntervalSec=300` + `StartLimitBurst=10` + `RestartSec=5`，并加一个 5 分钟一次的自愈 timer（见下面 U16 节） |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
-**"用真 token 从公网走一遍 302→200"**（要家里的 harness 用 `harness` 函数重启一次才有
-token；现在跑着的那个实例是 10-05 起的，token 只在它内存里，读不出来 —— hazards H22）；
 **"网络真断"（ServerAlive 那条路）的重连、重启机器后服务会不会自己起来**（linger 已开、
-单元已 `enable`，但没重启过机器）；真机上的安全组/防火墙/证书续期的任何验证。
+单元已 `enable`，但没重启过机器）；真机上的安全组/防火墙/证书续期的任何验证；
+真手机浏览器扫码（一直是 curl 在验，**没有真机浏览器截图**）。
 
 ---
 
@@ -608,3 +612,35 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
 - **可重跑判据**：`sh tests/run_tests.sh`（应 420/0）；真机 `harness`（有会话时应打印"复用"）；
   `dsh-remote serve-status`。
 - **没验的**：真·重启机器后的自动恢复（要等下次重启）、服务接管那一刻（需要那个手起会话先结束）。
+
+## ✅ 2026-10-09：过期 cookie 让固定地址失效（用户手机上只看到 401）—— U13
+
+- **怎么发现的**：用户 2026-10-09 在手机上实测：浏览器里存着**过期/乱写**的
+  `dsh-auth-*` cookie 时，打开收藏的固定地址 `https://<入口>/` 不是跳转，而是
+  `dsh web` 的 401 原文（"dsh web authentication required; reopen the URL printed by
+  dsh web."）。绕开只要清一次站点数据或用 `/go` —— 所以此前几轮都没想到去测。
+- **根因**：`@entry` 里的 `not header Cookie *dsh-auth-*`（ADR-0014 为防死循环加的）
+  把所有带 cookie 的 `/` 都推给了 `dsh web`，而 **Caddy 不会验签**：
+  过期 cookie 与有效 cookie 对它没有区别。详见 hazards **H25**。
+- **做了什么**（ADR-0018）：
+  1. Caddy 两份模板：`@entry` 只留 `path /` + `not query token=*`（**删掉按 cookie 的那条**）；
+  2. `bin/dsh-token-broker`：带 `dsh-auth-*` cookie 的 `GET /` →
+     拿它探一次 `127.0.0.1:<web_port>/`（GET / 3s / 只看状态码）；
+     **2xx/3xx → 把这一条首页代发**（响应原样、`Set-Cookie` 透传、只代理这一条，
+     会话/SSE/WebSocket 仍直连）；**401/403 → 302 补 token + `Set-Cookie` 清掉失效 cookie**；
+     连不上/超时/其它状态码 → **503**（宁可说"判断不出来"，也不乱跳）；
+     外加一道防转圈闸：上游 3xx 若指回入口，就换成 token 跳转。
+- **验证（真机，家里 → 公网 8443，`--interface eth1`）**——7 条判据全过：
+  1. 过期 cookie：`/` → **302**（带 `set-cookie: dsh-auth-stale=; Max-Age=0`）→ 跟随 → **200 + `<title>DeepSeek Harness</title>`**（34782 B）；
+  2. 有效 cookie：`/` → **200，0 次跳转**（broker 日志"cookie 有效（探测 200）→ 代发首页 200（34782 字节）"）；
+  3. 不带 cookie：`/` → 302 → 200（原行为没坏）；
+  4. `/?token=…` → 303 → **200**（老用法没坏）；
+  5. `/go` 仍 302；`/index.html`（`dsh web` 真实 200 的路径）**不经过 broker**（broker 日志 28 → 28 行）；
+  6. `sh tests/run_tests.sh` → **437 通过 0 失败**（K 节 38 → 55 条，新增 `tests/fake_dsh_web.py` 夹具）；
+  7. `python3 -m py_compile bin/dsh-token-broker` 通过。
+- **云上同步**：`cloud/` 传到 `~/dsh-relay/cloud/`（旧目录备份成 `cloud.bak-20261009-cookie`）→
+  在云上按原参数重渲染（`relay.sh --no-compose --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'`，
+  **显式带当前密码**）→ 容器重建（Caddyfile 自动备份 `Caddyfile.bak-<时间戳>`）；
+  自检 401 / 隧道 401 / broker 302 全绿；改完复验**当前密码 302、旧密码（含 `#` 那个）401**。
+- **没验 / 风险**：真手机浏览器（还是 curl 在验）；broker 那条"探测误判"的极端情况
+  （上游回 500 等）只在夹具上验过；首页那次请求会打到 `dsh web` 两次（探测+代发）。

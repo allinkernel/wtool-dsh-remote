@@ -443,3 +443,77 @@ SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/�
 - 老 K 节 7 条用例被这次改动暴露：它们**碰巧**依赖"本机 3080 没人听"；夹具改到 3085 + 显式逃生阀。
 - 测试 400 → **420 通过 0 失败**。真机验证：复用分支 rc=0 不起新进程；服务 enable 后在
   `activating` 等端口；活会话与隧道均未被打断（`NRestarts=0`）。
+
+## 2026-10-09（cookie 判断挪进 broker）—— 用户手机实测的"固定地址 401"缺口（ADR-0018）
+
+**谁**：助手（用户 2026-10-09 在手机上实测撞到并给出复现命令；方案由用户定，助手实现 + 真机复验）。
+**背景**：上一轮收尾时写的是"固定地址这条链路已经验通"—— 那是因为**测的时候 jar 是干净的**。
+用户手机上存着过期的 `dsh-auth-*` cookie，于是 `/` 被 Caddy 的
+`not header Cookie *dsh-auth-*` 直接推给 `dsh web`，看到的是 401 原文而不是跳转。
+
+**改了什么**（代码 + 文档在同一个提交里）：
+
+1. `cloud/Caddyfile.ip` / `Caddyfile.domain`：`@entry` **删掉** `not header Cookie *dsh-auth-*`，
+   只留 `path /` + `not query token=*`；注释里写清"为什么不能按 cookie 排"（Caddy 不验签）。
+   顺手把"其余请求"那条注释里"带 cookie 的 /"去掉（它现在一定走 broker）。
+2. `bin/dsh-token-broker`（172 → 386 行）：带 `dsh-auth-*` cookie 的 `GET /` →
+   先探测（`GET` / 3s / 只看状态码）→ 2xx/3xx 就**把这一条首页代发**（响应原样、
+   `Set-Cookie` 透传、body 上限 8MB）；401/403 → 302 补 token + `Set-Cookie` 清掉失效 cookie；
+   连不上/超时/别的状态码 → 503。另加：`redirects_to_entry()` 这道防转圈闸、
+   `--probe-timeout`（默认 3s）、启动行与每条判定的日志。
+   `POST` 仍然 405、`/go` 仍然无条件 302、没有 token 文件仍然 503。
+3. `tests/fake_dsh_web.py`（新，194 行）：假 `dsh web` 夹具 —— `?token=` 换 cookie、
+   按 `dsh-auth-*` cookie 的**值**回 200 首页 / 401 / 303 回入口 / 500 / 拖过超时，
+   `--log` 记每条请求。K 节用它把三条行为**离线**测出来。
+4. K 节 38 → **55 条**：模板断言改成"**不许**有 `not header Cookie`"（针带缩进 ——
+   注释里解释了"为什么不能写"，第一次就是被自己的注释误报红的）；
+   broker 那截加了过期/有效/回环/500/超时/别家 cookie/没有 token 文件等 17 条。
+5. 文档：ADR-**0018**（用户说的"ADR-0017"已被上一轮的 dsh web 常驻占用 → 顺延，
+   并把上一轮漏在表外的 0017 行并回索引表）、hazards **H25**（这个缺口）与 **H26**
+   （`passwd` 拒 `#`：只记现状 + 两条待决定，**没改行为**）、`architecture.md` §1/§2/§3.2/§6/§10、
+   `BACKLOG.md`（U13 ✅ / U14 ⏸ / U15 ⏸）、`README.md`。
+
+**本机验证**：
+
+- `sh tests/run_tests.sh` → **437 通过 0 失败**（K 55 / O 20；上一轮 420）。
+- `python3 -m py_compile bin/dsh-token-broker tests/fake_dsh_web.py` → 通过。
+- 新 broker 先在**真 `dsh web`**（用户正在跑的那个实例，没重启）上试：
+  有效 cookie（从真实例换来的）→ 200 / 34782 字节 / `<title>DeepSeek Harness</title>`；
+  乱写 cookie → 302 + 清 cookie；带 token 的请求打 broker → 400（那条本来就该去 dsh web）。
+
+**真机验证**（家里 → 公网，`curl -sk --interface eth1 -u dsh:<当前密码>`；用户指定的密码没换）：
+
+| # | 判据 | 实测 |
+|---|---|---|
+| 1 | 过期/乱写 cookie：`/` → 302 → 200 + title | **302**（`set-cookie: dsh-auth-stale=; Max-Age=0`）→ 跟随 **200**、34782 B、`<title>DeepSeek Harness</title>` |
+| 2 | 有效 cookie：`/` → 200、**0 次跳转** | **200 0**（broker 日志：`cookie 有效（探测 200）→ 代发首页 200（34782 字节）`） |
+| 3 | 不带 cookie：`/` → 302 → 200 | **200**（2 跳）、34782 B |
+| 4 | `/?token=…` → 200 | 第一跳 **303** `location: ./` + `set-cookie: dsh-auth-<authority>=…` → 跟随 **200** |
+| 5 | `/go` 302；`/` 之外的路径不经 broker | `/go` **302**；`/index.html` **200**（34782 B）且 broker 日志 **28 → 28 行**（diff=0） |
+| 6 | 测试全绿 | **437 / 0** |
+| 7 | 语法检查 | `py_compile` 通过 |
+
+- **链路逐步实测**（就是"为什么不会转圈"的证据）：
+  ① 无 cookie `GET /` → broker **302** `/?token=6b15Sb…`；
+  ② `GET /?token=6b15Sb…` → **dsh web 303** `./` + `set-cookie: dsh-auth-VPhEE…`（直连，不经 broker）；
+  ③ 带那条 cookie `GET /` → broker 探测 200 → **代发 200、0 次跳转** → 循环终止。
+- **密码**：重渲染时显式带当前密码；改完复验 `doublemindul@200w` → **302**、
+  `doublemindul#300w` → **401**（旧的那个 `pELX…` 更早那轮已验过 401）。
+
+**云上同步**（写只限 `~/dsh-relay/**` + `sudo docker`，全程没碰 nginx/80/443/安全组/apt/`/etc`）：
+
+1. `~/dsh-relay/cloud` → 备份成 `cloud.bak-20261009-cookie`；`scp -r cloud/` 传新的模板与脚本；
+2. 先在云上 `--dry-run` 渲染 + `caddy validate` → `Valid configuration`（无残留占位符）；
+3. 真跑 `sh cloud/relay.sh --ip 123.56.158.212 --port 8443 --user dsh --password '<当前密码>'
+   --tunnel-port 18080 --local-port 3080 --broker-port 18081 --no-compose
+   --dir /home/mindul/dsh-relay --docker-cmd 'sudo docker'`
+   → Caddyfile 备份 `Caddyfile.bak-20261009-134xxx`、容器 `dsh-relay` 重建（`Up`）、
+   自检 **401 / 401 / broker 302** 全绿；
+4. 家里 `systemctl --user restart dsh-token-broker.service`（**只重启 broker，绝不碰 `dsh web`**）。
+
+**踩到的坑**：`check_not_contains "not header Cookie"` 被**模板注释**里的同一串文字误报
+（注释正是在解释"为什么不能写这条"）；断言改成带两行缩进的针
+（`printf '\t\tnot header Cookie'`）才对准真实指令。
+
+**没验 / 风险**：真手机浏览器（仍是 curl 在验）；"上游回 500 / 探测超时"两条只在夹具上验；
+首页那次会打到 `dsh web` 两次（探测 + 代发，多一次本地回环）。

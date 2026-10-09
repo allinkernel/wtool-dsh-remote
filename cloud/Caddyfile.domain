@@ -24,17 +24,18 @@
 
 {{ALLOW_BLOCK}}
 	# ---------------------------------------------------------------- token 重定向
-	# 手机收藏的固定地址（https://<入口>/，不带 token）交给家里的 token broker，
-	# 由它 302 到 /?token=<当前值>（token 每个进程随机、只在内存里，只有家里知道；
-	# 见 docs/adr/0014-*.md）。两条 not 缺一不可：
-	#   not query token=*            带 token 的请求要直连 dsh web；
-	#   not header Cookie *dsh-auth-* 已经换到 cookie 的浏览器也要直连 dsh web ——
-	#     dsh web 用 token 换一个 30 天的签名 cookie，之后 / 不再需要 token。
-	#     不排除 cookie 就是死循环：/ → broker → /?token → (set-cookie, 303 ./) → / → …
+	# 手机收藏的固定地址（https://<入口>/，不带 token）交给家里的 token broker
+	# （token 每个进程随机、只在内存里，只有家里知道；见 docs/adr/0014-*.md）。
+	# broker 那边分两种：没有 dsh-auth-* cookie → 302 到 /?token=<当前值>；
+	# 带 cookie → 它拿这条 cookie 探一次 dsh web，有效就把这一条 GET / 的响应
+	# 代发回来（会话/SSE/WebSocket 仍然直连，不经过它）。
+	# **"cookie 还有效吗"这里判不了**：Caddy 只会看"有没有 Cookie 这个头"，不会验签，
+	# 所以**不能**写 `not header Cookie *dsh-auth-*` —— 那样带着过期 cookie 的浏览器
+	# 永远拿不到跳转，只看到 dsh web 的 401（2026-10-09 用户手机实测；ADR-0018）。
+	# 这里只排除带 token 的请求：那种请求直接打 dsh web，broker 只管补 token。
 	@entry {
 		path /
 		not query token=*
-		not header Cookie *dsh-auth-*
 	}
 	reverse_proxy @entry 127.0.0.1:{{BROKER_PORT}} {
 		header_up Host 127.0.0.1:{{LOCAL_PORT}}
@@ -47,7 +48,7 @@
 		header_up Host 127.0.0.1:{{LOCAL_PORT}}
 	}
 
-	# 其余请求（会话界面 / SSE / WebSocket / 带 token 或带 cookie 的 /）
+	# 其余请求（带 token 的 /、会话界面、SSE、WebSocket）
 	# 一律直连家里的 dsh web —— broker 不参与主链路。
 	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {
 		# 关键：把 Host/Origin 改成回环地址。

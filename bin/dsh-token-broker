@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""dsh-token-broker —— 把"不带 token 的入口请求"302 到当前 token 的地址。
+"""dsh-token-broker —— 手机固定地址的入口：该补 token 的补 token，cookie 还有效的放行。
 
-**它只做重定向，绝不代理应用流量**：手机上的会话界面、SSE、WebSocket 一律由 Caddy
-直连家里 `dsh web`（`127.0.0.1:3080`）那条路，broker 不碰。它唯一的存在理由是
-`dsh web` 的 token **每个进程随机生成、只在内存里**（`processLaunchToken`，32 字节
-base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关）—— 手机每次重启后都得
-重新抄一遍带 token 的地址。家里这个服务读 `harness` 函数捕获下来的 token 文件，
-把 `https://<入口>/` 302 到 `/?token=<当前值>`，于是手机收藏的固定地址永远能用。
+**它只代理一条 `GET /`**（带 `dsh-auth-*` cookie 且探测通过时，把首页代发一次）。
+手机上的会话界面、SSE、WebSocket 一律由 Caddy 直连家里 `dsh web`
+（`127.0.0.1:3080`）那条路，broker 不碰 —— 多一跳就可能把流式破坏掉。
+它唯一的存在理由是 `dsh web` 的 token **每个进程随机、只在内存里**
+（`processLaunchToken`，32 字节 base64url；`dsh web --help` 里没有固定 token /
+关鉴权的开关）—— 手机每次重启后都得重新抄一遍带 token 的地址。家里这个服务读
+`harness` 函数捕获下来的 token 文件，把 `https://<入口>/`（不带 token）302 到
+`/?token=<当前值>`，于是手机收藏的固定地址永远能用。
 
 用法（一般不用手敲，由 `dsh-remote broker-install` 装成 systemd 单元）：
 
@@ -15,13 +17,27 @@ base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关）——
 
 路由（只有这几条，别的都不做）：
 
-    GET  /      没有 token 参数  → 302 Location: /?token=<当前 token>
-    GET  /go    任何时候        → 302 Location: /?token=<当前 token>
+    GET  /go                    任何时候 → 302 Location: /?token=<当前 token>
                                 （cookie 过期 / 换过 token 之后的"重进一次"入口）
-    带 token 参数的请求          → 400（那种请求该直接打 dsh web，不该走这儿）
-    其它路径                    → 404；其它方法 → 405
-    读不到 token 文件           → 503（**绝不** 302 到空 token）
-    dsh web 的端口连不上        → 503（宁可说"没在跑"，也别把人送去一个死 token）
+    GET  /      不带 dsh-auth-* cookie → 302 Location: /?token=<当前 token>
+    GET  /      带 dsh-auth-* cookie   → **先探测一次** dsh web 的 `GET /`：
+                                   2xx/3xx → 把首页代发一次，响应原样回给浏览器
+                                   401/403 → cookie 过期：302 到 /?token=…，
+                                             并顺手 Set-Cookie 清掉那几条失效的 cookie
+                                   其它/连不上 → 503 + 一句人话（**绝不**乱跳，怕转圈）
+    带 token 参数的请求           → 400（那种请求该直接打 dsh web，不该走这儿）
+    其它路径                     → 404；其它方法 → 405
+    读不到 token 文件             → 503（**绝不** 302 到空 token）
+
+**为什么"cookie 还有效吗"要在这儿判、而不是在 Caddy**（见 ADR-0018）：
+Caddy 只会看"有没有 `Cookie` 这个头"，不会验签，于是"带着过期 cookie 的浏览器"
+永远拿不到 302（而 `dsh web` 只会回 401）—— 2026-10-09 用户手机上实测到的那个缺口。
+broker 本来就串在链路里、又能直连本地 `dsh web`，所以由它探一次最省事：
+探测走本地回环、超时 3 秒，只看状态码。
+**死循环不在这儿发生**：跳转后浏览器带 token 打 `/?token=…`，Caddy 直接交给 dsh web，
+dsh web 换完 cookie 303 回 `/`，这时 cookie 有效 → 探测 2xx → 首页直接返回 200。
+另外留了最后一道闸：探测返回的 3xx 如果又指回入口 `/`（不带 token），
+就换成 token 跳转 —— 不允许把一个"回到自己"的跳转原样发给浏览器。
 
 只绑 `127.0.0.1`（云上是靠 SSH 反向隧道 `-R 127.0.0.1:18081:127.0.0.1:3081`
 把它接出去的，安全组里不开这个端口）。日志一行一条到 stdout（systemd 收进 journald）。
@@ -30,7 +46,9 @@ base64url；`dsh web --help` 里没有固定 token / 关鉴权的开关）——
 from __future__ import annotations
 
 import argparse
+import http.client
 import os
+import re
 import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,8 +58,46 @@ DEFAULT_PORT = 3081
 DEFAULT_WEB_PORT = 3080
 DEFAULT_HOST = "127.0.0.1"
 
-# 只有这两条路径会被 302：`/`（手机收藏的固定地址）和 `/go`（重进入口）。
+# 只有这两条路径会被特殊对待：`/`（手机收藏的固定地址）和 `/go`（重进入口）。
 REDIRECT_PATHS = ("/", "/go")
+
+# `dsh web` 的 cookie 名是 COOKIE_PREFIX + base64url(sha256(authority))，
+# 所以形状固定：前缀 + base64url 字符。**按这个形状挑**，别把别人家的 cookie
+# 当成我们的（那会导致"永远探测失败、永远 302"，比不做还坏）。
+COOKIE_PREFIX = "dsh-auth-"
+COOKIE_NAME_RE = re.compile(r"^dsh-auth-[A-Za-z0-9_-]+$")
+
+# 探测只等 3 秒（"轻量探测"）：连不上或太慢就当 dsh web 没在跑/没回应。
+PROBE_TIMEOUT = 3.0
+# 真代发首页给的时间宽一点 —— 探测已经证明它有回应了，别让一次慢渲染变成 503。
+PROXY_TIMEOUT = 30.0
+# 首页就几十 KB；给个上限，免得一个异常响应把内存拖爆。
+MAX_PROXY_BODY = 8 * 1024 * 1024
+
+# 发给 dsh web 时不带的头：逐跳的、以及让上游自己算的。
+# `accept-encoding` 特意不带 —— 只走回环，让上游回未压缩的，我们才能如实填 Content-Length；
+# 对外压缩是 Caddy `encode zstd gzip` 的事。
+DROP_REQUEST_HEADERS = frozenset(
+    (
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "accept-encoding",
+        "content-length",
+    )
+)
+
+# 回传响应时不带过去的头：逐跳的 + 长度（我们自己重算）+ Server/Date
+# （BaseHTTPRequestHandler 会发我们自己的那份，重复了不是合法响应）。
+DROP_RESPONSE_HEADERS = frozenset(
+    ("connection", "keep-alive", "proxy-connection", "transfer-encoding",
+     "content-length", "server", "date")
+)
 
 
 def read_token(path: str) -> "str | None":
@@ -63,6 +119,57 @@ def web_port_open(port: int, host: str = DEFAULT_HOST, timeout: float = 0.5) -> 
         return False
 
 
+def auth_cookie_names(cookie_header: str) -> "list[str]":
+    """从 Cookie 头里挑出 `dsh-auth-*` 那几条的名字（保序、去重）。
+
+    只认名字形状对得上的：`dsh web` 生成的名字是安全的 base64url，
+    别的一律不当成"我们的 cookie"（不然会拿别人的 cookie 去探测，白探一趟）。
+    """
+    names: list[str] = []
+    for segment in cookie_header.split(";"):
+        at = segment.find("=")
+        if at == -1:
+            continue
+        name = segment[:at].strip()
+        if COOKIE_NAME_RE.match(name) and name not in names:
+            names.append(name)
+    return names
+
+
+def clear_cookie_headers(names) -> "list[tuple[str, str]]":
+    """把失效的 `dsh-auth-*` 清掉（能清就清）。
+
+    属性照抄 `dsh web` 自己那套（`Max-Age=…; Path=/; Expires=…; HttpOnly; SameSite=Strict`，
+    没有 `Domain`、没有 `Secure`）—— 只把 Max-Age 设 0、Expires 设到过去，Path 必须一样
+    才是同一条 cookie。清不掉也不致命：下一次请求会再跳一次 token，照样能进。
+    """
+    return [
+        (
+            "Set-Cookie",
+            "%s=; Max-Age=0; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict" % name,
+        )
+        for name in names
+    ]
+
+
+def redirects_to_entry(location: str) -> bool:
+    """这个 `Location` 会不会把浏览器送回同一个入口（`/` 且不带 token）？
+
+    最后一道防转圈的闸：探测/代发拿到的 3xx 如果指向入口本身，原样发出去就是
+    `GET / → 3xx / → GET / → …` 的死循环（broker 会一直代发那个 3xx）。
+    这种情况让浏览器去走 token 那条路（那边 dsh web 会换 cookie 再 303 回 `/`）。
+    """
+    if not location:
+        return False
+    path = urlsplit(location).path
+    for prefix in ("./", "../"):
+        while path.startswith(prefix):
+            path = path[len(prefix):]
+    if path in ("", ".", ".."):
+        path = "/"
+    return path == "/" and "token=" not in urlsplit(location).query
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "dsh-token-broker"
     sys_version = ""
@@ -70,6 +177,10 @@ class Handler(BaseHTTPRequestHandler):
     # 默认的访问日志走 stderr；我们走 stdout（journald 一样收，顺序更好读）
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         sys.stdout.write("%s %s\n" % (self.address_string(), fmt % args))
+        sys.stdout.flush()
+
+    def _log(self, text: str) -> None:
+        sys.stdout.write("%s %s\n" % (self.address_string(), text))
         sys.stdout.flush()
 
     def _respond(self, code: int, text: str, headers=()) -> None:
@@ -84,6 +195,98 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    # ------------------------------------------------------------ 代发那一条 GET /
+    def _web_request(self, port: int, timeout: float, cookie_header: str, method: str = "GET"):
+        """向本地 dsh web 发一条请求，返回 (状态码, 响应头列表, body)；连不上返回 None。"""
+        conn = http.client.HTTPConnection(DEFAULT_HOST, port, timeout=timeout)
+        try:
+            conn.request(
+                method,
+                "/",
+                headers={"Cookie": cookie_header, "Accept": "*/*", "Connection": "close"},
+            )
+            resp = conn.getresponse()
+            body = resp.read(MAX_PROXY_BODY)
+            return resp.status, resp.getheaders(), body
+        except (OSError, http.client.HTTPException):
+            return None
+        finally:
+            conn.close()
+
+    def _probe(self, port: int, cookie_header: str) -> "int | None":
+        """轻量探测：拿这条 cookie 问一次 dsh web 的 `GET /`，只看状态码。"""
+        got = self._web_request(port, self.server.probe_timeout, cookie_header)  # type: ignore[attr-defined]
+        return None if got is None else got[0]
+
+    def _send_proxied(self, status: int, headers, body: bytes) -> None:
+        """把 dsh web 的响应原样回给浏览器（逐跳头/长度丢掉，其余照抄，Set-Cookie 一条不落）。"""
+        self.send_response(status)
+        for name, value in headers:
+            if name.lower() in DROP_RESPONSE_HEADERS:
+                continue
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _redirect_to_token(self, token: str, clear_names=()) -> None:
+        location = "/?token=%s" % quote(token, safe="")
+        headers = [("Location", location)]
+        headers.extend(clear_cookie_headers(clear_names))
+        if clear_names:
+            self._log("cookie 失效（%s）→ 302 %s，并清掉那条 cookie" % (", ".join(clear_names), location))
+        else:
+            self._log("没有可用 cookie → 302 %s" % location)
+        self._respond(302, "去 %s\n" % location, headers)
+
+    def _handle_home_with_cookie(self, token: str, names, cookie_header: str, port: int) -> None:
+        """`GET /` 带着 `dsh-auth-*` cookie：探一次，有效就代发首页，过期就补 token。"""
+        status = self._probe(port, cookie_header)
+        probe_timeout = self.server.probe_timeout  # type: ignore[attr-defined]
+        if status is None:
+            self._log("探测 127.0.0.1:%d/ 失败（超时 %.0fs）→ 503" % (port, probe_timeout))
+            self._respond(
+                503,
+                "dsh-token-broker: 探测 127.0.0.1:%d/ 没回应（%.0f 秒超时）。\n"
+                "dsh web 可能没在跑。没敢跳转 —— 那样只会把人送去一个死 token。\n"
+                % (port, probe_timeout),
+            )
+            return
+
+        if status in (401, 403):
+            # cookie 过期/不被接受：回到 token 那条路，顺手把失效的 cookie 清掉
+            self._redirect_to_token(token, names)
+            return
+
+        if not 200 <= status < 400:
+            self._log("探测 127.0.0.1:%d/ 回了 %d，判断不出 cookie 有效性 → 503" % (port, status))
+            self._respond(
+                503,
+                "dsh-token-broker: dsh web 对首页回了 %d，判断不出这条 cookie 还有效没。\n"
+                "没敢跳转（会来回转圈）。看看家里 dsh web 的日志。\n" % status,
+            )
+            return
+
+        # 2xx/3xx：cookie 有效 —— 把这一条 `GET /` 代发给 dsh web，响应原样返回
+        got = self._web_request(port, PROXY_TIMEOUT, cookie_header)
+        if got is None:
+            self._log("探测通过但代发首页失败 → 503")
+            self._respond(503, "dsh-token-broker: 探测过了，但代发首页时连不上 dsh web。\n")
+            return
+        pstatus, pheaders, pbody = got
+        location = ""
+        for name, value in pheaders:
+            if name.lower() == "location":
+                location = value
+                break
+        if 300 <= pstatus < 400 and redirects_to_entry(location):
+            self._log("dsh web 回了 %d Location: %s（又要回入口）→ 换成 token 跳转，别转圈" % (pstatus, location))
+            self._redirect_to_token(token, names)
+            return
+        self._log("cookie 有效（探测 %d）→ 代发首页 %d（%d 字节）" % (status, pstatus, len(pbody)))
+        self._send_proxied(pstatus, pheaders, pbody)
 
     def _handle(self) -> None:
         parts = urlsplit(self.path)
@@ -108,6 +311,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         web_port = self.server.web_port  # type: ignore[attr-defined]
+
+        # `GET /` 带着 dsh-auth-* cookie：先探测 cookie 还有效没（ADR-0018）。
+        cookie_header = ", ".join(self.headers.get_all("Cookie") or [])
+        names = auth_cookie_names(cookie_header) if (path == "/" and cookie_header) else []
+        if names:
+            self._handle_home_with_cookie(token, names, cookie_header, web_port)
+            return
+
         if not web_port_open(web_port):
             self._respond(
                 503,
@@ -116,8 +327,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        location = "/?token=%s" % quote(token, safe="")
-        self._respond(302, "去 %s\n" % location, (("Location", location),))
+        self._redirect_to_token(token)
 
     def do_GET(self) -> None:  # noqa: N802
         self._handle()
@@ -132,15 +342,17 @@ class Handler(BaseHTTPRequestHandler):
 def main(argv) -> int:
     ap = argparse.ArgumentParser(
         prog="dsh-token-broker",
-        description="把不带 token 的入口 302 到当前 token（只重定向，不代理）",
+        description="手机固定地址的入口：不带 token 就 302 到当前 token；带 cookie 就先探测，有效则代发首页",
     )
     ap.add_argument("--host", default=DEFAULT_HOST, help="绑定地址（默认只绑回环 %s）" % DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=int(os.environ.get("DSH_REMOTE_BROKER_PORT", DEFAULT_PORT)),
                     help="监听端口（默认 %d）" % DEFAULT_PORT)
     ap.add_argument("--web-port", type=int, default=DEFAULT_WEB_PORT,
-                    help="dsh web 的端口，用来判它到底在不在跑（默认 %d）" % DEFAULT_WEB_PORT)
+                    help="dsh web 的端口：判它在不在跑、拿 cookie 去探测、代发首页都是打这个口（默认 %d）" % DEFAULT_WEB_PORT)
     ap.add_argument("--token-file", default=os.environ.get("DSH_REMOTE_TOKEN_FILE", ""),
                     help="token 文件（harness 函数写的那个）")
+    ap.add_argument("--probe-timeout", type=float, default=PROBE_TIMEOUT,
+                    help="带 cookie 时探测 dsh web 的超时秒数（默认 %.0f）" % PROBE_TIMEOUT)
     args = ap.parse_args(argv)
 
     if not args.token_file:
@@ -153,10 +365,12 @@ def main(argv) -> int:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.token_file = args.token_file       # type: ignore[attr-defined]
     server.web_port = args.web_port           # type: ignore[attr-defined]
+    server.probe_timeout = args.probe_timeout  # type: ignore[attr-defined]
     server.daemon_threads = True
     sys.stdout.write(
-        "dsh-token-broker: http://%s:%d/ → 302 /?token=（token 文件：%s；dsh web 端口：%d）\n"
-        % (args.host, args.port, args.token_file, args.web_port)
+        "dsh-token-broker: http://%s:%d/ → 没 cookie 就 302 /?token=；带 dsh-auth-* cookie 先探测"
+        "（%.0fs；token 文件：%s；dsh web 端口：%d）\n"
+        % (args.host, args.port, args.probe_timeout, args.token_file, args.web_port)
     )
     sys.stdout.flush()
     try:

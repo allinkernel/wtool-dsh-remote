@@ -27,12 +27,15 @@
 | 11 | [`relay.sh` 的 stdout 只放 Caddyfile，进度/报告全走 stderr](0011-relay-stdout-is-caddyfile.md) | |
 | 12 | [IP 模式在真机上要三处硬化：`default_sni`、钉住的镜像 tag、无 compose 的用户空间模式](0012-ip-mode-hardening-on-real-host.md) | 2026-10-07 第一次真阿里云部署时定 |
 | 13 | [隧道常驻用 systemd `--user` 单元 + ssh 自带保活（不用 autossh，也不在云上守）](0013-tunnel-residency-systemd-user-not-autossh.md) | 2026-10-07 U3：含"谁来重启 / 重连耗时期望"与 `tunnel-install` 的顺序 |
-| 14 | [手机收藏一个不带 token 的固定地址：家里放一个"只做 302"的 token broker](0014-fixed-phone-url-token-broker.md) | 2026-10-07：含 Caddy 那两条 `not` 为什么缺一不可 |
+| 14 | [手机收藏一个不带 token 的固定地址：家里放一个"只做 302"的 token broker](0014-fixed-phone-url-token-broker.md) | 2026-10-07：含 Caddy 那两条 `not` 为什么缺一不可 —— **其中按 cookie 的那条已被 ADR-0018 删掉，以 0018 为准** |
 | 15 | [一条命令装好：`dsh-remote server`（自检 → 部署 → 常驻 → 二维码）](0015-one-command-server-install.md) | 2026-10-07：含为什么自己实现 QR、二维码为什么不带 token |
 | 16 | [改密码做成一条命令（`dsh-remote passwd`），而且只换那一行哈希](0016-passwd-one-command-and-single-line-hints.md) | 2026-10-07：用户实测"三步教程"走不通之后；含提示语必须一行能复制 |
+| 17 | [dsh web 常驻化（开机自启）+ `harness` 复用 + 会话起来后重连隧道](0017-dsh-web-service-boot-autostart-and-reuse.md) | 2026-10-07：`dsh-web.service` / `dsh-web-run` / `harness` 三步；为什么不用 `ExecStartPost` |
+| 18 | [把"cookie 还有效吗"的判断挪进家里的 broker（只代发那一条 `GET /`）](0018-cookie-check-moved-into-broker.md) | 2026-10-09：用户手机上实测"过期 cookie 只看得到 401"之后；含否决方案（删 `not` 会死循环 / Caddy 验不了签 / 让用户清 cookie） |
 
 > **1–11 是同一条线（2026-09-20 的初版 `13734e3` + 2026-10-04 的修复）**，
 > 2026-10-07 补记成 ADR。当时只写了 `README.md` 的"为什么这么设计"一节和代码注释，
 > 没有 ADR 文件 —— 所以正文里的"背景/理由"大多是从那两处提炼的，凡提炼不出处的
 > 都在该条里显式写了"未记录"。
-| 0017 | dsh web 常驻化（开机自启）+ harness 复用 + 起来后重连隧道 | Accepted | 2026-10-07 |
+>
+> 17/18 两行原来不在表里（上一轮 0017 只写成了表外的一行），2026-10-09 顺手并回表内。

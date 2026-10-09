@@ -28,6 +28,15 @@
 #     用户管理器不可用时"还没动旧隧道就停手"、tunnel-status 的漂移检测、卸载
 #     —— 单元落点用 DSH_REMOTE_UNIT_DIR 钉到临时目录，systemctl/tmux 全是桩
 #     （真 tmux 上可能正跑着生产隧道），跑完比真 ~/.config/systemd/user 的指纹
+#   K token 重定向（固定地址那半）：Caddyfile 两份模板的 @entry 只按 token 排、
+#     不按 cookie 排；broker 起真进程 + **假 dsh web 夹具**（tests/fake_dsh_web.py，
+#     按 cookie 的值造 401/200/303/500/慢响应）验：过期 cookie → 302 + 清 cookie、
+#     有效 cookie → 代发首页 200（探测+代发恰好两条请求）、3xx 指回入口 → 换 token
+#     跳转、判断不出 → 503、没有 token 文件 → 503（ADR-0018）
+#   L 二维码（矩阵对账 / PNG / SVG / 终端画）
+#   M server（一条命令装好：自检失败指引、--dry-run 不写、部署失败不能吞）
+#   N passwd（改密码：只换那一行哈希、只 restart、新密码 302 旧密码 401）
+#   O dsh web 常驻 + harness 复用（单元渲染 / 复用分支 / 逃生阀）
 #
 # 要 docker 的两条在 tests/ 下单独放：caddy-validate.sh（3 条）、relay-e2e.sh（9 条）。
 # 它们**没有 docker 时 exit 77**（跳过码）—— 别把 77 当通过（H8）。
@@ -979,8 +988,11 @@ printf 'K. token 重定向：harness 捕获 / broker 302 / Caddy 路由\n'
 for tmpl in Caddyfile.ip Caddyfile.domain; do
     tc=$(cat "$proj/cloud/$tmpl")
     check_contains "$tmpl：入口 matcher 认 path /" "path /" "$tc"
-    check_contains "$tmpl：排除带 token 的请求（否则 /?token → 303 ./ → / 死循环）" "not query token=*" "$tc"
-    check_contains "$tmpl：排除已换到 cookie 的请求（dsh web 换 cookie 后 303 回 /）" "not header Cookie *dsh-auth-*" "$tc"
+    check_contains "$tmpl：排除带 token 的请求（那种直连 dsh web）" "not query token=*" "$tc"
+    # 针要带上缩进：模板注释里**解释**了"为什么不能写 not header Cookie"，
+    # 只搜这几个字会把注释也算上（第一次就是这么误报的）。真实指令是两行缩进。
+    check_not_contains "$tmpl：**不再**按 cookie 排除（过期 cookie 会永远拿不到跳转，ADR-0018）" \
+        "$(printf '\t\tnot header Cookie')" "$tc"
     check_contains "$tmpl：broker 那条走占位符 BROKER_PORT" "{{BROKER_PORT}}" "$tc"
     check_contains "$tmpl：/go 是重进入口" "@go path /go" "$tc"
     check_contains "$tmpl：其余请求仍直连 dsh web" "reverse_proxy 127.0.0.1:{{TUNNEL_PORT}}" "$tc"
@@ -1063,10 +1075,14 @@ sleep 1
 STUB
 chmod +x "$TMP/kbin/npx"
 
-# ③ broker 本体：起真进程（python3 + 一个真在听的假 dsh web）
+# ③ broker 本体：起真进程（python3 + 假 dsh web 夹具 —— 401/200/303/500 四种响应都造得出来）
+#    夹具按 cookie 的值决定行为：good=200 首页 / loop=303 回入口 / boom=500 / slow=拖过超时 / 其它=401
 k_wport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 k_bport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-python3 -m http.server "$k_wport" --bind 127.0.0.1 >/dev/null 2>&1 &
+k_bport2=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+: >"$TMP/k-web.log"
+python3 "$proj/tests/fake_dsh_web.py" --port "$k_wport" --token Tok-456 --slow-seconds 1.5 \
+    --log "$TMP/k-web.log" >"$TMP/k-web.out" 2>&1 &
 k_wpid=$!
 python3 "$proj/bin/dsh-token-broker" --port "$k_bport" --web-port "$k_wport" \
     --token-file "$TMP/k-tok.txt" >"$TMP/k-broker.log" 2>&1 &
@@ -1079,6 +1095,10 @@ while [ "$k_i" -lt 30 ]; do
 done
 check "broker：没有 token 文件 → 503（不 302 到空 token）" "503" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/")"
+check "broker：没有 token 文件 + 带 cookie → 也是 503（先看 token，不拿 cookie 去探）" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: dsh-auth-probe=good' "http://127.0.0.1:$k_bport/")"
+check "broker：没有 token 时**一次都没碰** dsh web（夹具日志还是空的）" "0" \
+    "$(wc -l <"$TMP/k-web.log" | tr -d ' ')"
 printf 'Tok-456\n' >"$TMP/k-tok.txt"
 k_hdr=$(curl -s -D - -o /dev/null --max-time 5 "http://127.0.0.1:$k_bport/")
 check_contains "broker：有 token → 302" "302" "$k_hdr"
@@ -1095,10 +1115,60 @@ if command -v ss >/dev/null 2>&1; then
 else
     ok "没有 ss，跳过「只绑回环」那条"
 fi
+
+# ③b cookie 那条路（ADR-0018）：过期 → 补 token 并清 cookie；有效 → 代发首页；判断不出来 → 503
+k_stale=$(curl -s -D - -o /dev/null --max-time 5 -H 'Cookie: dsh-auth-stale=x' "http://127.0.0.1:$k_bport/")
+check_contains "过期 cookie：/ → 302（不再把 dsh web 的 401 甩给手机）" "302" "$k_stale"
+check_contains "过期 cookie：Location 还是补 token" "Location: /?token=Tok-456" "$k_stale"
+check_contains "过期 cookie：顺手 Set-Cookie 清掉那条失效 cookie" \
+    "Set-Cookie: dsh-auth-stale=; Max-Age=0; Path=/" "$k_stale"
+
+k_before=$(wc -l <"$TMP/k-web.log" | tr -d ' ')
+curl -s -D "$TMP/k-good.hdr" -o "$TMP/k-good.html" --max-time 5 \
+    -w '%{http_code} %{num_redirects}' -H 'Cookie: dsh-auth-probe=good' "http://127.0.0.1:$k_bport/" \
+    >"$TMP/k-good.code"
+k_after=$(wc -l <"$TMP/k-web.log" | tr -d ' ')
+check "有效 cookie：/ → 200（broker 代发首页，不是 302）" "200 0" "$(cat "$TMP/k-good.code")"
+check_contains "有效 cookie：拿回来的就是首页（title 在）" "<title>DeepSeek Harness</title>" \
+    "$(cat "$TMP/k-good.html")"
+check_contains "有效 cookie：上游的 Set-Cookie 原样透传" "dsh-auth-probe=refreshed" \
+    "$(cat "$TMP/k-good.hdr")"
+check_contains "有效 cookie：上游的其它响应头也透传（Content-Security-Policy）" \
+    "Content-Security-Policy: default-src 'self'" "$(cat "$TMP/k-good.hdr")"
+check "有效 cookie：先探测、再代发 —— 打到 dsh web 恰好 2 条请求" "2" "$((k_after - k_before))"
+
+k_loop=$(curl -s -D - -o /dev/null --max-time 5 -H 'Cookie: dsh-auth-x=loop' "http://127.0.0.1:$k_bport/")
+check_contains "探到 3xx 但 Location 指回入口：换成 token 跳转（不许原样转发转圈）" \
+    "Location: /?token=Tok-456" "$k_loop"
+check "探到判断不出有效性的状态码（500）→ 503，不乱跳" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: dsh-auth-x=boom' "http://127.0.0.1:$k_bport/")"
+check "不是 dsh-auth-* 的 cookie 当没有 cookie：302（不拿别人家 cookie 去探）" "302" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: session=abc' "http://127.0.0.1:$k_bport/")"
+check "/go 带有效 cookie 也还是 302（重进入口语义不变）" "302" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: dsh-auth-probe=good' "http://127.0.0.1:$k_bport/go")"
+
+# 探测超时那条单起一个 broker（探测超时调短，别让测试干等 3 秒）
+python3 "$proj/bin/dsh-token-broker" --port "$k_bport2" --web-port "$k_wport" \
+    --token-file "$TMP/k-tok.txt" --probe-timeout 0.3 >"$TMP/k-broker2.log" 2>&1 &
+k_bpid2=$!
+k_i=0
+while [ "$k_i" -lt 30 ]; do
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$k_bport2/" && break
+    sleep 0.1
+    k_i=$((k_i + 1))
+done
+check "探测超时（dsh web 拖着不回）→ 503，不跳转" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: dsh-auth-x=slow' "http://127.0.0.1:$k_bport2/")"
+check_contains "探测超时那条在日志里说清了原因" "探测 127.0.0.1:$k_wport/ 失败" "$(cat "$TMP/k-broker2.log")"
+kill "$k_bpid2" 2>/dev/null
+wait "$k_bpid2" 2>/dev/null
+
 kill "$k_wpid" 2>/dev/null
 sleep 0.3
 check "broker：dsh web 没在听 → 503（宁可说没跑，也别送去死 token）" "503" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$k_bport/")"
+check "broker：dsh web 没在听 + 带 cookie → 也是 503" "503" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Cookie: dsh-auth-probe=good' "http://127.0.0.1:$k_bport/")"
 kill "$k_bpid" 2>/dev/null
 wait "$k_bpid" 2>/dev/null
 check_contains "broker：启动时把监听地址和 token 文件打出来" \
