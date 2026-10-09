@@ -19,7 +19,7 @@
 # `wtool uninstall tools/dsh-remote` 能干净撤掉、`wtool list` 看得见、
 # 别的机器上 `wtool install tools/dsh-remote` 得到同样的布局。
 #
-# 约定（同 tools/gerrit-gate）：
+# 约定（这个仓以及别的 wtool 项目脚本都一样）：
 #   * stdin 是 /dev/null —— 不写交互式提问
 #   * 可重入 —— 重复跑不报错、不重复添加
 #   * 不做不可逆的事 —— 绝不覆盖已有配置；目录要变成软链时先把内容搬进前缀
