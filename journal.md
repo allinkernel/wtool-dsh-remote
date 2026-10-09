@@ -663,3 +663,67 @@ SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/�
 本轮的数是这样量出来的：把工作树拷到临时目录、把那三个文件还原成 `HEAD`、
 删掉那个未跟踪命令（= "HEAD + 本轮改动"），再跑一次 → **556 通过 0 失败**。
 提交用 pathspec 只提交本轮的文件。
+
+## 2026-10-09（强制重置按钮 + `/reset` + harness 四档诊断）—— 用户批准"要有强制重置按钮"
+
+**谁**：用户 2026-10-09 批准新命令 `force-restart-dsh-remote`。同一天用户对 `harness`
+的"没起来"诊断发火（原因含糊），追加要求：**诊断要确定、验证不许碰 3080**。
+
+**背景（当天三类故障，现场判据都是实测的）**：
+① `dsh-tunnel.service` `NRestarts=10` 且 `is-active=failed`（云上僵尸会话占着
+`18080/18081`，起来就被掐 → ADR-0019 的 `StartLimitBurst=10` 按设计停下，**不会自己恢复**）；
+② `current-token.txt` 43 字节但拿它打本地 `dsh web` 是 **401**（实例是**手工**起的，
+token 只在它内存里，H22/H29）；③ `dsh-web.service` `NRestarts=108`、`is-active=activating`
+（手工实例占着 3080，`dsh-web-run` 按设计 exit 1 不抢）。
+
+**改了什么**（代码 + 文档 + 测试同一个提交）：
+
+1. `bin/dsh-remote` 加 `force-restart-dsh-remote`（安全档 6 步：reset-failed + 重启
+   隧道/broker → 云上只读复验 `2/2` → 本地 3080 是谁在听 → token 真打一次 → 公网三连
+   → 结论；每步 `状态 + 原因` + `判据命令`；`--json` 给手机页面）；
+   `--restart-web --yes` 是**受限例外**（只 SIGTERM 占着端口的那**一个** PID，cmdline 里
+   必须含 `dsh`，再用**服务**起回来抓新 token）；薄封装 `bin/dsh-force-restart-dsh-remote`；
+   `install.sh` 注册第 5 条命令。
+2. `bin/dsh-token-broker` 加 `/reset`：GET 确认页（一次性 nonce + 上次结果）、POST
+   **异步**跑安全档（先回 202 再动隧道 —— 同步做的话响应会被自己重启的隧道掐掉）、
+   结果渲染成"每步 ✓/✗ + 判据"。只认回环 + 沿用 `basic_auth`（不加新鉴权）+ 不回显
+   token/密码 + `no-store`。两份 `Caddyfile` 加 `@reset`（basic_auth 之后、兜底之前）。
+3. `env.zsh` / `env.bash`（两份逐字相同）：`harness` "等不到地址"那一档**先看端口**
+   （`ss -ltnp`）—— 有人听 = "被别人占着（PID x，不是 systemd 管的）" + "现在能用的还是
+   那个实例（token 实测过才打）"；没人听才分"服务失败 exit N / 还在起第 N 次重试 /
+   服务没在跑"三档，每档带判据。**不再出现"端口被占 / npx 卡住都可能是这个"**。
+4. 文档：ADR-0022/0023（编号避开同仓另一轮的 0020/0021）、hazards **H29/H30/H31**、
+   `architecture.md`（§3 两行 + §3.2 `/reset` + §3.5 四档 + §10/§11/§12）、
+   `README.md`（命令表 + 手机按钮）、`AGENTS.md`（**验证的铁律：绝不碰 3080**）、
+   `BACKLOG.md` U18/U19。测试：新增 **P 节 85 条**，O 节 108 → **142**（态⑦/态⑧ +
+   态③/⑥ 改成新文案）。
+
+**验证**（详见 `BACKLOG.md` U18/U19）：
+- 真机安全档 rc=0（隧道/broker ✓、云上 2/2、token 303→200、公网 401→302→200）；
+- **`--restart-web` 没对用户的实例跑**（会断用户会话）：做的是"真 `ss` + 真 SIGTERM"混合演练
+  （靶子是我自己起的监听，端口 3996；另验 cmdline 不含 dsh 时拒绝杀、非 tty 无 `--yes` 拒绝）；
+- 云上只写 `/home/mindul/dsh-relay/**`：重渲染用了显式 `--password 'doublemindul@200w'`，
+  复验"该密码 302 / 错密码 401 / 不带密码 401"，云上两端口 2/2，ufw inactive（没碰防火墙）；
+- **手机 `/reset` 真公网**：GET 200 + no-store + 无 token/密码；POST 带 nonce **202 / 0.126s**；
+  重放/不带 nonce 403；20 秒后结果页渲染 6 步 ✓/✗ + 判据；
+- **harness 四档在 3181+ 上验过**（3182 端口被占 / 3183 失败 / 3184 还在起 / 3185 没在跑，
+  3181 那个真实例只读看一眼）；
+- `sh tests/run_tests.sh` → **675 通过 0 失败**；**全程 `ss -ltnp | grep ':3080 '` 的 PID 没变**
+  （整轮跑完还是 `pid=17169`）。
+
+**订正（追加，不改上面的历史条目）**：同一天 journal 第 24 轮记过一句
+"`~/.local/state/dsh-remote/current-token.txt` 在 **21:12:39** 被重写过、没定位到是谁写的"——
+**那是父代理写的**：用户把当时那个手工实例的新 token 贴给它，它 `printf` 进状态文件并
+`chmod 600`，随后复验"固定地址 → 302 → 200 + `DeepSeek Harness`"。**不是未知来源**。
+
+**踩到的一个测试坑（值得记）**：P 节单跑全绿、**全量跑却红了 14 条** —— 根因是 E 节有一句
+`export DSH_REMOTE_CONF="$TMP/remote.conf"`，而命令读的是 `CONF=${DSH_REMOTE_CONF:-$CONF_DIR/remote.conf}`：
+我的 `prun` 只覆盖了 `DSH_REMOTE_CONF_DIR`，于是命令读的是**别的节的 conf**
+（`local_port` 成了 3099、公网成了"没写 public_url"）。修法：P 节的 prun 和 broker 启动都
+**显式**给 `DSH_REMOTE_CONF`。教训：这套测试的"环境变量是全局的"，写新节时
+**要显式给自己那一份 conf**，别只改 `*_CONF_DIR`。
+
+**没验 / 风险**：`--restart-web` 的真实服务那半（真 `systemctl start dsh-web.service` +
+真抓到新 token）**没在真机上验**（会打断用户会话，用户没让做）；"npx 绑不上端口会不会先
+打印 token"**没复现**（H31 里按"一次观察"写）；`/reset` 在隧道正断着时打开会 502（页面里
+写了要等一下再刷）。

@@ -42,7 +42,9 @@
 #   O dsh web 常驻 + harness 四态（单元渲染 / 端口被占不抢 / 逃生阀 /
 #     **harness 的输出契约**：状态行 + 原因行 + 判据命令，四态各一条
 #     —— 服务在跑 / 端口被非 systemd 实例占 / 服务 failed / 没有服务走前台，
-#     外加"刚被 systemd 拉起""等超时"；**dsh-web-run 的代理处理**：
+#     外加"刚被 systemd 拉起"；**等超时那一档按实测分四类**（端口被别人占 / 服务失败 exit N /
+#     服务还在起第 N 次重试 / 服务没在跑），每类都带一条判据命令 —— 2026-10-09 用户要求
+#     "别写端口被占 / npx 卡住都可能是这个"；**dsh-web-run 的代理处理**：
 #     桩 npx 把子进程的 `env | grep -i proxy` dump 出来对账，日志那行也要对）
 #
 # 要 docker 的两条在 tests/ 下单独放：caddy-validate.sh（3 条）、relay-e2e.sh（9 条）。
@@ -707,7 +709,7 @@ d_out=$(cat "$TMP/i-d.out")
 check_contains "警告里点名了缺的源（命令）" "$d_missing/bin/dsh-remote" "$d_out"
 check_contains "警告里说了去哪儿找" "找的地方：$d_missing" "$d_out"
 check_contains "警告里说明来源是 WTOOL_PROJECT_DIR" "来自 WTOOL_PROJECT_DIR" "$d_out"
-check_contains "末尾交代跳过了几条" "有 6 条源没找到" "$d_out"   # 4 条命令 + 2 张样板
+check_contains "末尾交代跳过了几条" "有 7 条源没找到" "$d_out"   # 5 条命令 + 2 张样板
 if [ ! -e "$inst/d/prefix" ] && [ ! -e "$inst/d/xdg-conf" ] && [ ! -e "$inst/d/xdg-state" ]; then
     ok "一个字节都没写：\$WTOOL_PREFIX / 配置 / 日志落点都没被建"
 else
@@ -745,7 +747,7 @@ fi
 d2_out=$(cat "$TMP/i-d2.out")
 check_contains "警告里点名缺的样板" "$d_fake/notify.conf.example" "$d2_out"
 check_contains "警告里点名缺的命令" "$d_fake/bin/dsh-notify" "$d2_out"
-check_contains "末尾交代跳过了 5 条" "有 5 条源没找到" "$d2_out"   # 缺 3 条命令 + 2 张样板
+check_contains "末尾交代跳过了 6 条" "有 6 条源没找到" "$d2_out"   # 缺 4 条命令 + 2 张样板
 
 # ---- E --uninstall：撤掉自己铺的软链，实体（配置/日志）留着
 run_install_a --uninstall >"$TMP/i-e.out" 2>&1
@@ -1802,7 +1804,8 @@ hr_states() {
     check_contains "$_sh 态③：状态行「没起来 ✗ 原因：」" "没起来 ✗ 原因：" "$_out"
     check_contains "$_sh 态③：原因 = 服务失败 + exit 1" "dsh-web.service 失败（exit 1）" "$_out"
     check_contains "$_sh 态③：附 journal 最后一行**原文**" "日志最后一行：dsh-web.service: Failed with result 'exit-code'." "$_out"
-    check_contains "$_sh 态③：给出看日志的命令" "看：journalctl --user -u dsh-web.service -n 20" "$_out"
+    check_contains "$_sh 态③：判据里有 ExecMainStatus + journal 最后一行" "systemctl --user show -p ExecMainStatus -p NRestarts --value dsh-web.service；journalctl --user -u dsh-web.service -n 1 -o cat" "$_out"
+    check_not_contains "$_sh 态③：不再写含糊的"都可能是这个"" "都可能是这个" "$_out"
 
     # 态④ 没有服务 → 走前台（老行为不变：抓 token、退出时清掉）
     rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
@@ -1837,11 +1840,48 @@ hr_states() {
     rm -f "$_hs/current-token.txt"
     hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=inactive H_SUBSTATE=dead H_NRESTARTS=3 DSH_REMOTE_HARNESS_WAIT=2
     _out=$(cat "$TMP/o-hr-$_sh.out")
-    check_contains "$_sh 态⑥：原因 = 等 Ns 没等到地址" "等了 2s 没等到 systemd 写出地址" "$_out"
-    check_contains "$_sh 态⑥：原因里带上 systemd 实测状态" "systemd=inactive/dead" "$_out"
-    check_contains "$_sh 态⑥：给判据命令" "判据：ss -ltn | grep :3980 ; systemctl --user is-active dsh-web.service" "$_out"
+    check_contains "$_sh 态⑥：原因 = 服务没在跑（不再是含糊的"等超时"）" "dsh-web.service 没在跑（is-active=inactive" "$_out"
+    check_contains "$_sh 态⑥：点明端口上没人听" "端口 3980 上也没人听" "$_out"
+    check_contains "$_sh 态⑥：附 journal 最后一行" "日志最后一行：" "$_out"
+    check_contains "$_sh 态⑥：给判据命令（三条都能原地复现）" '判据：systemctl --user is-active dsh-web.service；ss -ltn | grep -E "[:.]3980 "；journalctl --user -u dsh-web.service -n 1 -o cat' "$_out"
+    check_contains "$_sh 态⑥：给一条能起它的命令" "起它：systemctl --user start dsh-web.service" "$_out"
     check_contains "$_sh 态⑥：点明地址文件是旧的（不许拿旧文件冒充刚起来）" "web-url.txt 还是上一次的，没被重写" "$_out"
     check_not_contains "$_sh 态⑥：不许把旧 token 当成现在的地址" "token=OLD-TOK" "$_out"
+    check_not_contains "$_sh 态⑥：不再写含糊的"都可能是这个"" "都可能是这个" "$_out"
+
+    # 态⑦ 等超时 + **端口被别人占着**（2026-10-09 用户现场就是这个形状：服务 start 了，
+    #      一个不是 systemd 管的进程占着端口）→ 原因必须是确定的"被别人占着 + 实测 PID"
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt" "$_hs/.h-stub-listen.pid"
+    printf 'local_port=3976\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=activating H_SUBSTATE=auto-restart H_NRESTARTS=7 H_RESTARTUSEC=30s \
+        H_START_LISTEN=3976 H_STATE="$_hs" DSH_REMOTE_HARNESS_WAIT=2
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态⑦：原因 = 端口被别人占着" "被别人占着" "$_out"
+    check_contains "$_sh 态⑦：点明「不是 systemd 管的」" "不是 systemd 管的" "$_out"
+    check_not_contains "$_sh 态⑦：不再写"端口被占 / npx 卡住都可能是这个"" "都可能是这个" "$_out"
+    check_not_contains "$_sh 态⑦：也不许再拿"没等到地址"当原因" "没等到 systemd 写出地址" "$_out"
+    _spid=$(cat "$_hs/.h-stub-listen.pid" 2>/dev/null || printf '')
+    case $_out in
+    *"PID $_spid"*) ok "$_sh 态⑦：原因是**实测的 PID**（ss -ltnp 那个）" ;;
+    *) bad "$_sh 态⑦：原因是**实测的 PID**（ss -ltnp 那个）" "没有 PID $_spid：$_out" ;;
+    esac
+    check_contains "$_sh 态⑦：判据就是 ss -ltnp 那一条" 'ss -ltnp | grep -E "[:.]3976 "' "$_out"
+    check_contains "$_sh 态⑦：也带上 systemd 实测状态" "activating/auto-restart" "$_out"
+    check_contains "$_sh 态⑦：给怎么让它接管" "DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的" "$_out"
+    [ -n "$_spid" ] && kill "$_spid" 2>/dev/null
+    rm -f "$_hs/.h-stub-listen.pid"
+
+    # 态⑧ 等超时 + 端口没人听 + 服务**还在起**（activating：第 N 次重试）→ 单独一档
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3975\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=activating H_SUBSTATE=auto-restart H_NRESTARTS=12 H_RESTARTUSEC=30s \
+        H_JOURNAL="[dsh-web-run] 代理: 已清空（桩）" DSH_REMOTE_HARNESS_WAIT=2
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态⑧：原因 = 服务还在起 + 第 N 次重试" "还在起（activating/auto-restart（已重试 12 次，每 30s 一次））" "$_out"
+    check_contains "$_sh 态⑧：点明端口上没人听" "端口 3975 上没人听" "$_out"
+    check_contains "$_sh 态⑧：附 journal 最后一行**原文**" "日志最后一行：[dsh-web-run] 代理: 已清空（桩）" "$_out"
+    check_contains "$_sh 态⑧：判据里有 NRestarts/RestartUSec" "systemctl --user show -p NRestarts -p RestartUSec --value dsh-web.service" "$_out"
+    check_not_contains "$_sh 态⑧：不再写含糊的"都可能是这个"" "都可能是这个" "$_out"
 }
 for shname in bash zsh; do
     if command -v "$shname" >/dev/null 2>&1; then
@@ -1924,6 +1964,353 @@ _pc=$(cat "$TMP/p-c.txt" 2>/dev/null)
 check_contains "代理③：环境变量优先于 remote.conf" "代理: =http://10.0.0.1:8888（来自 DSH_REMOTE_WEB_PROXY" "$(cat "$TMP/o-p.out")"
 check_contains "代理③：子进程里 http_proxy 是环境变量那个" "http_proxy=http://10.0.0.1:8888" "$_pc"
 
+
+# ------------------------------------------------- P 一键强制重置 + 手机 /reset
+printf 'P. 一键强制重置（force-restart-dsh-remote）+ 手机 /reset\n'
+
+# 桩：systemctl / ssh / curl / ss —— 全在临时目录，**不碰真 systemd、真状态目录、真 ss**。
+# 端口挑一个高位的 3989（真 3080 上跑着用户的会话，测里绝不能碰它）。
+pstub="$TMP/pstub"
+pconf="$TMP/pconf/remote.conf"
+pstate="$TMP/pstate"
+punits="$TMP/punits"
+mkdir -p "$pstub" "$TMP/pconf" "$pstate" "$punits"
+printf 'local_port=3989\ncloud_host=1.2.3.4\ncloud_user=mindul\ncloud_ssh_port=22\nremote_port=18080\nbroker_remote_port=18081\nbroker_local_port=3081\npublic_url=https://1.2.3.4:8443\nweb_user=dsh\n' >"$pconf"
+for _pu in dsh-tunnel.service dsh-token-broker.service dsh-web.service; do : >"$punits/$_pu"; done
+printf 'PTOKEN123\n' >"$pstate/current-token.txt"
+
+cat >"$pstub/systemctl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"${P_SCTL_LOG:-/dev/null}"
+args=""
+for a in "$@"; do [ "$a" = "--user" ] || args="$args $a"; done
+set -- $args
+case " $* " in
+*" show-environment "*) exit 0 ;;
+esac
+u=""
+for a in "$@"; do u=$a; done
+case "$u" in
+dsh-tunnel.service) P=T ;;
+dsh-token-broker.service) P=B ;;
+dsh-web.service) P=W ;;
+*) P=X ;;
+esac
+eval "act=\${${P}_ACTIVE:-active} sub=\${${P}_SUBSTATE:-running} main=\${${P}_MAINPID:-0} nr=\${${P}_NRESTARTS:-0}"
+case " $* " in
+*" is-active "*)
+    printf '%s\n' "$act"
+    [ "$act" = active ] && exit 0
+    exit 3 ;;
+*" show "*)
+    for a in "$@"; do
+        case $a in
+        MainPID) printf '%s\n' "$main" ;;
+        SubState) printf '%s\n' "$sub" ;;
+        NRestarts) printf '%s\n' "$nr" ;;
+        esac
+    done
+    exit 0 ;;
+*" start dsh-web.service "* | *" restart dsh-web.service "*)
+    # 模拟 dsh-web-run：真起来之后会把新 token 抓进状态文件（web-url.txt 也一起）
+    if [ -n "${W_NEW_TOKEN:-}" ]; then
+        printf '%s\n' "$W_NEW_TOKEN" >"$DSH_REMOTE_STATE_DIR/current-token.txt"
+        printf 'http://127.0.0.1:3989/?token=%s\n' "$W_NEW_TOKEN" >"$DSH_REMOTE_STATE_DIR/web-url.txt"
+        : >"$DSH_REMOTE_STATE_DIR/.w-started"
+    fi
+    exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$pstub/ssh" <<'STUB'
+#!/bin/sh
+case ${P_SSH:-ok} in
+ok) printf '2\n' ;;
+one) printf '1\n' ;;
+fail)
+    printf 'ssh: connect to host 1.2.3.4 port 22: Connection refused\n' >&2
+    exit 255
+    ;;
+esac
+exit 0
+STUB
+cat >"$pstub/curl" <<'STUB'
+#!/bin/sh
+url=""
+follow=0
+authed=0
+for a in "$@"; do
+    case $a in
+    -*L*) follow=1 ;;
+    -u | -u*) authed=1 ;;
+    http*) url=$a ;;
+    esac
+done
+case $url in
+http://127.0.0.1:*) [ "$follow" = 1 ] && printf 200 || printf '%s' "${P_TOKEN_CODE:-303}" ;;
+https://*)
+    if [ "$follow" = 1 ]; then printf '%s' "${P_PUB_FOLLOW:-200}"
+    elif [ "$authed" = 1 ]; then printf '%s' "${P_PUB_AUTHED:-302}"
+    else printf '%s' "${P_PUB_FIRST:-401}"; fi ;;
+*) printf 000 ;;
+esac
+exit 0
+STUB
+cat >"$pstub/ss" <<'STUB'
+#!/bin/sh
+p=${P_LISTEN_PORT:-}
+[ -n "$p" ] || exit 0
+if [ -f "${DSH_REMOTE_STATE_DIR:-/tmp}/.w-started" ]; then
+    pid=${W_MAINPID:-777}
+else
+    pid=${P_LISTEN_PID:-}
+    [ -n "$pid" ] || exit 0
+    kill -0 "$pid" 2>/dev/null || exit 0
+fi
+case " $* " in
+*-ltnp* | *" -p "*) printf 'LISTEN 0 511 127.0.0.1:%s 0.0.0.0:* users:(("python3",pid=%s,fd=3))\n' "$p" "$pid" ;;
+*) printf 'LISTEN 0 511 127.0.0.1:%s 0.0.0.0:*\n' "$p" ;;
+esac
+exit 0
+STUB
+chmod +x "$pstub"/*
+
+plisten() { # plisten <端口> [多余的 argv…] → 起一个真回环监听，打印它的 PID
+    _plp=$1
+    shift
+    python3 -c "import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',$_plp)); s.listen(1); time.sleep(60)" "$@" >/dev/null 2>&1 &
+    printf '%s' "$!"
+}
+
+PRUN_EXTRA="" # 额外参数（要分词）；用前设、用后清
+prun() { # prun <状态目录> <输出文件> [KEY=VAL…]：跑安全档，rc 由调用方 $? 取
+    _prs=$1
+    _pro=$2
+    shift 2
+    # shellcheck disable=SC2086
+    # DSH_REMOTE_CONF 要**显式**给：E 节有一句 `export DSH_REMOTE_CONF=…`，
+    # 不给的话命令读的是那一份（2026-10-09 实测：P 节全跑时读到 M 节的 conf，
+    # 于是 local_port 成了 3099、公网成了"没写 public_url"—— 单跑 P 节看不出来）。
+    env "$@" \
+        DSH_REMOTE_CONF="$TMP/pconf/remote.conf" \
+        DSH_REMOTE_CONF_DIR="$TMP/pconf" DSH_REMOTE_STATE_DIR="$_prs" \
+        DSH_REMOTE_UNIT_DIR="$punits" DSH_REMOTE_SYSTEMCTL="$pstub/systemctl" \
+        PATH="$pstub:$PATH" sh "$proj/bin/dsh-remote" force-restart-dsh-remote $PRUN_EXTRA >"$_pro" 2>&1
+    _prc=$?
+    PRUN_EXTRA=""
+    return "$_prc"
+}
+
+# ① help / 参数 / 薄封装等价
+"$proj/bin/dsh-force-restart-dsh-remote" --help >"$TMP/p-help.out" 2>&1
+check "force-restart-dsh-remote --help 退出 0" "0" "$?"
+check_contains "help 里有这条命令" "force-restart-dsh-remote" "$(cat "$TMP/p-help.out")"
+check_contains "help 里写明安全档不碰 dsh web" "绝不碰 dsh web" "$(cat "$TMP/p-help.out")"
+check_contains "help 里有 --restart-web 例外" "restart-web" "$(cat "$TMP/p-help.out")"
+sh "$proj/bin/dsh-remote" force-restart-dsh-remote --help >"$TMP/p-help2.out" 2>&1
+check "薄封装和 dsh-remote 子命令的 help 逐字相同" "0" \
+    "$(cmp -s "$TMP/p-help.out" "$TMP/p-help2.out" && printf 0 || printf 1)"
+sh "$proj/bin/dsh-remote" force-restart-dsh-remote --bogus >"$TMP/p-bad.out" 2>&1
+check "不认识的参数 → 非 0" "1" "$?"
+check_contains "不认识的参数会说清收哪些" "--restart-web / --yes / --json" "$(cat "$TMP/p-bad.out")"
+
+# ② 安全档：隧道健康 + 服务托管 + token 有效 + 公网通 → rc=0，关键行都在
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ W_MAINPID=$$ W_ACTIVE=active T_ACTIVE=active T_MAINPID=555 T_NRESTARTS=0 B_ACTIVE=active \
+    P_SSH=ok P_TOKEN_CODE=303 P_PUB_FIRST=401 P_PUB_AUTHED=302 P_PUB_FOLLOW=200 \
+    prun "$pstate" "$TMP/p-ok.out"
+check "安全档全绿时退出 0" "0" "$?"
+check_contains "①隧道+broker 打 ✓" "[1/6] 隧道+broker ✓" "$(cat "$TMP/p-ok.out")"
+check_contains "①带判据命令" "判据 systemctl --user show -p NRestarts -p MainPID dsh-tunnel.service" "$(cat "$TMP/p-ok.out")"
+check_contains "②云上两个口都在听（2/2）" "都绑上了（2/2" "$(cat "$TMP/p-ok.out")"
+check_contains "②判据就是那条 ssh 计数命令" "grep -cE \"127.0.0.1:(18080|18081)\"" "$(cat "$TMP/p-ok.out")"
+check_contains "③认得出服务托管" "是 dsh-web.service 托管的" "$(cat "$TMP/p-ok.out")"
+check_contains "④token 有效（首跳 303 → 跟随 200）" "token 有效（首跳 303 → 跟随跳转 200" "$(cat "$TMP/p-ok.out")"
+check_contains "⑤公网 401 的含义写清了" "不带密码 401（Caddy 的 basic auth 在挡" "$(cat "$TMP/p-ok.out")"
+check_contains "⑤公网 302 的含义写清了" "broker 在把 / 补成 /?token=" "$(cat "$TMP/p-ok.out")"
+check_contains "⑥结论是 ✓" "结论 ✓" "$(cat "$TMP/p-ok.out")"
+check_contains "⑥结论里有下一步" "下一步 都通了" "$(cat "$TMP/p-ok.out")"
+check_not_contains "安全档没有去动 dsh web（不出现 SIGTERM）" "SIGTERM" "$(cat "$TMP/p-ok.out")"
+check_not_contains "输出里不打印 token 值" "PTOKEN123" "$(cat "$TMP/p-ok.out")"
+
+# ③ 安全档：隧道 failed（没活进程）→ ✗；broker 单元没装 → ✗；rc=1
+mv "$punits/dsh-token-broker.service" "$TMP/p-broker-unit.bak"
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ W_MAINPID=$$ T_ACTIVE=failed T_MAINPID=0 T_NRESTARTS=10 B_ACTIVE=active \
+    P_SSH=ok P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-tun.out"
+check "隧道 failed 时退出非 0" "1" "$?"
+check_contains "①隧道 ✗ 且把实测状态打出来" "restart 之后没有活着的进程" "$(cat "$TMP/p-tun.out")"
+check_contains "①broker 单元没装会说清" "dsh-token-broker.service 不在" "$(cat "$TMP/p-tun.out")"
+mv "$TMP/p-broker-unit.bak" "$punits/dsh-token-broker.service"
+
+# ④ 安全档：token 过期（401）→ 明说"要 --restart-web"；手工实例要认出来
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ W_MAINPID=0 W_ACTIVE=activating W_SUBSTATE=auto-restart W_NRESTARTS=108 \
+    T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=ok P_TOKEN_CODE=401 \
+    prun "$pstate" "$TMP/p-exp.out"
+check "token 过期时退出非 0" "1" "$?"
+check_contains "④明说 token 过期" "token **过期**（HTTP 401" "$(cat "$TMP/p-exp.out")"
+check_contains "④指向 --restart-web 才能拿新 token" "不重启 dsh web 拿不到新的" "$(cat "$TMP/p-exp.out")"
+check_contains "③认出是手工起的实例（cgroup 里没有它）" "是**手工起的**实例" "$(cat "$TMP/p-exp.out")"
+check_contains "③把服务状态一起打出来（activating + 重试次数）" "activating/auto-restart（已重试 108 次）" "$(cat "$TMP/p-exp.out")"
+check_contains "下一步就一条：在机器上跑 --restart-web" "下一步 要新 token：**在机器上**跑 force-restart-dsh-remote --restart-web --yes" "$(cat "$TMP/p-exp.out")"
+
+# ⑤ 安全档：端口没人听 / 云上只绑上一个 / ssh 上不去
+P_LISTEN_PORT= P_TOKEN_CODE=000 T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active W_ACTIVE=failed P_SSH=ok \
+    prun "$pstate" "$TMP/p-noweb.out"
+check_contains "③没人听就说没人听" "没人听" "$(cat "$TMP/p-noweb.out")"
+check_contains "④dsh web 没跑 → curl 000" "连不上（curl 000）" "$(cat "$TMP/p-noweb.out")"
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=one P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-one.out"
+check_contains "②只绑上 1/2 会点出来" "只绑上 1/2" "$(cat "$TMP/p-one.out")"
+check_contains "②并且点名僵尸会话要用户同意" "要用户同意才能杀" "$(cat "$TMP/p-one.out")"
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=fail P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-sshfail.out"
+check_contains "②ssh 上不去也说得清" "ssh 上不去" "$(cat "$TMP/p-sshfail.out")"
+
+# ⑥ --restart-web 非 tty 且没 --yes → 拒绝，且**一个进程都不许动**
+p_lp=$(plisten 3989 dsh web --port 3989)
+sleep 0.5
+printf 'OLD-TOKEN\n' >"$pstate/current-token.txt"
+rm -f "$pstate/.w-started"
+PRUN_EXTRA="--restart-web"
+P_LISTEN_PORT=3989 P_LISTEN_PID="$p_lp" T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active W_ACTIVE=activating W_SUBSTATE=auto-restart \
+    P_SSH=ok P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-noyes.out"
+check "--restart-web 非交互且没有 --yes → 非 0" "1" "$?"
+check_contains "拒绝时说清要 --yes" "必须显式加 --yes" "$(cat "$TMP/p-noyes.out")"
+check_contains "拒绝时也把大字警告打出来了" "会**打断正在跑的会话**" "$(cat "$TMP/p-noyes.out")"
+check "拒绝时那个监听进程还在（没乱杀）" "0" "$(kill -0 "$p_lp" 2>/dev/null && printf 0 || printf 1)"
+
+# ⑦ --restart-web --yes：真 SIGTERM 那一个 PID（服务那半走桩）→ 新 token 落地
+PRUN_EXTRA="--restart-web --yes"
+P_LISTEN_PORT=3989 P_LISTEN_PID="$p_lp" T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active W_ACTIVE=activating W_SUBSTATE=auto-restart \
+    W_MAINPID=778 W_NEW_TOKEN=NEW-TOKEN-456 P_SSH=ok P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-rw.out"
+check "--restart-web --yes 退出 0" "0" "$?"
+check_contains "⑦只 SIGTERM 占着端口的那个 PID" "只 SIGTERM 了占着 127.0.0.1:3989 的那一个 PID $p_lp" "$(cat "$TMP/p-rw.out")"
+check_contains "⑦用服务起回来（activating 时说明改用 restart）" "服务原本停在 activating/auto-restart" "$(cat "$TMP/p-rw.out")"
+check_contains "⑦新 token 落地只报存在性" "新 token 已落地" "$(cat "$TMP/p-rw.out")"
+check_contains "⑦明说不打印 token 值" "**值不打印**" "$(cat "$TMP/p-rw.out")"
+check_not_contains "⑦输出里没有新 token 的值" "NEW-TOKEN-456" "$(cat "$TMP/p-rw.out")"
+check "⑦旧 PID 真的被 SIGTERM 了" "1" "$(kill -0 "$p_lp" 2>/dev/null && printf 0 || printf 1)"
+check_contains "⑦复验本地 200（跟随跳转）" "跟随跳转 200" "$(cat "$TMP/p-rw.out")"
+check_contains "⑦复验公网 200" "Caddy→隧道→broker→dsh web 全通" "$(cat "$TMP/p-rw.out")"
+kill "$p_lp" 2>/dev/null || true
+
+# ⑧ 占着端口的是别的进程（cmdline 里没有 dsh）→ 不杀
+p_decoy=$(plisten 3989)
+sleep 0.5
+printf 'STILL-OLD\n' >"$pstate/current-token.txt"
+PRUN_EXTRA="--restart-web --yes"
+P_LISTEN_PORT=3989 P_LISTEN_PID="$p_decoy" T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active W_ACTIVE=active W_SUBSTATE=running \
+    W_NEW_TOKEN=SHOULD-NOT-HAPPEN P_SSH=ok P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-decoy.out"
+check "⑧cmdline 里没有 dsh → 非 0" "1" "$?"
+check_contains "⑧不杀，并说清为什么" "**不杀**，那可能不是 dsh web" "$(cat "$TMP/p-decoy.out")"
+check "⑧那个进程还活着" "0" "$(kill -0 "$p_decoy" 2>/dev/null && printf 0 || printf 1)"
+check "⑧也没给它换 token（token 文件还是旧的）" "STILL-OLD" "$(cat "$pstate/current-token.txt")"
+kill "$p_decoy" 2>/dev/null || true
+
+# ⑨ 从 broker 触发：不重启 broker 自己；也不许带 --restart-web
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=ok P_TOKEN_CODE=303 \
+    prun "$pstate" "$TMP/p-fb.out" DSH_REMOTE_FROM_BROKER=1
+check_contains "⑨从 /reset 触发时 broker 不重启自己" "broker 跳过重启（这次运行就是它发起的" "$(cat "$TMP/p-fb.out")"
+PRUN_EXTRA="--restart-web --yes"
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=ok \
+    prun "$pstate" "$TMP/p-fb2.out" DSH_REMOTE_FROM_BROKER=1
+check "⑨云上带 --restart-web → 非 0" "1" "$?"
+check_contains "⑨云上 /reset 永远不许重启 dsh web" "云上的 /reset 不允许重启 dsh web" "$(cat "$TMP/p-fb2.out")"
+
+# ⑩ --json：一行一条合法 JSON（broker 的页面靠它，别在 python 里重写第二套）
+PRUN_EXTRA="--json"
+P_LISTEN_PORT=3989 P_LISTEN_PID=$$ T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active P_SSH=one P_TOKEN_CODE=401 \
+    prun "$pstate" "$TMP/p-json.out"
+check "⑩--json 时退出码照样反映失败" "1" "$?"
+check "⑩每行都是合法 JSON，head 开头 summary 结尾 5 个 step" "ok" \
+    "$(python3 - "$TMP/p-json.out" <<'PY'
+import json, sys
+kinds = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if line:
+        kinds.append(json.loads(line)["kind"])
+print("ok" if kinds and kinds[0] == "head" and kinds[-1] == "summary" and kinds.count("step") == 5 else "bad")
+PY
+)"
+check_not_contains "⑩JSON 里也没有 token 值" "PTOKEN123" "$(cat "$TMP/p-json.out")"
+
+# ⑪ 手机按钮：broker 真进程 + GET /reset 确认页（no-store / nonce / 没有 token 和密码）
+pbstate="$TMP/pbstate"
+p_bport=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+mkdir -p "$pbstate"
+printf 'SECRET-BROKER-TOKEN\n' >"$pbstate/current-token.txt"
+env DSH_REMOTE_STATE_DIR="$pbstate" DSH_REMOTE_CONF="$TMP/pconf/remote.conf" \
+    DSH_REMOTE_CONF_DIR="$TMP/pconf" DSH_REMOTE_UNIT_DIR="$punits" \
+    DSH_REMOTE_SYSTEMCTL="$pstub/systemctl" DSH_REMOTE_RESET_DELAY=0 \
+    PATH="$pstub:$PATH" P_LISTEN_PORT= T_ACTIVE=active T_MAINPID=555 B_ACTIVE=active \
+    W_ACTIVE=active W_SUBSTATE=running P_SSH=ok P_TOKEN_CODE=303 P_PUB_FIRST=401 P_PUB_AUTHED=302 P_PUB_FOLLOW=200 \
+    python3 "$proj/bin/dsh-token-broker" --port "$p_bport" --web-port 3989 \
+    --token-file "$pbstate/current-token.txt" >"$TMP/p-broker.log" 2>&1 &
+p_bpid=$!
+p_i=0
+while [ "$p_i" -lt 40 ]; do
+    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p_bport/reset" && break
+    sleep 0.1
+    p_i=$((p_i + 1))
+done
+p_hdr=$(curl -s -D - -o "$TMP/p-reset.html" --max-time 5 "http://127.0.0.1:$p_bport/reset")
+check_contains "⑪GET /reset → 200" "200" "$p_hdr"
+check_contains "⑪响应 no-store" "Cache-Control: no-store" "$p_hdr"
+check_contains "⑪页面是确认页（确认按钮）" "确认重置" "$(cat "$TMP/p-reset.html")"
+check_contains "⑪说清不打断当前会话" "打断当前会话" "$(cat "$TMP/p-reset.html")"
+check_contains "⑪表单带一次性 nonce" 'name="nonce"' "$(cat "$TMP/p-reset.html")"
+check_contains "⑪写明要重启 dsh web 得在机器上跑" "force-restart-dsh-remote --restart-web --yes" "$(cat "$TMP/p-reset.html")"
+check_not_contains "⑪页面里没有 token" "SECRET-BROKER-TOKEN" "$(cat "$TMP/p-reset.html")"
+check_not_contains "⑪页面里没有密码" "doublemindul" "$(cat "$TMP/p-reset.html")"
+
+# ⑫ POST 的两道闸：没 nonce / nonce 重放 → 403；带 nonce → 202（先回响应再动隧道）
+check "⑫POST 不带 nonce → 403" "403" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --max-time 5 "http://127.0.0.1:$p_bport/reset")"
+p_nonce=$(sed -n 's/.*name="nonce" value="\([^"]*\)".*/\1/p' "$TMP/p-reset.html" | head -n 1)
+p_post=$(curl -s -o "$TMP/p-post.html" -w '%{http_code}' -X POST -d "nonce=$p_nonce" --max-time 8 "http://127.0.0.1:$p_bport/reset")
+check "⑫POST 带 nonce → 202" "202" "$p_post"
+check_contains "⑫提示隧道会断几秒" "隧道会断几秒" "$(cat "$TMP/p-post.html")"
+check "⑫同一个 nonce 重放 → 403" "403" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST -d "nonce=$p_nonce" --max-time 5 "http://127.0.0.1:$p_bport/reset")"
+
+# ⑬ POST 真的跑了安全档那套（桩 systemctl）：结果文件 + 页面每步 ✓/✗ + 判据
+p_i=0
+while [ "$p_i" -lt 60 ]; do
+    grep -q '"kind":"summary"' "$pbstate/reset-last.jsonl" 2>/dev/null && break
+    sleep 0.5
+    p_i=$((p_i + 1))
+done
+check "⑬结果文件是 head + 5 步 + summary 共 7 行" "7" "$(wc -l <"$pbstate/reset-last.jsonl" | tr -d ' ')"
+check_contains "⑬那次里 broker 没重启自己" "broker 跳过重启" "$(cat "$pbstate/reset-last.jsonl")"
+check "⑬stdout 是纯 JSON、stderr 是空的" "0" \
+    "$([ -s "$pbstate/reset-last.err" ] && printf 1 || printf 0)"
+curl -s -o "$TMP/p-result.html" --max-time 5 "http://127.0.0.1:$p_bport/reset"
+check_contains "⑬GET /reset 渲染出每步的 ✓" "✓" "$(cat "$TMP/p-result.html")"
+check_contains "⑬也渲染出判据命令" "判据 <code>" "$(cat "$TMP/p-result.html")"
+check_contains "⑬渲染出结论" "结论" "$(cat "$TMP/p-result.html")"
+check_not_contains "⑬结果页里也没有 token" "SECRET-BROKER-TOKEN" "$(cat "$TMP/p-result.html")"
+check_not_contains "⑬结果页里也没有密码" "doublemindul" "$(cat "$TMP/p-result.html")"
+kill "$p_bpid" 2>/dev/null || true
+
+# ⑭ Caddyfile 两份模板都要有 /reset，而且必须排在兜底 reverse_proxy **之前**（basic_auth 之后）
+for _pcf in Caddyfile.ip Caddyfile.domain; do
+    check_contains "⑭$_pcf 有 @reset path /reset" "@reset path /reset" "$(cat "$proj/cloud/$_pcf")"
+    check_contains "⑭$_pcf 的 /reset 走 broker 那条隧道" "reverse_proxy @reset 127.0.0.1:{{BROKER_PORT}}" "$(cat "$proj/cloud/$_pcf")"
+    _pline_reset=$(grep -n '@reset path /reset' "$proj/cloud/$_pcf" | head -n 1 | cut -d: -f1)
+    _pline_ba=$(grep -n 'basic_auth {' "$proj/cloud/$_pcf" | head -n 1 | cut -d: -f1)
+    _pline_catch=$(grep -n '^	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}}' "$proj/cloud/$_pcf" | head -n 1 | cut -d: -f1)
+    check "⑭$_pcf：basic_auth 在前、兜底在后（$_pline_ba < $_pline_reset < $_pline_catch）" "1" \
+        "$([ -n "$_pline_ba" ] && [ -n "$_pline_reset" ] && [ -n "$_pline_catch" ] && [ "$_pline_ba" -lt "$_pline_reset" ] && [ "$_pline_reset" -lt "$_pline_catch" ] && printf 1 || printf 0)"
+    _pindent=$(sed -n 's/^\([[:space:]]*\)@reset path \/reset$/\1/p' "$proj/cloud/$_pcf" | head -n 1)
+    check "⑭$_pcf：@reset 那行有缩进（说明在站点块里，basic_auth 才管得到）" "1" \
+        "$([ -n "$_pindent" ] && printf 1 || printf 0)"
+done
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s\n' "----------------"

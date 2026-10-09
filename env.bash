@@ -87,9 +87,18 @@ _hr_listening() { # 127.0.0.1:<端口> 有人在听吗（ss；没有 ss 就 curl
     fi
 }
 
-_hr_port_pid() { # 听 <端口> 的那个 PID；拿不到就打印空（那时只说"被占"，不编 PID）
+_hr_port_line() { # 听 <端口> 的那一行原文（任何地址；ss -ltnp 拿不到就是空）
     command -v ss >/dev/null 2>&1 || return 0
-    ss -ltnp 2>/dev/null | grep -F ":$1 " | head -n 1 | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'
+    ss -ltnp 2>/dev/null | grep -E "[:.]$1[[:space:]]" | head -n 1
+}
+
+_hr_port_pid() { # 听 <端口> 的那个 PID；拿不到就打印空（那时只说"被占"，不编 PID）
+    _hr_port_line "$1" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'
+}
+
+_hr_port_taken() { # 这个端口上有人听吗（任何地址 —— 那正是"服务绑不上"的原因）
+    [ -n "$(_hr_port_line "$1")" ] && return 0
+    _hr_listening "$1"   # 没有 ss 时退回 curl 那一招
 }
 
 _hr_unit_prop() { # $1=单元 $2=属性（MainPID/SubState/NRestarts/ExecMainStatus/RestartUSec…）
@@ -300,26 +309,64 @@ harness() {
             [ -n "${_hr_pub}" ] && printf 'harness: 手机 %s\n' "${_hr_pub}"
             return 0
         fi
-        # 没等到地址 → 报**实测出来的**原因，不许猜
+        # 没等到地址 → 报**实测出来的**原因，不许猜（2026-10-09 用户要求：
+        # 先看端口有没有人听 —— 有人听就是"端口被占"这一档，原因就确定了，别再写
+        # "端口被占 / npx 卡住都可能是这个"；没人听才去看 systemd，分三档，
+        # 每档都给一条能原地复现的判据命令）。
         _hr_pid=$(_hr_port_pid "${_hr_lp}")
-        if [ -n "${_hr_pid}" ] && ! _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; then
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 被另一个实例占着（PID %s，不是 systemd 管的）\n' \
-                "${_hr_lp}" "${_hr_pid}"
-            printf 'harness:   → 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的\n'
+        _hr_jlast=$(_hr_journal_last "$_hr_unit")
+        _hr_tokfile=
+        if [ -s "$_hr_tok" ]; then
+            _hr_tokfile=$(tr -d '\n' <"$_hr_tok")
+        elif [ -s "$_hr_url" ]; then
+            _hr_tokfile=$(sed -n 's/.*[?&]token=\([^&[:space:]]*\).*/\1/p' "$_hr_url" | head -n 1)
+        fi
+        if _hr_port_taken "${_hr_lp}"; then
+            if [ -n "${_hr_pid}" ]; then _hr_pid_txt="PID ${_hr_pid}"; else _hr_pid_txt='PID 拿不到（ss -ltnp 看不到）'; fi
+            if [ -n "${_hr_pid}" ] && _hr_pid_in_unit "${_hr_pid}" "$_hr_unit"; then
+                # 端口上是**服务自己**的人，却没写出新地址（罕见，别赖到"端口被占"上）
+                printf 'harness: dsh web 没起来 ✗ 原因：%s 上在听的那个 %s 属于 %s，但 %ss 内没写出新地址\n' \
+                    "${_hr_lp}" "${_hr_pid_txt}" "${_hr_unit}" "${_hr_wait}"
+                printf 'harness:   判据：ss -ltnp | grep -E "[:.]%s "；ls -l %s；journalctl --user -u %s -n 20\n' \
+                    "${_hr_lp}" "$_hr_url" "${_hr_unit}"
+            else
+                printf 'harness: dsh web 没起来 ✗ 原因：%s 被别人占着（%s，不是 systemd 管的）—— 服务只能等它让位\n' \
+                    "${_hr_lp}" "${_hr_pid_txt}"
+                # 那个实例的 token 只在它内存里才一定准 —— 拿真请求验一次再打（H22）
+                if [ -n "${_hr_tokfile}" ] && [ "$(_hr_token_probe "${_hr_lp}" "${_hr_tokfile}")" = ok ]; then
+                    printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/?token=%s（token 实测有效）\n' \
+                        "${_hr_lp}" "${_hr_tokfile}"
+                else
+                    printf 'harness:   现在能用的还是那个实例：http://127.0.0.1:%s/（token 没记下或实测已失效 —— 那个实例不是这里起的，它的 token 只在它内存里）\n' \
+                        "${_hr_lp}"
+                fi
+                printf 'harness:   → 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的\n'
+                printf 'harness:   判据：ss -ltnp | grep -E "[:.]%s "   # 这一行就是占着它的那个进程\n' "${_hr_lp}"
+            fi
             printf 'harness:   systemd: %s  看：journalctl --user -u %s -n 20\n' \
                 "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")" "${_hr_unit}"
         elif [ "${_hr_svc}" = failed ]; then
             _hr_code=$(_hr_unit_prop "$_hr_unit" ExecMainStatus)
-            _hr_jlast=$(_hr_journal_last "$_hr_unit")
-            printf 'harness: dsh web 没起来 ✗ 原因：%s 失败（exit %s）—— 日志最后一行：%s\n' \
-                "${_hr_unit}" "${_hr_code:-未知}" "${_hr_jlast:-（journalctl 没给出内容）}"
-            printf 'harness:   看：journalctl --user -u %s -n 20\n' "${_hr_unit}"
+            printf 'harness: dsh web 没起来 ✗ 原因：%s 失败（exit %s），端口 %s 上没人听 —— 日志最后一行：%s\n' \
+                "${_hr_unit}" "${_hr_code:-未知}" "${_hr_lp}" "${_hr_jlast:-（journalctl 没给出内容）}"
+            printf 'harness:   判据：systemctl --user show -p ExecMainStatus -p NRestarts --value %s；journalctl --user -u %s -n 1 -o cat\n' \
+                "${_hr_unit}" "${_hr_unit}"
+        elif [ "${_hr_svc}" = activating ] || [ "${_hr_svc}" = active ]; then
+            printf 'harness: dsh web 没起来 ✗ 原因：%s 还在起（%s），端口 %s 上没人听 —— 日志最后一行：%s\n' \
+                "${_hr_unit}" "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")" \
+                "${_hr_lp}" "${_hr_jlast:-（journalctl 没给出内容）}"
+            printf 'harness:   判据：systemctl --user show -p NRestarts -p RestartUSec --value %s；journalctl --user -u %s -n 1 -o cat\n' \
+                "${_hr_unit}" "${_hr_unit}"
         else
-            printf 'harness: dsh web 没起来 ✗ 原因：等了 %ss 没等到 systemd 写出地址（systemd=%s；端口被占 / npx 卡住都可能是这个）\n' \
-                "${_hr_wait}" "$(_hr_svc_note "${_hr_svc}" "${_hr_sub}" "${_hr_restarts}" "${_hr_rsec}")"
-            printf 'harness:   判据：ss -ltn | grep :%s ; systemctl --user is-active %s\n' "${_hr_lp}" "${_hr_unit}"
-            [ -s "$_hr_url" ] && printf 'harness:   （web-url.txt 还是上一次的，没被重写）\n'
-            printf 'harness:   看：journalctl --user -u %s -n 20\n' "${_hr_unit}"
+            printf 'harness: dsh web 没起来 ✗ 原因：%s 没在跑（is-active=%s：没装 / 没 enable / 自己退了），端口 %s 上也没人听\n' \
+                "${_hr_unit}" "${_hr_svc:-空}" "${_hr_lp}"
+            printf 'harness:   日志最后一行：%s\n' "${_hr_jlast:-（journalctl 没给出内容）}"
+            printf 'harness:   判据：systemctl --user is-active %s；ss -ltn | grep -E "[:.]%s "；journalctl --user -u %s -n 1 -o cat\n' \
+                "${_hr_unit}" "${_hr_lp}" "${_hr_unit}"
+            printf 'harness:   → 起它：systemctl --user start %s（要开机自动起：dsh-remote serve-install）\n' "${_hr_unit}"
+        fi
+        if ! _hr_port_taken "${_hr_lp}" && [ -s "$_hr_url" ]; then
+            printf 'harness:   （web-url.txt 还是上一次的，没被重写）\n'
         fi
         return 0
     fi

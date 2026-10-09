@@ -1,0 +1,14 @@
+#!/bin/sh
+# dsh-force-restart-dsh-remote —— `dsh-remote force-restart-dsh-remote` 的薄封装。
+#
+# 用户 2026-10-09 批准的用户可见命令名就是这个（"要有强制重置按钮"），
+# 和 `dsh-remote-server` 是同一个模式：真正干活的是 bin/dsh-remote 里的
+# cmd_force_restart，这里只负责把参数原样转过去，并且**先解软链**再找兄弟脚本
+# （$WTOOL_PREFIX/bin 里那一条是软链，不解就会把目录算成 bin 的软链所在处）。
+#
+# 默认是安全档（重置隧道 + broker，复验云上/本地/token/公网，**不碰 dsh web**）。
+# `--restart-web --yes` 是例外：只 SIGTERM 占着 local_port 的那一个 PID，
+# 再用 dsh-web.service 起回来 —— 会打断正在跑的会话。云上的 /reset 不走它。
+SELF=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
+exec "$SELF_DIR/dsh-remote" force-restart-dsh-remote "$@"

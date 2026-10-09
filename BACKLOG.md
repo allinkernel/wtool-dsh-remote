@@ -13,7 +13,7 @@
 ## 🔴 仍未做 / 未验证（一览，2026-10-09 更新）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **556 通过 0 失败**，2026-10-09 实跑），
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **675 通过 0 失败**，2026-10-09 实跑），
 > 真机端到端也在 2026-10-07 当天走通了（中继 + 公网 + 常驻隧道），
 > 2026-10-09 又按"固定地址"那 7 条判据从家里经公网复验了一遍。
 > 下表是"还剩什么"的全集，展开在后面的小节里。
@@ -37,11 +37,21 @@
 | U15 | ⏸ | `dsh-web.service` 长期停在 `activating`（在等 3080 空出来） | **待用户决定**：① 保持现状；② 加"提示用户手动重启那个实例"；③ 自动接管（**会打断在跑的会话，默认不做**）。**①已经做到**（2026-10-09，U17）：`harness` 现在直接打出"3080 被另一个实例占着（PID …，不是 systemd 管的）"+ 接管办法 |
 | U16 | ✅ | **隧道自我维持成风暴 + 没有自愈** | 2026-10-09：`StartLimitIntervalSec=300` + `StartLimitBurst=10` + `RestartSec=5`，并加一个 5 分钟一次的自愈 timer（见下面 U16 节） |
 | U17 | ✅ | **`harness` 输出"状态 + 原因" + 堵住坏代理卡死服务** | 2026-10-09 用户要求：明确说清服务起没起来、为什么；四态 + 判据命令（ADR-0020）。同时 `dsh-web-run` 起 npx 前默认清空代理（ADR-0021、hazards H28）。见下面 U17 节 |
+| U18 | ✅ | **一键强制重置 + 手机上的按钮** | 2026-10-09 用户批准"要有强制重置按钮"：`force-restart-dsh-remote`（安全档绝不碰 `dsh web`；`--restart-web --yes` 是受限例外）+ 云上 `/reset`（确认页 + POST，走 broker、异步、一次性 nonce）。真机 + 真公网实测。见下面 U18 节（ADR-0022/0023、hazards H29/H30） |
+| U19 | ✅ | **`harness` "没起来"那一档不许再含糊** | 2026-10-09 用户现场发火：超时分支只会说"端口被占 / npx 卡住都可能是这个"。改成**先看端口**（有人听 = "被别人占着 + 实测 PID + 那个实例的 token 验没验过"），没人听才分"服务失败 exit N / 还在起第 N 次重试 / 服务没在跑"三档，每档一条判据命令。3181+ 上验过四档（见下面 U19 节）。另记一条 hazard H31：**打印了 URL ≠ 这个实例活着** |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
 **"网络真断"（ServerAlive 那条路）的重连、重启机器后服务会不会自己起来**（linger 已开、
 单元已 `enable`，但没重启过机器）；真机上的安全组/防火墙/证书续期的任何验证；
 真手机浏览器扫码（一直是 curl 在验，**没有真机浏览器截图**）。
+
+⚠️ **2026-10-09 实测的一条"不会自动恢复"**：云上僵尸会话占着 `18080/18081` 时，家里隧道
+连续失败 **10 次**就被 `StartLimitBurst` **停下并标 `failed`**（`NRestarts=10`）——
+这是 ADR-0019 有意设计的"别再锤对端"，代价是**它自己不会回来**：要么等自愈 timer
+（最长 5 分钟，且它也只是"再试一次"），要么**人跑一条命令**清掉那个状态
+（`force-restart-dsh-remote` 做的第一件事就是 `reset-failed`）。
+同一天还有两条"看起来在跑其实没成"：手工起的 `dsh web` 让 token 抓不到（H29）、
+服务被端口占着一直 `activating`（U15/U19）。
 
 ---
 
@@ -725,3 +735,94 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
 - `harness` 里 `ss -ltnp` 的 PID 需要能看到进程属主；别人的进程看不到时会退化成
   "PID 拿不到（ss -ltnp 看不到）"（**没在真机上遇到**，代码里是显式降级）。
 - 前台那条（`npx` 交互跑）的代理**故意没动** —— 那是用户自己的会话（ADR-0021 决定 4）。
+
+---
+
+## ✅ U18 一键强制重置 `force-restart-dsh-remote` + 手机上的 `/reset`（2026-10-09 做完并实测）
+
+**谁要的**：用户 2026-10-09 批准的新用户可见命令（"要有强制重置按钮"）。
+**为什么**：当天一天里实测到三类"不会自己好"的故障，而人只有手机：
+
+| # | 现场判据（当天实测） | 为什么不会自己恢复 |
+|---|---|---|
+| ① 隧道死 | `systemctl --user show -p NRestarts --value dsh-tunnel.service` = **10**、`is-active` = **failed** | 云上僵尸会话占着 `18080/18081` → 起来就被掐 → ADR-0019 的 `StartLimitBurst=10` 按设计**停下**；自愈 timer 最长 5 分钟才看一眼 |
+| ② token 过期 | `current-token.txt` **43 字节**，拿它打 `http://127.0.0.1:3080/?token=…` 回 **401** | `dsh web` 是**手工**起的，token 只在它内存里（H22）；不重启它就拿不到新 token |
+| ③ 服务被占 | `dsh-web.service` = `activating`、`NRestarts` = **108**（后来 124/143 还在涨） | 手工实例占着 3080，`dsh-web-run` 按设计 exit 1 不抢，systemd 每 30 秒重试 |
+
+**做了什么**（代码 + 文档同一个提交；ADR-0022/0023、hazards H29/H30）：
+1. `bin/dsh-remote` 的 `cmd_force_restart`（安全档 6 步 + `--restart-web` 例外 + `--json`）
+   + 薄封装 `bin/dsh-force-restart-dsh-remote` + `scripts/install.sh` 注册（第 5 条命令，
+   I 节"源没找到"的条数断言跟着从 6/5 改成 7/6）。
+2. `bin/dsh-token-broker` 加 `/reset`：GET 确认页（一次性 nonce 表单 + 上次结果）、
+   POST 异步跑安全档（**先回 202 再动隧道**）、结果渲染成"每步 ✓/✗ + 判据"。
+   安全：只认回环来源 + Caddy 的 basic_auth（**不加新鉴权**）+ nonce 挡跨站表单 +
+   不回显 token/密码 + `Cache-Control: no-store`。
+3. 两份 `Caddyfile` 加 `@reset` 路由（在 basic_auth 之后、兜底之前，走 broker 那条隧道）。
+4. 文档：ADR-0022（命令语义 + 限定 ADR-0005）、ADR-0023（按钮为什么走 broker）、
+   hazards H29/H30/H31、`architecture.md`（§3 两行 + §3.2 的 `/reset` + §3.5 的四档 +
+   §10/§11/§12）、`README.md`（命令表 + 手机按钮怎么用）、`AGENTS.md`（**验证不碰 3080** 的铁律）。
+
+**验证到什么程度**（**真机 + 真公网**，全部只用 3181+ / 桩，**全程没碰 3080**）：
+- **安全档真机跑通**：隧道 ✓（`reset-failed` + restart，`is-active=active NRestarts=0`）、
+  broker ✓、云上 `18080+18081` **2/2** ✓、本地 3080 认成"手工实例 PID 152050
+  （`dsh-web.service=activating/auto-restart（已重试 143 次）`）"、token 有效（首跳 303 →
+  跟随 200）、公网 401→302→200 ✓，rc=0。判据：`ss -ltnp | grep ':3080 '` 的 PID 自始至终没变。
+- **`--restart-web` 没有对用户的实例跑**（那会断掉用户正在看的会话）。做的是**真 `ss` +
+  真 SIGTERM** 的混合演练：靶子是我自己起的监听（cmdline 带 `dsh web`，端口 3996）→
+  只杀了它那一个 PID、端口随即空出；另验"cmdline 不含 dsh → **不杀**"和
+  "非 tty 没 `--yes` → 拒绝且不动任何进程"。服务那半（起回来 + 抓新 token）走桩
+  （P 节 9 条）。
+- **云上重渲染**（只写 `/home/mindul/dsh-relay/**`）：scp 两个模板 → `sh cloud/relay.sh
+  --ip 123.56.158.212 --port 8443 --password 'doublemindul@200w' --no-compose --dir
+  /home/mindul/dsh-relay --docker-cmd 'sudo docker'`（ufw inactive，没碰防火墙）→
+  复验"该密码 302 / 错密码 401 / 不带密码 401"、云上 Caddyfile 有 `@reset`、两端口 2/2。
+  密码值**没变**（本来就是用户给的那个），所以"旧密码失效"这一条只能验"错密码仍被拒"。
+- **手机 `/reset` 真公网实测**：`GET /reset`（带 basic auth）→ **200**、`Cache-Control: no-store`、
+  页面有"确认重置"和 nonce、**没有 token/密码**；`POST` 带 nonce → **202 / 0.126s**
+  （隧道随后才断，证明"先回响应再动隧道"这条设计成立）；不带 nonce / 重放同一个 nonce → **403**；
+  20 秒后 `GET /reset` 渲染出 6 步 ✓/✗ + 判据 + 结论（`reset-last.jsonl` 7 行，stderr 空）。
+- **本机离线**：`sh tests/run_tests.sh` → **675 通过 0 失败**（新增 **P 节 85 条**，
+  O 节 108 → **142** 条）。跑完 `ss -ltnp | grep ':3080 '` 还是 `pid=17169`。
+
+**没验 / 风险**：`--restart-web` 的**真实服务那半**（真 `systemctl start dsh-web.service`
++ 真抓到新 token）**没在真机上验**（会打断用户会话，用户没让做）——只有桩测 +
+  真 SIGTERM 那半；`/reset` 的 nonce 挡不挡得住"已经拿到 basic auth 的脚本"（能）与
+  "真人误点"（不能，那是设计）；`/reset` 在"隧道正断着"时打开会 502（页面里写了要等一下再刷）。
+
+---
+
+## ✅ U19 `harness` "没起来"那一档：从"可能是这个可能是那个"改成四档实测（2026-10-09 做完并实测）
+
+**谁要的**：用户 2026-10-09 现场发火。当时 `harness` 打的是：
+`dsh web 没起来 ✗ 原因：等了 20s 没等到 systemd 写出地址（systemd=activating/auto-restart
+（已重试 7 次，每 30s 一次）；端口被占 / npx 卡住都可能是这个）` —— 而真实原因是确定的：
+3080 被别人的实例占着，`dsh-web-run` 的日志里明明写着"已经有会话在跑 … exit 1 让 systemd
+按 RestartSec 重试"。
+
+**做了什么**（`env.zsh` / `env.bash` 两份逐字相同，改完 `diff` 过）：
+- 新增 `_hr_port_line` / `_hr_port_taken`（`ss -ltnp | grep -E '[:.]<端口> '`，没有 `ss`
+  退回 `curl` 敲一下）；`_hr_port_pid` 改成用它们。
+- **等不到地址时先看端口**：有人听 → "`<端口>` 被别人占着（PID x，不是 systemd 管的）——
+  服务只能等它让位" + "现在能用的还是那个实例"（token **拿真请求验过**才打带 token 的地址）
+  + 接管办法 + 判据 `ss -ltnp | grep -E '[:.]<端口> '`。
+- **没人听**才看 systemd，分三档（都附 `journalctl -o cat -n 1` 的**最后一行原文**）：
+  服务失败（`exit N`）/ 还在起（`activating…（已重试 N 次，每 30s 一次）`）/ 服务没在跑
+  （`is-active=inactive`，并给"起它"的命令）。四档都会补一行"web-url.txt 还是上一次的"。
+- 测试：O 节里"等超时"那两条断言跟着改，并新增**态⑦（端口被别人占）/ 态⑧（还在起）**，
+  每条都断言"原因 + 判据"、且**不许再出现"都可能是这个"**。
+
+**验证到什么程度**：**在 3181 上（不碰 3080）**用真 `env.bash` + 桩 systemctl/journalctl 跑过四档：
+
+| 档 | 怎么造的 | 打出来的（实测原文摘要） |
+|---|---|---|
+| 端口被别人占 | 3182：等的中途让别人 `bind` 上 | `原因：3182 被别人占着（PID 62294，不是 systemd 管的）—— 服务只能等它让位` + `判据：ss -ltnp \| grep -E "[:.]3182 "` |
+| 服务失败 | 3183：`is-active=failed`、桩 journal 给一行 | `原因：dsh-web.service 失败（exit 1），端口 3183 上没人听 —— 日志最后一行：dsh-web.service: Failed with result 'exit-code'.` |
+| 还在起 | 3184：`activating/auto-restart`、`NRestarts=12` | `原因：dsh-web.service 还在起（activating/auto-restart（已重试 12 次，每 30s 一次）），端口 3184 上没人听 —— 日志最后一行：…` |
+| 服务没在跑 | 3185：`inactive` | `原因：dsh-web.service 没在跑（is-active=inactive：没装 / 没 enable / 自己退了），端口 3185 上也没人听` + `→ 起它：systemctl --user start dsh-web.service` |
+| （对照）复用分支 | **只读**看 3181 上那个真实例 | `3181 被另一个实例占着（PID 25896，不是 systemd 管的）` + `现在能用的还是那个实例` |
+
+⚠️ **反面对照里发现的一条，记进 hazards H31**：把 3186 端口先占住再跑
+`npx @deepseek-ai/dsh web --port 3186` → 它直接 `EADDRINUSE` 退出、**没有**打印 token
+（所以"绑不上端口也会先打印一个 token"这个说法**本轮没有复现**）；能确认的只有
+"**打印了 URL ≠ 这个实例活着**" —— 判据是 `ss -ltnp` + 拿那个 token 直连一次。
+**全量**：`sh tests/run_tests.sh` → **675 通过 0 失败**；跑完 3080 的 PID 没变。

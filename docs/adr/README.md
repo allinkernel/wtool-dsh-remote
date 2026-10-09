@@ -35,6 +35,8 @@
 | 19 | [隧道"失败 10 次就停下" + 家里一个 5 分钟一次的自愈检查（不再无限重试）](0019-tunnel-storm-guard-and-self-heal.md) | 2026-10-09：`RestartSec=3` + `StartLimitIntervalSec=0` 在对端持续掐连接时自我维持成 **1708 次**风暴之后；含"为什么自愈放家里不放云上"与否决方案 |
 | 20 | [`harness` 的输出契约：第一行永远是"状态 + 为什么"，原因必须实测](0020-harness-status-output-contract.md) | 2026-10-09 用户："废话太多，明确地指出服务到底起来没有、没起来的原因是什么"；含四态判据、为什么"地址是不是刚写的"不能只比 mtime |
 | 21 | [`dsh-web-run` 起 npx 前默认清空代理（要代理就显式配）](0021-dsh-web-run-clears-proxy.md) | 2026-10-09：WSL autoProxy 注入的坏代理被开机时的 `systemd --user` 抓到 → 服务里的 npx 永久卡住、永不写 token；`harness` 那边表现为"等 20s 没等到地址" |
+| 22 | [`force-restart-dsh-remote`：一键兜底，以及"绝不重启 `dsh web`"的唯一例外](0022-force-restart-command-and-restart-web-exception.md) | 2026-10-09 用户批准"要有强制重置按钮"：当天实测三类故障（隧道风暴停下 / 手工实例的 token 抓不到 / 服务被端口占着 activating）都要人回家敲命令。**限定 ADR-0005**：默认档绝不碰 `dsh web`，`--restart-web --yes` 是显式例外（只 SIGTERM 占着端口的那一个 PID + 用服务起回来） |
+| 23 | [手机上的"重置按钮"走云上 `/reset` → 家里 token broker，而不是直连 `dsh web`](0023-reset-button-through-token-broker.md) | 2026-10-09：broker 已经在家、已经有隧道、和命令同一个 `bin/`，所以由它代跑安全档（只跑命令、不重写逻辑）；POST 先回 202 再动隧道（实测 0.126s）、一次性 nonce 挡 CSRF、云上永不允许 `--restart-web` |
 
 > **1–11 是同一条线（2026-09-20 的初版 `13734e3` + 2026-10-04 的修复）**，
 > 2026-10-07 补记成 ADR。当时只写了 `README.md` 的"为什么这么设计"一节和代码注释，

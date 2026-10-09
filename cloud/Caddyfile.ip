@@ -55,6 +55,16 @@
 		header_up Host 127.0.0.1:{{LOCAL_PORT}}
 	}
 
+	# /reset：手机上的"重置按钮"（2026-10-09 用户批准；ADR-0022）。GET 是一个确认页，
+	# POST 让**家里**把隧道 + token broker 重置一遍（跑的是和命令行同一个
+	# force-restart-dsh-remote 安全档），结果渲染成每步 ✓/✗ + 判据命令。
+	# 走 broker 那条隧道（和 /go 同一个口），**必须留在 basic_auth 之后** ——
+	# 这一段就在站点块里，basic_auth 已经先把过关。云上永远不允许重启 dsh web。
+	@reset path /reset
+	reverse_proxy @reset 127.0.0.1:{{BROKER_PORT}} {
+		header_up Host 127.0.0.1:{{LOCAL_PORT}}
+	}
+
 	# 其余请求（带 token 的 /、会话界面、SSE、WebSocket）
 	# 一律直连家里的 dsh web —— broker 不参与主链路。
 	reverse_proxy 127.0.0.1:{{TUNNEL_PORT}} {

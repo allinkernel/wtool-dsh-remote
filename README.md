@@ -168,6 +168,8 @@ harness:   systemd: activating/auto-restart（已重试 84 次，每 30s 一次�
 | `dsh-remote broker-install` / `broker-uninstall` | 把 token broker 装成 / 撤出 systemd `--user` 常驻 |
 | `dsh-remote server` | **一条命令装好**：自检 → 云上中继 → 家里常驻隧道 + broker → 起 harness → 打印固定地址 + 二维码（`dsh-remote-server` 是等价入口） |
 | `dsh-remote passwd` | **改中继密码**（在家里一条命令）：云上算哈希 → 只改 Caddyfile 里那一行 → 重启容器 → 验"旧密码被拒 + 新密码能过" → 同步云上的密码文件 |
+| **`force-restart-dsh-remote`** | **一键兜底**：`reset-failed` + 重启隧道和 token broker，然后复验"云上两个隧道口 / 本地 dsh web / token 还新鲜吗 / 公网入口"，每步都打一行**状态 + 为什么**和一条**判据命令**，最后给结论。**默认绝不碰 `dsh web`**（所以在跑的那个会话不受影响）。手机连不上、隧道被占、服务一直起不来时先跑它 |
+| `force-restart-dsh-remote --restart-web --yes` | 上面那条的**例外**：`dsh web` 是**手工**起的、token 已经过期（手机固定地址回 401）时，只有重启它才能拿到新 token。它会**只对占着 3080 的那一个进程**发 SIGTERM，然后用 `dsh-web.service` 起回来（这样新 token 才会被记下来），**会打断正在跑的会话** —— 所以要 `--yes`（交互终端里敲 `yes` 也行）。只差这一条路才用它 |
 | `dsh-remote url` | 打印手机该收藏的地址 |
 | `dsh-remote notify-test` | 推一条测试消息 |
 | `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
@@ -177,6 +179,14 @@ harness:   systemd: activating/auto-restart（已重试 84 次，每 30s 一次�
 | `dsh-remote check-hooks` | 一次性进程验证钩子桥到底会不会触发（对照实验，几十秒） |
 | `dsh-remote log` | 看推送日志（`notify.log`）和 harness 日志（`web.log`）；隧道日志在 tmux / systemd 那边 |
 | `dsh-notify "标题" "正文"` | 直接推一条（脚本里也能用，退出码永远是 0） |
+
+**手机上的"重置按钮"**：浏览器打开你的固定地址后面加 `/reset`
+（例：`https://<你的入口>:8443/reset`，一样要过 basic auth）—— 那是一个确认页
+（"会重置隧道/broker，**不会**打断当前会话"），点"确认重置"就是在这里跑一遍
+上面那条 `force-restart-dsh-remote` 的安全档；几秒后刷新同一页能看到**每步 ✓/✗ + 判据命令**。
+隧道会断几秒（这是它要做的事），期间刷新可能失败一次，等一下再刷。
+**要重启 `dsh web`（换新 token）不能在手机上做** —— 那会把你自己这条连接掐断；
+那种情况在机器上跑 `force-restart-dsh-remote --restart-web --yes`。
 
 `cloud-install` 的选项（真装到云上那一条）：
 
@@ -353,7 +363,7 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 556 条（以输出为准），不联网、不碰真 $HOME
+sh tests/run_tests.sh        # 675 条（以输出为准），不联网、不碰真 $HOME
                              #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
                              #   跑几次 docker run …（第一次会把 caddy:2.11.4 拉下来，约 50MB）
 sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
@@ -383,12 +393,16 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-09 实测，合计 **556**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-09 实测，合计 **675**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 100** /
 **固定地址那条链路 K 55** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22** /
-**dsh web 常驻 + harness 四态输出 O 108**（含 `dsh-web-run` 的代理处理：
-桩 npx 把子进程的 `env | grep -i proxy` dump 出来对账）。
+**dsh web 常驻 + harness 四态输出 O 142**（含"没起来"的四档诊断：端口被别人占 /
+服务失败 / 还在起 / 服务没在跑，每档都带判据；还有 `dsh-web-run` 的代理处理：
+桩 npx 把子进程的 `env | grep -i proxy` dump 出来对账）/
+**一键强制重置 + 手机 `/reset` P 85**（安全档在各种桩状态下的关键输出、`--restart-web`
+无 `--yes` 拒绝、只 SIGTERM 那一个真 PID、broker 的 `GET/POST /reset`（nonce 一次性、
+结果页渲染、两处都不泄漏 token/密码）、两份 Caddyfile 的 `/reset` 位置）。
 K 节里 broker 起**真进程**、`dsh web` 用 `tests/fake_dsh_web.py` 这个**假夹具**
 （按 cookie 的值造 200/401/303/500/慢响应），所以"过期 cookie → 跳转""有效 cookie →
 代发首页""判断不出来 → 503"三条都**离线**测得出来。
@@ -398,6 +412,9 @@ J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 O 节的 harness 四态（服务在跑 / 端口被非 systemd 实例占 / 服务 failed / 没有服务走前台）
 用 `systemctl`/`journalctl` 桩 + 真回环监听，**bash 和 zsh 各跑一遍同一张表**。
+**测试绝不碰 3080**（那是你正在用的那个会话）：端口一律用 3181 以上或临时挑的空闲端口，
+状态/配置/单元落点全指到临时目录 —— 判据是跑完 `ss -ltnp | grep ':3080 '` 的 PID 没变
+（P 节和 O 节都守这条）。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
 （永远绿的测试等于没测）。

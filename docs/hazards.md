@@ -1029,3 +1029,110 @@ grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run
   `[dsh-web-run] 代理: 已清空（http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY/all_proxy/ALL_PROXY；no_proxy 保留：没设）`
   （2026-10-09 20:5x 当场读到；那时本机 `systemctl --user show-environment | grep -i proxy` 已经没有代理变量了
   —— 注入是开机那次的事，现在看不到，所以**这条 hazard 的现场没有被本轮复现**）。
+
+---
+
+## H29. **手工**起的 `dsh web` → token 抓不到，手机固定地址 401（H22 的"续集"）
+
+- **现象**（2026-10-09 用户手机上实测）：手机收藏的固定地址一直是 **401**
+  （`dsh web authentication required; reopen the URL printed by dsh web.`），
+  家里 `current-token.txt` **在、43 字节**，但拿它打本地 `dsh web` 也是 **401**。
+  与此同时 `dsh-token-broker` 活得好好的、302 也在发 —— 于是"看起来每个零件都正常"。
+- **根因**：那个 `dsh web` 是**手工**起的（`npx @deepseek-ai/dsh web --port 3080`，
+  2026-10-06 起一直没退）。`dsh web` 的 token 是**每个进程随机、只在内存里**的
+  （`processLaunchToken`，H22），只有 `dsh-web-run` 这条包装会把启动时打印的那一行
+  解析下来写进状态文件。手工起的实例**没有任何东西去抓那个 token** ——
+  状态文件里那份是**上一个**（由服务/`harness` 起的）实例留下的，早就作废了。
+  于是：broker 老老实实 302 到一个**死 token**，`dsh web` 回 401。
+- **判据（怎么一眼看出来）**：
+
+  ```sh
+  ss -ltnp | grep ':3080'                       # 记下 PID
+  systemctl --user show -p MainPID --value dsh-web.service   # 和上面那个 PID 不一样
+  grep -q dsh-web.service /proc/<PID>/cgroup && echo 服务托管 || echo 手工实例
+  curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:3080/?token=$(cat ~/.local/state/dsh-remote/current-token.txt)"
+  #   → 401 = token 过期（状态文件是旧的）；303/200 = 有效
+  systemctl --user show -p NRestarts --value dsh-web.service  # 手工占着端口时这个数会一直涨（当天 108 → 143）
+  ```
+  同一天的现场：`dsh-web.service` 停在 `activating`、`NRestarts=108`，
+  而 3080 上那个 PID 的 cgroup 里根本没有 `dsh-web.service`。
+- **修法**：让**服务**把 `dsh web` 起回来（`dsh-web-run` 才会抓 token）——
+  `force-restart-dsh-remote --restart-web --yes`（ADR-0022）。它会
+  **只 SIGTERM 占着 3080 的那一个 PID**，然后 `systemctl --user restart/start dsh-web.service`
+  并等 `current-token.txt` 出现新值。**不重启 `dsh web` 拿不到新 token**，没有第二条路
+  （`dsh web --help` 里没有固定 token / 关鉴权的开关，H22 已经查过）。
+  **代价**：会打断正在跑的会话 —— 所以它默认不跑，必须人显式加 `--restart-web --yes`。
+- **验证程度**：现象是 2026-10-09 的**真实现场**（上面那条 `curl … 401` 与
+  cgroup 判据都是当场读的）。**真机上没有对用户正在用的那个实例跑过 `--restart-web`**
+  （那正是用户此刻在看的会话，跑了它这个会话就断了）—— 真机验到的是：
+  ① 安全档那一步如实报出"手工实例 PID 152050、`dsh-web.service=activating/auto-restart（已重试 143 次）`"；
+  ② **真 `ss` + 真 SIGTERM** 的混合演练：拿一个真监听（cmdline 里带 `dsh web`）当靶子，
+   `--restart-web --yes` 只杀了它那一个 PID、端口随即空出来、用户那个 3080 实例全程没被碰
+  （`ss -ltnp | grep -c ':3080 '` 前后都是 1）；③ 服务那半（起回来 + 抓 token）在
+  `tests/run_tests.sh` 的 P 节用桩 systemctl 验（桩在 `start/restart dsh-web.service` 时
+  把新 token 写进状态文件，模拟 `dsh-web-run`）。
+
+## H30. `/reset` 不能同步做，也不能带 `--restart-web`
+
+- **现象**（两条都是设计时推出来的，2026-10-09 用实测确认了第一条）：
+  ① 手机上点"确认重置"如果**同步**跑完再回响应，浏览器只会看到一次 502/连接重置
+  —— 因为安全档第一步就重启隧道，而这条 HTTP 请求正走在**那条隧道**上
+  （Caddy → 云上 `18081` → SSH 隧道 → 家里 `3081`）；
+  ② 如果允许从云上 `--restart-web`，那就是"自己把自己踢掉"：重启 `dsh web` 会换 token、
+  切断浏览器那条链路，用户既看不到结果、也不知道到底成没成。
+- **根因**：`/reset` 的"执行者"（家里 broker）和它的"传输通道"（那条隧道）是**同一个东西的两半**；
+  重启通道 = 掐断自己。`dsh web` 更极端：它是这条链路最后那一跳。
+- **修法**（ADR-0023）：
+  ① POST **先把响应发出去**（broker 立刻回 `202` + "已开始（隧道会断几秒）"），
+  run 起成 **detached** 子进程（`start_new_session=True`），并且 `sleep <DSH_REMOTE_RESET_DELAY>`
+  （默认 2 秒）之后才 `exec` —— 给响应留出上路的时间。**实测 0.13 秒回 202**，隧道随后才断；
+  ② 从 `/reset` 起的那次带 `DSH_REMOTE_FROM_BROKER=1`：命令看到它就**拒绝** `--restart-web`
+  （`die "云上的 /reset 不允许重启 dsh web…"`），而且**跳过重启 broker 自己**
+  （run 是 broker 的子进程、同一个 cgroup，重启 broker 会把正在写这份报告的进程一起杀掉；
+  何况"能答 `/reset` 的 broker 显然是活的"）。
+- **判据（怎么看出来 / 怎么复现）**：
+
+  ```sh
+  # ① 异步：POST 立刻回，隧道随后才断
+  curl -sk -u dsh:<密码> -o /dev/null -w '%{http_code} %{time_total}s\n' -X POST -d "nonce=<从 GET 页面取>" https://<入口>:8443/reset
+  #   → 202 0.1x 秒（同步做的话这里会超时/502）
+  # ② 云上不许重启 dsh web
+  DSH_REMOTE_FROM_BROKER=1 dsh-remote force-restart-dsh-remote --restart-web --yes; echo $?   # → 1 + 那句 die
+  # ③ 从 /reset 触发时 broker 那一行是"跳过重启"
+  grep -o 'broker 跳过重启[^"]*' ~/.local/state/dsh-remote/reset-last.jsonl
+  ```
+- **验证程度**：2026-10-09 实测 —— 真公网 POST 回 **202 / 0.126s**，
+  随后家里 `reset-last.jsonl` 里第 1 步写着"broker 跳过重启（这次运行就是它发起的…）"，
+  云上隧道口最后仍是 **2/2**；P 节另有 3 条桩测守住这三件事（异步 202 / 重放 nonce 403 /
+  `DSH_REMOTE_FROM_BROKER=1` 下拒绝 `--restart-web`）。
+
+## H31. **打印了 URL ≠ 这个实例活着**：别拿一行输出当"它在跑"
+
+- **现象**（2026-10-09 用户现场）：终端/日志里出现过一条带 token 的 `dsh web` 地址，
+  拿它直连本地却回 **401**（`dsh web authentication required; reopen the URL printed by dsh web.`）。
+  也就是"**看见了 URL**"和"**这个实例正活着并且认这个 token**"是两件事。
+- **根因**：`dsh web` 的 token 是**每个进程随机、只在内存里**的（H22）。任何"从输出里抓一行"
+  的东西（`harness` 函数、`dsh-web-run`、用户手工复制）抓到的都是**那一刻那个进程**的 token；
+  那个进程随后退出/被换掉/端口被别人抢走，文件里/剪贴板里那一行就变成**死 token**，
+  而它看起来和好的一模一样。链路里没有任何东西会告诉你它死了 —— 直到你拿它打一次、
+  拿到 401（broker 会老老实实 302 到这个死 token，手机上也只看到 401，见 H29）。
+- **判据（两条一起看，缺一不可）**：
+
+  ```sh
+  ss -ltnp | grep ':3080 '                                  # ① 端口上到底有没有人听、是谁
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    "http://127.0.0.1:3080/?token=$(cat ~/.local/state/dsh-remote/current-token.txt)"
+  #   → 303/200 = 这个 token 现在真的能用；401 = 死 token（文件/那行输出已经作废）
+  ```
+  **反例（本轮实测，一次）**：把 3186 端口先占住，再跑
+  `npx @deepseek-ai/dsh web --port 3186` → 它报
+  `startup failed: … Error: listen EADDRINUSE: address already in use 127.0.0.1:3186`，
+  **没有**打印 token（所以"绑不上端口也会先打印一个 token"这个说法**本轮没有复现**；
+  只验到"输出的那行不等于它活着"这条一般规律）。要下"npx 会/不会先打印"的结论，
+  得换个起法再测几次。
+- **修法 / 纪律**：任何"告诉你地址"的输出后面都要能接一条**实测**（本项目的做法：
+  `harness` 打印带 token 的地址前先 `curl` 一次；`force-restart-dsh-remote` 的 token 那一步
+  也是真打一次再看 401/303）。**别把"抓到一行 URL"写成能力**（同 H3 的纪律）。
+- **验证程度**：现象是用户 2026-10-09 的实测（拿到的 token 本地 401）；
+  `401` 那条判据本轮在真机上复现过（H29 现场：43 字节的 `current-token.txt` → 401）。
+  "npx 绑不上端口会不会先打印 token"**没有复现**，按上面反例里写的那样标注。

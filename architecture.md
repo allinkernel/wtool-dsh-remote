@@ -72,7 +72,7 @@
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 58 | 隧道配置样板（含 `web_proxy=`：常驻服务里 npx 的代理开关，默认清空） |
 | `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 1932 | **556 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `tests/run_tests.sh` | 2321 | **675 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
 | `tests/fake_dsh_web.py` | 194 | 测试零件：假 `dsh web`（按 cookie 的值造 200/401/303/500/慢响应；只给 K 节用，见 §10） |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
@@ -129,7 +129,7 @@ harness 分不清请求来自本地还是远程 —— 所以 basic auth 的密�
 
 ---
 
-## 3. `bin/dsh-remote`：26 个子命令的真实行为
+## 3. `bin/dsh-remote`：27 个子命令的真实行为
 
 `SELF` 先 `readlink -f` 解软链，`PROJ_DIR` = 解出来的脚本的上一级
 （踩过：不解软链会把项目目录算成 `~/.local`，`hooks/` 就找不到了）。
@@ -165,6 +165,8 @@ NOTIFY      = ${DSH_NOTIFY_BIN:-$(command -v dsh-notify || $SELF_DIR/dsh-notify)
 | `token-broker` | **前台**跑 broker（`--port` / `--web-port` / `--token-file` / `--probe-timeout` 可覆盖）；常驻用 `broker-install`。它自己 `exec python3 bin/dsh-token-broker` | 循环 / 1 |
 | `broker-install` | 渲染并装 `~/.config/systemd/user/dsh-token-broker.service`（`ExecStart=<python3> <PROJ_DIR>/bin/dsh-token-broker --port <broker_local_port> --web-port <local_port> --token-file <token_file>`；`Restart=always` / `RestartSec=3` / `StartLimitIntervalSec=0` / journald）→ `daemon-reload` → `enable --now` → 停 2 秒打印判据（含 `curl http://127.0.0.1:<port>/` 的 302/503 判读）。`--no-enable` / `--dry-run` | 0 / 1 |
 | `broker-uninstall` | `disable --now` + 删单元 + `daemon-reload`；token 文件留着（`harness` 函数还在写） | 0 |
+| `force-restart-dsh-remote` | **一键兜底**（2026-10-09 加；ADR-0022）。**默认安全档**：① `systemctl --user reset-failed dsh-tunnel.service` + 重启 `dsh-tunnel` / `dsh-token-broker`；② 云上**只读**复验 `ss -ltn \| grep -cE '127.0.0.1:(18080\|18081)'` 必须 = 2（不够就点名"可能是云上僵尸会话占着、要用户同意才能杀"）；③ 本地 `local_port` 是谁在听（`dsh-web.service` 托管 = MainPID 命中或 cgroup 里带单元名；否则报"手工实例 PID x"）；④ 拿 `current-token.txt` 真打一次本地 dsh web（401 = 过期，并指向 `--restart-web`）；⑤ 公网固定地址不带密码/带密码/跟随跳转三连（401/302/200 的含义都写进输出）；⑥ 结论 + 下一步。每步两行：`[n/6] 标题 ✓/✗/! 明细` + `判据 <可复现命令>`；有 `fail` 步退出码 1。`--json` 改成一行一条 JSON（`head`/`step`/`summary`，broker 的 `/reset` 页面渲染它）。`bin/dsh-force-restart-dsh-remote` 是它的薄封装（照 `dsh-remote-server`：解软链 + `exec … dsh-remote force-restart-dsh-remote "$@"`）。**安全档绝不碰 `dsh web`** | 0 / 1 |
+| `force-restart-dsh-remote --restart-web --yes` | 上面那条的**例外**（ADR-0022，用户 2026-10-09 批准）：大字警告（走 stderr，`--json` 的 stdout 保持纯 JSON）→ 非交互必须有 `--yes`（否则 `die`）→ `ss -ltnp` 找出占着 `local_port` 的**那一个** PID（cmdline 里没有 `dsh` 就**不杀**并说明它是什么）→ **只对它** `kill -TERM`（不用 `-9`、不 `pkill`）→ 用 `systemctl --user start dsh-web.service` 起回来（`SubState=auto-restart` 时改用 `restart`，否则 30 秒的重试计时器还挂着）→ 最多 30s 轮询 `current-token.txt`/`web-url.txt` 出现新值 → 报**新 token 的存在性（不打印值）** → 复验本地 200 + 公网 200。`DSH_REMOTE_FROM_BROKER=1`（云上 `/reset` 那条）时直接 `die` | 0 / 1 |
 | `cloud-setup` | **只打印**要人在云上敲的 scp / ssh 命令（值从 `remote.conf` 取，缺的用 `<你的阿里云公网 IP>` / `root` / `18080` / `3080` 占位），末尾提醒安全组只开 22 + 443/8443，**绝不要开 18080 和 3080** | 0 |
 | `cloud-install` | 见 §4（这是唯一会碰云上那台机器的子命令） | 0 / 1 |
 | `migrate` | 把旧版放在 `$DSH_HOME` 下的 `remote.conf` / `notify.conf` / `hooks.json` 搬到 `$CONF_DIR`，`notify.log` / `web.log` / `web-url.txt` 搬到 `$STATE_DIR`（目标已存在就不覆盖），顺手删掉 `$DSH_HOME/*.example`；搬了东西就提醒重跑 `notify-enable` 更新 patch 里的路径 | 0 |
@@ -332,6 +334,24 @@ hazards H22），所以"家里重启一次 harness，手机上的地址就作废
   别的路径 404 / 方法 405。**只代理这一条 `GET /`**（探测超时 3s、代发 30s、
   响应体上限 8MB）；`--probe-timeout` 可调（默认 3，K 节用它把"超时 → 503"跑快）。
   cookie 只认形状对得上的（`dsh-auth-` + base64url），别人家的 cookie 当"没有 cookie"。
+- **`/reset`（手机上的"重置按钮"，2026-10-09 加；ADR-0023）**：Caddy 第四条路由
+  `@reset path /reset` → 同一条隧道转给 broker（`{{BROKER_PORT}}`），**排在兜底
+  `reverse_proxy 127.0.0.1:{{TUNNEL_PORT}}` 之前**、且在站点块里（所以**在 `basic_auth` 之后**，
+  没有新增鉴权方式）。broker 那边：
+  `GET /reset` 返回一个极简确认页（中文、无外部资源：说明"会重置隧道/broker、
+  **不会**打断当前会话"、给一次性 nonce 表单、下面渲染"最近一次的结果"）；
+  `POST /reset` 校验 nonce（`secrets.token_urlsafe(18)`，10 分钟过期、用一次即废 ——
+  挡"带着浏览器缓存 basic auth 凭据的跨站表单"）→ 起一次**安全档**的
+  `force-restart-dsh-remote --json`（**不重写逻辑**）→ 立刻回 `202` + "已开始（隧道会断几秒）"。
+  **为什么是异步的**：安全档第一步就重启隧道，而这条请求正走在隧道上 —— 同步做的话响应
+  永远发不出去（2026-10-09 实测：POST 回 202 只用 **0.126s**，隧道随后才断）。
+  run 是 detached 子进程（`start_new_session=True`，`sleep DSH_REMOTE_RESET_DELAY`（默认 2s）
+  之后才 `exec`），stdout 写 `$STATE_DIR/reset-last.jsonl`、stderr 写 `reset-last.err`、
+  pid 写 `reset-run.pid`（"还在跑"看 pid + 有没有 `summary` 两样）。
+  从 `/reset` 起的那次带 `DSH_REMOTE_FROM_BROKER=1`：**不许** `--restart-web`，
+  而且**跳过重启 broker 自己**（run 是它的子进程、同一个 cgroup；何况能答 `/reset`
+  说明它活着）。`/reset` 只认回环来源；页面里**不回显任何 token / 密码**；
+  响应一律 `Cache-Control: no-store`。
 - **Caddy 只按 token 排，不按 cookie 排**（`path /` + `not query token=*`）：
   少了 `not query token=*` 带 token 的请求会被反复 302；而
   **不能再加 `not header Cookie *dsh-auth-*`** —— Caddy 只看"有没有这个头"、不验签，
@@ -436,8 +456,19 @@ RestartSec=30          # 端口被手起的会话占着时，不必每 3 秒去�
 | 顺序 | 条件 | 行为 |
 |---|---|---|
 | ① | `local_port` 已有人听（`ss -ltn`，没有 `ss` 用 `curl`） | **复用**，绝不起第二个。再分：端口上那个 PID 是不是单元的 `MainPID`（或 `/proc/<pid>/cgroup` 里有 `dsh-web.service`）—— 是 → "托管 ✓"；不是且单元在 `activating/failed` → 打 **`没起来 ✗ 原因：<端口> 被另一个实例占着（PID …，不是 systemd 管的）`** + 接管办法 + `systemd: activating/auto-restart（已重试 N 次，每 30s 一次）`；不是且单元 `inactive/没装` → 就是普通"已在跑 ✓（非 systemd）" |
-| ② | 没人在听，但 `dsh-web.service` 装了 | 先打一行 **`等 systemd 写出地址（最多 20s）…`**，`start --no-block`，然后逐秒等 —— 成功判据是 `web-url.txt` **这次刚写的**（比起点标记新，**或**内容变了；只比 mtime 会假阴性，见下）**且**端口真在听。等到 → 结论行；等不到 → 按实测原因三选一：端口被别人占了 / 单元 `failed`（附 exit code + `journalctl -o cat -n 1` 的**最后一行原文**）/ 还在 `activating` 或 `inactive`（附 `systemd=<状态>` + 判据命令 `ss -ltn \| grep :<端口> ; systemctl --user is-active dsh-web.service`） |
+| ② | 没人在听，但 `dsh-web.service` 装了 | 先打一行 **`等 systemd 写出地址（最多 20s）…`**，`start --no-block`，然后逐秒等 —— 成功判据是 `web-url.txt` **这次刚写的**（比起点标记新，**或**内容变了；只比 mtime 会假阴性，见下）**且**端口真在听。等不到 → **先看端口有没有人听**（`_hr_port_taken`：`ss -ltnp \| grep -E '[:.]<端口> '` 有输出，或退回 `curl` 敲门），有人听 → 一档；没人听 → 按 `is-active` 分三档（见下表，每档都带能原地复现的判据命令） |
 | ③ | 上面都不成立（没装单元），或 `DSH_REMOTE_HARNESS_NO_REUSE=1` | 退回**原来**的前台行为（`npx dsh web` + 抓 token + 退出时清 token），先打一行说明走的哪条路 |
+
+**②等不到地址时的四档**（2026-10-09 用户要求"原因要确定，别写'可能是这个可能是那个'"）：
+
+| 档 | 判据（先端口，后 systemd） | 打出来的话 |
+|---|---|---|
+| 端口被别人占着 | `ss -ltnp \| grep -E '[:.]<lp> '` 有输出，且那个 PID 既不是 `MainPID`、cgroup 里也没有 `dsh-web.service` | `没起来 ✗ 原因：<lp> 被别人占着（PID x，不是 systemd 管的）—— 服务只能等它让位` + `现在能用的还是那个实例：http://127.0.0.1:<lp>/`（token 拿真请求验过才打带 token 的地址）+ `→ 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的` + 判据 `ss -ltnp \| grep -E '[:.]<lp> '` + `systemd: <状态>` |
+| 服务失败 | 没人听 + `is-active=failed` | `没起来 ✗ 原因：dsh-web.service 失败（exit N），端口 <lp> 上没人听 —— 日志最后一行：<journalctl -o cat 最后一行原文>` + 判据（`show -p ExecMainStatus -p NRestarts` / `journalctl … -n 1 -o cat`） |
+| 服务还在起 | 没人听 + `is-active=activating`（或 `active`） | `没起来 ✗ 原因：dsh-web.service 还在起（activating/auto-restart（已重试 N 次，每 30s 一次）），端口 <lp> 上没人听 —— 日志最后一行：…` + 判据（`show -p NRestarts -p RestartUSec` / `journalctl … -n 1 -o cat`） |
+| 服务没在跑 | 没人听 + 其它状态（`inactive`/空/`unknown`） | `没起来 ✗ 原因：dsh-web.service 没在跑（is-active=inactive：没装 / 没 enable / 自己退了），端口 <lp> 上也没人听` + `日志最后一行：…` + 判据（`is-active` / `ss -ltn \| grep -E '[:.]<lp> '` / `journalctl … -n 1 -o cat`）+ `→ 起它：systemctl --user start dsh-web.service` |
+
+（四档都会补一行 `（web-url.txt 还是上一次的，没被重写）` —— 不许拿旧文件冒充"刚起来"。）
 
 - **PID 来自 `ss -ltnp`**；拿不到就写 `PID 拿不到（ss -ltnp 看不到）`，不编一个。
 - **token 只打"验过的"**：复用别人（非 systemd）那个实例时，本地 token 文件可能是旧的
@@ -794,7 +825,7 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-09 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **556 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / **J 100** / **K 55** / **L 17** / M 46 / **N 22** / **O 108**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节：harness 函数两个 shell 各抓一次 token / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + harness 四态输出契约 + 代理（O 节，108 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；`dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）** |
+| `tests/run_tests.sh` | **675 通过 0 失败**（A 10 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 55 / **J 100** / **K 55** / **L 17** / M 46 / **N 22** / **O 142** / **P 85**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节：harness 函数两个 shell 各抓一次 token / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + harness 四态输出契约 + 代理（O 节，142 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；四态之外还有"等超时"的四档（端口被别人占 / 服务失败 exit N / 还在起第 N 次重试 / 服务没在跑），每档都断言"原因 + 判据命令"、且不许再出现含糊话；`dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）**、**一键强制重置 + 手机 `/reset`（P 节，85 条：`--help` 与薄封装等价、安全档在"隧道健康/不健康""token 有效/过期""端口有人听/没人听"几种桩状态下输出的关键行、`--restart-web` 无 `--yes` 拒绝 + `--yes` 只 SIGTERM 那一个真 PID、cmdline 不含 dsh 时拒绝杀、`DSH_REMOTE_FROM_BROKER=1` 下不重启 broker 也拒绝 `--restart-web`、`--json` 每行合法、broker 真进程的 `GET/POST /reset`（nonce 一次性、重放 403、结果页渲染、两处都无 token/密码泄漏）、两份 Caddyfile 的 `@reset` 位置）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
@@ -899,6 +930,8 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `DSH_REMOTE_TOKEN_FILE` | dsh-remote、broker | token 文件路径，默认 `$STATE_DIR/current-token.txt` |
 | `DSH_REMOTE_PYTHON` | dsh-remote | 写进 broker 单元的 python3 绝对路径（默认 `command -v python3`） |
 | `DSH_REMOTE_BROKER_PORT` | dsh-token-broker | broker 监听端口（默认 3081；一般由 `broker-install` 用 `--port` 传） |
+| `DSH_REMOTE_FROM_BROKER` | dsh-remote（`force-restart-dsh-remote`） | 由 broker 的 `/reset` 起子进程时置 1：**不许** `--restart-web`、**跳过**重启 broker 自己（它就是发起者） |
+| `DSH_REMOTE_RESET_DELAY` | dsh-token-broker | `/reset` 起的那次 run 先睡几秒再动隧道（默认 2 —— 让 POST 的 202 先发出去） |
 | `DSH_REMOTE_IFACE` | dsh-remote（`passwd` 的验证那步） | 给 `curl` 绑网卡（本机绕开 Clash 用 `eth1`，见 hazards H11） |
 | `relay_dir` / `RELAY_DIR`（conf 键） | dsh-remote passwd | 云上中继目录，默认 `/home/mindul/dsh-relay` |
 
@@ -926,6 +959,9 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `$WTOOL_PREFIX/var/dsh-remote/.harness-wrote-token` | `harness` 的"这份是我写的"标记（内容 = 那一刻的 token；退出时 `cmp` 相等才删 token 文件） |
 | `$WTOOL_PREFIX/var/dsh-remote/.harness-wait-start` | `harness` 等 systemd 写地址的**起点标记**（只有比它新的 `web-url.txt` 才算"刚写的"；用完即删） |
 | `$WTOOL_PREFIX/var/dsh-remote/dsh-web-run.log` | `dsh-web-run` 自己的日志（服务那边主要看 journald；含"代理: …"那一行） |
+| `$WTOOL_PREFIX/var/dsh-remote/reset-last.jsonl` | **手机 `/reset` 那次的输出**（一行一条 JSON：`head`/`step`/`summary`；broker 的页面渲染它。不是第二套状态 —— token 仍然只有 `current-token.txt` 一份） |
+| `$WTOOL_PREFIX/var/dsh-remote/reset-last.err` | 同一次的 stderr（正常是空的） |
+| `$WTOOL_PREFIX/var/dsh-remote/reset-run.pid` | 同一次的 pid + 起始时间（判"还在跑"；另一个判据是 jsonl 里有没有 `summary` —— 跑完的子进程可能还是僵尸） |
 | `$WTOOL_PREFIX/var/dsh-remote/phone-qr.png` / `.svg` | `server` 打出来的二维码图片（没装 `qrencode` 时用 `dsh-qr` 生成） |
 | `~/.dsh/profiles/web/cordis.patch.yml` | **唯一**必须待在 `~/.dsh` 的东西（profile patch 只能放那儿），由 `notify-enable` 写 |
 

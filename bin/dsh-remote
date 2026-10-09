@@ -14,6 +14,12 @@
 #   dsh-remote serve-uninstall 撤掉 web 常驻服务（不动正在跑的会话）
 #   dsh-remote broker-install  把 token broker 装成 systemd --user 常驻（手机固定地址靠它）
 #   dsh-remote broker-uninstall 撤掉它
+#   dsh-remote force-restart-dsh-remote
+#                              **一键兜底**：reset-failed + 重启隧道/broker，再复验云上两个
+#                              隧道口 / 本地 dsh web / token 新鲜度 / 公网入口（安全档，
+#                              **绝不碰 dsh web**）。`--restart-web --yes` 是用户批准的例外：
+#                              只 SIGTERM 占着 local_port 的那**一个** PID，再用 dsh-web.service
+#                              起回来（打断会话；只为了拿新 token）。手机上的按钮是云上 /reset
 #   dsh-remote systemd         旧名字：只生成单元、不 enable（= tunnel-install --no-enable）
 #   dsh-remote url             打印手机该收藏的地址
 #   dsh-remote notify-test     推一条测试消息到手机
@@ -1217,6 +1223,597 @@ cmd_broker_uninstall() {
     say "token 文件 $(token_file) 留着（harness 函数还在写它）"
 }
 
+# ---------------------------------------- 一键强制重置（force-restart-dsh-remote）
+# 2026-10-09 用户批准的用户可见命令（"要有强制重置按钮"）。它兜的是当天实测的三类故障：
+#   ① 云上僵尸会话占着 18080/18081 → 家里隧道连续失败 10 次被 StartLimitBurst 停下，
+#      **不会自动恢复**（要 reset-failed + 重启；H27 的加固是有意"停下别再锤"）；
+#   ② `dsh web` 是**手工**起的 → token 只在它内存里、状态文件过期 → 手机固定地址 401
+#      （H22）：不重启 dsh web 拿不到新 token；
+#   ③ 手工实例占着 3080 时 `dsh-web.service` 一直 activating（反复重试那次）。
+#
+# **默认是安全档：绝不碰 `dsh web`**（ADR-005）。它按顺序做：
+#   1) reset-failed + 重启 dsh-tunnel / dsh-token-broker
+#   2) 云上**只读**复验：127.0.0.1:18080 与 18081 两个口必须都绑上（2/2）
+#   3) 本地 3080 是谁在听（dsh-web.service 托管 还是 手工 PID）
+#   4) 拿状态文件里的 token 真打一次本地 dsh web：401 = 过期
+#   5) 公网固定地址：401（Caddy 挡）/ 302（broker 补 token）/ 200（全链路通）
+#   6) 3–5 行结论 + 下一步
+#
+# `--restart-web --yes` 是用户 2026-10-09 明确批准的**例外**（ADR-0022）：只对
+# `ss -ltnp` 里占着 `local_port` 的**那一个** PID 发 SIGTERM（**不是** `pkill -f dsh`），
+# 然后**用服务**（`dsh-web.service`）把它起回来 —— 这样 `dsh-web-run` 才会把新 token
+# 抓进状态文件（这才是修 stale token 的正路）。它会打断正在跑的会话，所以非交互环境下
+# 必须显式 `--yes`。**云上 /reset 永远不会走这条**（会把自己踢掉）。
+#
+# 输出契约（2026-10-09 用户要求"状态 + 原因 + 判据命令，别啰嗦"）：每步两行 ——
+# `[n/N] 标题 ✓/✗/! 实测出来的状态与原因` + `      判据 <可复现命令>`，结尾是结论。
+# `--json`（broker 的 /reset 页面用）改成一行一条 JSON，**不重写第二套逻辑**。
+FR_TOTAL=6
+FR_N=0
+FR_JSON=0
+FR_BAD=0 # fail 的步数（退出码用它）
+FR_TUN=
+FR_BROKER=
+FR_CLOUD=
+FR_WEB=
+FR_TOKEN=
+FR_PUB=
+FR_TUN_TXT=
+FR_BROKER_TXT=
+FR_CLOUD_TXT=
+FR_WEB_WHO=
+FR_TOKEN_TXT=
+FR_PUB_TXT=
+FR_FROM_BROKER=0
+case ${DSH_REMOTE_FROM_BROKER:-0} in 1 | yes | true | on) FR_FROM_BROKER=1 ;; esac
+
+fr_esc() { # 一段文本 → 能塞进 JSON 字符串（转义反斜杠/引号，换行折成空格）
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' ' | tr -d '\r' | sed -e 's/[[:space:]]*$//'
+}
+
+fr_mark() { # ok/fail/warn → ✓/✗/!
+    case $1 in
+    ok) printf '✓' ;;
+    fail) printf '✗' ;;
+    *) printf '!' ;;
+    esac
+}
+
+fr_head() { # fr_head <模式>：开头一行（JSON 模式是头部那条）
+    if [ "$FR_JSON" = 1 ]; then
+        printf '{"kind":"head","tool":"force-restart-dsh-remote","version":1,"mode":"%s","total":%s,"host":"%s","at":"%s","from_broker":%s}\n' \
+            "$(fr_esc "$1")" "$FR_TOTAL" "$(fr_esc "$(hostname 2>/dev/null || printf '?')")" \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$FR_FROM_BROKER"
+        return 0
+    fi
+    say "force-restart-dsh-remote：$1"
+    say "  reset-failed + 重启隧道/broker → 云上只读复验 → 本地 dsh web / token / 公网 → 结论"
+}
+
+fr_step() { # fr_step <键> <ok|fail|warn> <标题> <明细> <判据命令>
+    FR_N=$((FR_N + 1))
+    [ "$2" = fail ] && FR_BAD=$((FR_BAD + 1))
+    if [ "$FR_JSON" = 1 ]; then
+        printf '{"kind":"step","n":%s,"total":%s,"step":"%s","state":"%s","title":"%s","detail":"%s","evidence":"%s"}\n' \
+            "$FR_N" "$FR_TOTAL" "$(fr_esc "$1")" "$2" "$(fr_esc "$3")" "$(fr_esc "$4")" "$(fr_esc "$5")"
+        return 0
+    fi
+    printf '[%s/%s] %s %s %s\n' "$FR_N" "$FR_TOTAL" "$3" "$(fr_mark "$2")" "$4"
+    [ -n "$5" ] && printf '      判据 %s\n' "$5"
+    return 0
+}
+
+fr_summary() { # fr_summary <ok|fail|warn> <多行状态> <下一步>
+    if [ "$FR_JSON" = 1 ]; then
+        printf '{"kind":"summary","state":"%s","detail":"%s","next":"%s"}\n' \
+            "$1" "$(fr_esc "$2")" "$(fr_esc "$3")"
+        return 0
+    fi
+    printf '\n结论 %s\n' "$(fr_mark "$1")"
+    printf '%s\n' "$2" | sed 's/^/  /'
+    [ -n "$3" ] && printf '  下一步 %s\n' "$3"
+    return 0
+}
+
+fr_port_pid() { # 听 <端口> 的那个 PID（拿不到就打印空 —— 那时只说"被占"，不编一个 PID）
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -ltnp 2>/dev/null | grep -E "[:.]$1[[:space:]]" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+fr_pid_in_unit() { # 这个 PID 跑在这个单元里吗（看 cgroup：listener 常是 MainPID 的子进程，别只比 MainPID）
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+    grep -qF -- "$2" "/proc/$1/cgroup" 2>/dev/null
+}
+
+fr_svc_note() { # 单元的实测状态拼一句人话（activating 才提重试次数）
+    _fr_s=${1:-}
+    _fr_sub=${2:-}
+    _fr_n=${3:-}
+    [ -n "$_fr_s" ] || _fr_s=未知
+    [ -n "$_fr_sub" ] && [ "$_fr_sub" != "$_fr_s" ] && _fr_s="$_fr_s/$_fr_sub"
+    case $_fr_s in
+    activating*) [ -n "$_fr_n" ] && _fr_s="$_fr_s（已重试 $_fr_n 次）" ;;
+    esac
+    printf '%s' "$_fr_s"
+}
+
+# ---- 第 1 步：reset-failed + 重启隧道（+ broker）--------------------------------
+fr_step_units() {
+    if ! systemd_user_ok; then
+        FR_TUN=fail
+        FR_BROKER=fail
+        FR_TUN_TXT="systemctl --user 连不上用户管理器"
+        FR_BROKER_TXT="同上"
+        fr_step tunnel-broker fail "隧道+broker" \
+            "systemctl --user 连不上用户管理器（systemd --user 没在跑）—— 什么都没动" \
+            "systemctl --user show-environment；loginctl enable-linger $(id -un)"
+        return 0
+    fi
+    # ① 隧道：**reset-failed 是必须的** —— 连续失败 10 次后单元停在 failed，
+    #    StartLimitBurst 会把后面的 restart 一起挡掉（H27 的加固就是"停下、别再锤"）。
+    systemctl_user reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl_user restart "$UNIT_NAME" >/dev/null 2>&1
+    _fr_rc=$?
+    sleep 1
+    _fr_ts=$(systemctl_user is-active "$UNIT_NAME" 2>/dev/null || true)
+    _fr_tp=$(systemctl_user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || printf '')
+    _fr_tn=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
+    if [ ! -f "$(unit_file)" ]; then
+        FR_TUN=fail
+        FR_TUN_TXT="单元没装"
+        _fr_tt="单元 $(unit_file) 不在（先 dsh-remote tunnel-install）"
+    elif [ "$_fr_ts" = active ] && [ -n "$_fr_tp" ] && [ "$_fr_tp" != 0 ]; then
+        FR_TUN=ok
+        FR_TUN_TXT="is-active=active MainPID=${_fr_tp} NRestarts=${_fr_tn:-?}"
+        _fr_tt="reset-failed + restart 完成：is-active=active MainPID=${_fr_tp} NRestarts=${_fr_tn:-?}"
+    else
+        FR_TUN=fail
+        FR_TUN_TXT="is-active=${_fr_ts:-?} MainPID=${_fr_tp:-0} NRestarts=${_fr_tn:-?}"
+        _fr_tt="restart 之后没有活着的进程（rc=$_fr_rc is-active=${_fr_ts:-?} MainPID=${_fr_tp:-0} NRestarts=${_fr_tn:-?}）"
+    fi
+    # ② broker。**从 /reset 触发时跳过**：这次运行就是 broker 发起的，重启它 = 杀掉
+    #    正在写这份报告的进程；而且它刚还能答 /reset，说明它是活的。
+    if [ "$FR_FROM_BROKER" = 1 ]; then
+        FR_BROKER=ok
+        FR_BROKER_TXT="跳过重启（这次运行就是它发起的；能答 /reset 说明它活着）"
+        _fr_bt="$FR_BROKER_TXT"
+    elif [ ! -f "$(broker_unit_file)" ]; then
+        FR_BROKER=fail
+        FR_BROKER_TXT="单元没装"
+        _fr_bt="单元 $(broker_unit_file) 不在（先 dsh-remote broker-install）"
+    else
+        systemctl_user reset-failed "$BROKER_UNIT_NAME" >/dev/null 2>&1 || true
+        systemctl_user restart "$BROKER_UNIT_NAME" >/dev/null 2>&1
+        sleep 1
+        _fr_bs=$(systemctl_user is-active "$BROKER_UNIT_NAME" 2>/dev/null || true)
+        [ -n "$_fr_bs" ] || _fr_bs=未知
+        if [ "$_fr_bs" = active ]; then
+            FR_BROKER=ok
+            FR_BROKER_TXT="is-active=active"
+            _fr_bt="dsh-token-broker.service is-active=active"
+        else
+            FR_BROKER=fail
+            FR_BROKER_TXT="is-active=$_fr_bs"
+            _fr_bt="dsh-token-broker.service is-active=$_fr_bs（看 journalctl --user -u $BROKER_UNIT_NAME -n 20）"
+        fi
+    fi
+    _fr_st=ok
+    { [ "$FR_TUN" = ok ] && [ "$FR_BROKER" = ok ]; } || _fr_st=fail
+    fr_step tunnel-broker "$_fr_st" "隧道+broker" \
+        "$_fr_tt；broker $_fr_bt" \
+        "systemctl --user show -p NRestarts -p MainPID dsh-tunnel.service"
+    return 0
+}
+
+# ---- 第 2 步（只有 --restart-web 才有）：只 SIGTERM 占着端口的那个 PID，再用服务起回来 ----
+fr_restart_web() {
+    tunnel_conf
+    _fr_lp=$local_port_v
+    _fr_tf=$(token_file)
+    _fr_uf=$STATE_DIR/web-url.txt
+    _fr_pid=$(fr_port_pid "$_fr_lp")
+    if [ -z "$_fr_pid" ]; then
+        fr_step web-kill warn "重启 dsh web" \
+            "127.0.0.1:${_fr_lp} 上没人听，不用杀谁" \
+            "ss -ltnp | grep -E '[:.]${_fr_lp} '"
+    else
+        _fr_cl=$(tr '\0' ' ' <"/proc/$_fr_pid/cmdline" 2>/dev/null || printf '')
+        case $_fr_cl in
+        *dsh*) ;;
+        *)
+            fr_step web-kill fail "重启 dsh web" \
+                "占着 127.0.0.1:${_fr_lp} 的 PID $_fr_pid 命令行里没有 dsh（$(printf '%s' "$_fr_cl" | cut -c1-100)）—— **不杀**，那可能不是 dsh web" \
+                "ss -ltnp | grep -E '[:.]${_fr_lp} '；tr '\\0' ' ' </proc/$_fr_pid/cmdline"
+            return 1
+            ;;
+        esac
+        kill -TERM "$_fr_pid" 2>/dev/null || true
+        _fr_i=0
+        while [ "$_fr_i" -lt 10 ]; do
+            port_listening "$_fr_lp" || break
+            sleep 1
+            _fr_i=$((_fr_i + 1))
+        done
+        if port_listening "$_fr_lp"; then
+            fr_step web-kill fail "重启 dsh web" \
+                "SIGTERM 之后 ${_fr_i}s 还在听（PID $_fr_pid 不响应 TERM）。**没有用 -9**（用户要求只 SIGTERM）—— 自己看这个 PID，或再跑一次这条命令" \
+                "ss -ltnp | grep -E '[:.]${_fr_lp} '；journalctl --user -u $SERVE_UNIT_NAME -n 20"
+            return 1
+        fi
+        fr_step web-kill ok "重启 dsh web" \
+            "只 SIGTERM 了占着 127.0.0.1:${_fr_lp} 的那一个 PID $_fr_pid（${_fr_i}s 后端口空出来）；没动别的进程" \
+            "ss -ltnp | grep -E '[:.]${_fr_lp} '"
+    fi
+    # 用**服务**起回来：dsh-web-run 才会把新 token 抓进状态文件。
+    # 服务停在 activating/auto-restart 时 `start` 是空操作（30 秒的计时器还挂着），
+    # 这时要 restart 才会立刻起 —— 打印出来，别让人以为它卡住了。
+    # 基线（旧 token / 旧 web-url.txt 的时间戳）要在**起服务之前**取：起完再取就
+    # 可能把刚写进去的新 token 当成"旧的"，然后白等 30 秒（沙箱里真踩到过）。
+    _fr_sub=$(systemctl_user show -p SubState --value "$SERVE_UNIT_NAME" 2>/dev/null || printf '')
+    _fr_old=$(cat "$_fr_tf" 2>/dev/null || printf '')
+    _fr_um_old=$(date -r "$_fr_uf" +%s 2>/dev/null || printf 0)
+    case $_fr_sub in
+    auto-restart)
+        systemctl_user restart "$SERVE_UNIT_NAME" >/dev/null 2>&1
+        _fr_via="restart（服务原本停在 activating/auto-restart，start 不会立刻起）"
+        ;;
+    *)
+        systemctl_user start "$SERVE_UNIT_NAME" >/dev/null 2>&1
+        _fr_via="start"
+        ;;
+    esac
+    _fr_get=0
+    _fr_new=
+    _fr_i=0
+    while [ "$_fr_i" -lt 30 ]; do
+        sleep 1
+        _fr_i=$((_fr_i + 1))
+        _fr_new=$(cat "$_fr_tf" 2>/dev/null || printf '')
+        _fr_um=$(date -r "$_fr_uf" +%s 2>/dev/null || printf 0)
+        if [ -n "$_fr_new" ] && { [ "$_fr_new" != "$_fr_old" ] || [ "$_fr_um" != "$_fr_um_old" ]; }; then
+            _fr_get=1
+            break
+        fi
+    done
+    if [ "$_fr_get" = 1 ]; then
+        _fr_sz=$(wc -c <"$_fr_tf" | tr -d ' ')
+        _fr_mt=$(date -r "$_fr_tf" '+%H:%M:%S' 2>/dev/null || printf '?')
+        FR_TOKEN_NEW=1
+        fr_step web-start ok "重启 dsh web" \
+            "systemctl --user $_fr_via $SERVE_UNIT_NAME；${_fr_i}s 后新 token 已落地（$_fr_tf，$_fr_sz 字节，$_fr_mt；**值不打印**）" \
+            "systemctl --user is-active $SERVE_UNIT_NAME；ls -l '$_fr_tf'"
+    else
+        FR_TOKEN_NEW=0
+        fr_step web-start fail "重启 dsh web" \
+            "systemctl --user $_fr_via $SERVE_UNIT_NAME；${_fr_i}s 内没等到新 token（web-url.txt 也没更新）" \
+            "journalctl --user -u $SERVE_UNIT_NAME -n 20；dsh-remote serve-status"
+        return 1
+    fi
+    return 0
+}
+
+# ---- 第 3 步：云上只读复验两个隧道口 --------------------------------------------
+fr_step_cloud() {
+    if ! conf_any cloud_host CLOUD_HOST >/dev/null 2>&1; then
+        FR_CLOUD=warn
+        FR_CLOUD_TXT="remote.conf 里没写 cloud_host"
+        fr_step cloud warn "云上隧道口" "remote.conf 里没写 cloud_host，跳过（隧道那头验不了）" \
+            "照 remote.conf.example 写 cloud_host"
+        return 0
+    fi
+    tunnel_conf
+    _fr_rp=$remote_port_v
+    _fr_brp=$broker_remote_port
+    _fr_q="127\\.0\\.0\\.1:(${_fr_rp}|${_fr_brp})"
+    _fr_ev="ssh ${ssh_user}@${host} 'ss -ltn | grep -cE \"127.0.0.1:(${_fr_rp}|${_fr_brp})\"'   # 必须回 2"
+    _fr_i=1
+    _fr_cnt=
+    _fr_err=
+    while [ "$_fr_i" -le 4 ]; do
+        _fr_out=$(cloud_ssh "ss -ltn | grep -cE '$_fr_q'" 2>&1)
+        case $_fr_out in
+        '' | *[!0-9]*)
+            _fr_cnt=
+            _fr_err=$(printf '%s' "$_fr_out" | head -n 1 | cut -c1-120)
+            ;;
+        *)
+            _fr_cnt=$_fr_out
+            _fr_err=
+            ;;
+        esac
+        [ "$_fr_cnt" = 2 ] && break
+        [ "$_fr_i" = 4 ] && break
+        sleep 2
+        _fr_i=$((_fr_i + 1))
+    done
+    if [ "$_fr_cnt" = 2 ]; then
+        FR_CLOUD=ok
+        FR_CLOUD_TXT="${_fr_rp}+${_fr_brp} 都在听（2/2）"
+        fr_step cloud ok "云上隧道口" \
+            "云上 127.0.0.1:${_fr_rp} 和 :${_fr_brp} 都绑上了（2/2，第 ${_fr_i} 次探测）" "$_fr_ev"
+    elif [ -z "$_fr_cnt" ]; then
+        FR_CLOUD=fail
+        FR_CLOUD_TXT="ssh 上不去"
+        fr_step cloud fail "云上隧道口" \
+            "ssh 上不去（${_fr_err:-没有输出}）—— 隧道和云上状态都没验成" \
+            "ssh ${ssh_user}@${host} true"
+    else
+        _fr_hold=$(cloud_ssh "ss -ltnp | grep -E '$_fr_q' | head -n 3" 2>&1 | head -n 1 | cut -c1-140)
+        FR_CLOUD=fail
+        FR_CLOUD_TXT="只绑上 ${_fr_cnt}/2"
+        fr_step cloud fail "云上隧道口" \
+            "只绑上 ${_fr_cnt}/2 —— **隧道没绑上**。可能是云上僵尸会话占着（旧 tmux / 别处的 ssh），**要用户同意才能杀**。谁占着：${_fr_hold:-拿不到（ss -ltnp 没权限？）}" \
+            "ssh ${ssh_user}@${host} 'ss -ltnp | grep -E \"127.0.0.1:(${_fr_rp}|${_fr_brp})\"'"
+    fi
+    return 0
+}
+
+# ---- 第 4 步：本地 3080 是谁在听 -------------------------------------------------
+fr_step_web() {
+    tunnel_conf
+    _fr_lp=$local_port_v
+    _fr_ev="ss -ltnp | grep -E '[:.]${_fr_lp} '；systemctl --user is-active $SERVE_UNIT_NAME；systemctl --user show -p MainPID --value $SERVE_UNIT_NAME"
+    _fr_st=$(systemctl_user is-active "$SERVE_UNIT_NAME" 2>/dev/null || true)
+    _fr_sub=$(systemctl_user show -p SubState --value "$SERVE_UNIT_NAME" 2>/dev/null || printf '')
+    _fr_nr=$(systemctl_user show -p NRestarts --value "$SERVE_UNIT_NAME" 2>/dev/null || printf '')
+    if [ -f "$(serve_unit_file)" ]; then
+        _fr_svc=$(fr_svc_note "$_fr_st" "$_fr_sub" "$_fr_nr")
+    else
+        _fr_svc="没装（dsh-remote serve-install）"
+    fi
+    if ! port_listening "$_fr_lp"; then
+        FR_WEB=fail
+        FR_WEB_WHO="127.0.0.1:${_fr_lp} 没人听（$SERVE_UNIT_NAME=$_fr_svc）"
+        fr_step web fail "本地 dsh web" \
+            "127.0.0.1:${_fr_lp} 没人听；$SERVE_UNIT_NAME=$_fr_svc —— 手机那条链路是断的" "$_fr_ev"
+        return 0
+    fi
+    _fr_pid=$(fr_port_pid "$_fr_lp")
+    _fr_main=$(systemctl_user show -p MainPID --value "$SERVE_UNIT_NAME" 2>/dev/null || printf '0')
+    # "在不在这个单元里"有两条判据：**MainPID 就是它**，或者它的 cgroup 里带单元名
+    # （服务真正的 listener 常常是 MainPID 的子进程：dsh-web-run → npx → node）。
+    if [ -n "$_fr_pid" ] && { { [ "$_fr_pid" = "${_fr_main:-0}" ] && [ "${_fr_main:-0}" != 0 ]; } || fr_pid_in_unit "$_fr_pid" "$SERVE_UNIT_NAME"; }; then
+        FR_WEB=ok
+        FR_WEB_WHO="服务托管（PID $_fr_pid，$SERVE_UNIT_NAME=$_fr_svc）"
+        fr_step web ok "本地 dsh web" \
+            "127.0.0.1:${_fr_lp} 在听，是 $SERVE_UNIT_NAME 托管的（PID $_fr_pid，$SERVE_UNIT_NAME=$_fr_svc）" "$_fr_ev"
+    elif [ -n "$_fr_pid" ]; then
+        FR_WEB=warn
+        FR_WEB_WHO="手工实例 PID $_fr_pid（非 systemd；$SERVE_UNIT_NAME=$_fr_svc）"
+        fr_step web warn "本地 dsh web" \
+            "127.0.0.1:${_fr_lp} 在听，但 PID $_fr_pid 既不是 $SERVE_UNIT_NAME 的 MainPID、cgroup 里也没有它 —— 是**手工起的**实例（$SERVE_UNIT_NAME=$_fr_svc）。手工实例的 token 只在它内存里（H22）" "$_fr_ev"
+    else
+        FR_WEB=warn
+        FR_WEB_WHO="有人在听但拿不到 PID（$SERVE_UNIT_NAME=$_fr_svc）"
+        fr_step web warn "本地 dsh web" \
+            "127.0.0.1:${_fr_lp} 有人在听，但拿不到 PID（ss -ltnp 没权限？）；$SERVE_UNIT_NAME=$_fr_svc" "$_fr_ev"
+    fi
+    return 0
+}
+
+# ---- 第 5 步：token 新鲜度（拿状态文件里的 token 真打一次）----------------------
+fr_step_token() {
+    tunnel_conf
+    _fr_lp=$local_port_v
+    _fr_tf=$(token_file)
+    _fr_ev="curl -s -o /dev/null -w '%{http_code}' \"http://127.0.0.1:${_fr_lp}/?token=<状态文件里的 token>\"   # 2xx/3xx=有效，401=过期"
+    if [ ! -s "$_fr_tf" ]; then
+        FR_TOKEN=fail
+        FR_TOKEN_TXT="状态文件里没有 token"
+        fr_step token fail "token 新鲜度" \
+            "状态文件里没有 token（$_fr_tf 不存在或为空）—— broker 会回 503" \
+            "ls -l '$_fr_tf'；dsh-remote serve-status"
+        return 0
+    fi
+    _fr_sz=$(wc -c <"$_fr_tf" | tr -d ' ')
+    _fr_mt=$(date -r "$_fr_tf" '+%m-%d %H:%M' 2>/dev/null || printf '?')
+    _fr_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${_fr_lp}/?token=$(cat "$_fr_tf")" 2>/dev/null || printf '000')
+    case $_fr_code in
+    2* | 3*)
+        _fr_jar=$(mktemp 2>/dev/null || printf '%s' "$STATE_DIR/.fr-cookie.$$")
+        _fr_final=$(curl -s -L -c "$_fr_jar" -b "$_fr_jar" -o /dev/null -w '%{http_code}' --max-time 10 \
+            "http://127.0.0.1:${_fr_lp}/?token=$(cat "$_fr_tf")" 2>/dev/null || printf '000')
+        rm -f -- "$_fr_jar"
+        if [ "$_fr_final" = 200 ]; then
+            FR_TOKEN=ok
+            FR_TOKEN_TXT="有效（首跳 $_fr_code → 跟随跳转 200）"
+            fr_step token ok "token 新鲜度" \
+                "token 有效（首跳 $_fr_code → 跟随跳转 $_fr_final，本地整条链路通；$_fr_sz 字节，$_fr_mt）" "$_fr_ev"
+        else
+            FR_TOKEN=warn
+            FR_TOKEN_TXT="首跳 $_fr_code，跟随跳转 $_fr_final"
+            fr_step token warn "token 新鲜度" \
+                "token 看起来有效（首跳 $_fr_code），但跟随跳转拿到 $_fr_final（看 dsh web 日志）" "$_fr_ev"
+        fi
+        ;;
+    401 | 403)
+        FR_TOKEN=fail
+        FR_TOKEN_TXT="**过期**（HTTP $_fr_code）"
+        fr_step token fail "token 新鲜度" \
+            "token **过期**（HTTP $_fr_code，$_fr_sz 字节，$_fr_mt）—— **不重启 dsh web 拿不到新的**（H22）：在机器上跑 force-restart-dsh-remote --restart-web --yes" \
+            "$_fr_ev"
+        ;;
+    000)
+        FR_TOKEN=fail
+        FR_TOKEN_TXT="本地 ${_fr_lp} 连不上（curl 000）"
+        fr_step token fail "token 新鲜度" \
+            "本地 127.0.0.1:${_fr_lp} 连不上（curl 000）—— dsh web 没在跑" "$_fr_ev"
+        ;;
+    *)
+        FR_TOKEN=warn
+        FR_TOKEN_TXT="HTTP $_fr_code 判不出来"
+        fr_step token warn "token 新鲜度" "本地 dsh web 回了 $_fr_code，判不出 token 有效没" "$_fr_ev"
+        ;;
+    esac
+    return 0
+}
+
+# ---- 第 6 步：公网固定地址 -------------------------------------------------------
+fr_step_public() {
+    _fr_pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
+    if [ -z "$_fr_pub" ]; then
+        FR_PUB=warn
+        FR_PUB_TXT="remote.conf 里没写 public_url"
+        fr_step public warn "公网入口" "remote.conf 里没写 public_url，跳过" "dsh-remote url"
+        return 0
+    fi
+    _fr_user=$(conf_any web_user WEB_USER 2>/dev/null || printf 'dsh')
+    _fr_c1=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 12 "$_fr_pub" 2>/dev/null || printf '000')
+    # 密码从云上 relay-password.txt 读（只进变量，**不打印、不落盘**）——没有就不做带密码那两条
+    _fr_pw=
+    if conf_any cloud_host CLOUD_HOST >/dev/null 2>&1; then
+        tunnel_conf
+        _fr_pw=$(cloud_ssh "sed -n 's/^PASSWORD=//p' '$(relay_dir_conf)/relay-password.txt' 2>/dev/null | tail -n 1" 2>/dev/null | tr -d '\r')
+    fi
+    _fr_ev="curl -sk -o /dev/null -w '%{http_code}' ${_fr_pub}   # 不带密码（想看到 401 = Caddy 的 basic auth 在挡）"
+    _fr_c2=
+    _fr_c3=
+    if [ -n "$_fr_pw" ]; then
+        _fr_c2=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 12 -u "${_fr_user}:${_fr_pw}" "$_fr_pub" 2>/dev/null || printf '000')
+        _fr_jar=$(mktemp 2>/dev/null || printf '%s' "$STATE_DIR/.fr-cookie.$$")
+        _fr_c3=$(curl -sk -L -c "$_fr_jar" -b "$_fr_jar" -u "${_fr_user}:${_fr_pw}" -o /dev/null -w '%{http_code}' \
+            --max-time 20 "$_fr_pub" 2>/dev/null || printf '000')
+        rm -f -- "$_fr_jar"
+        _fr_ev="$_fr_ev；带密码：curl -sk -u ${_fr_user}:<密码> -o /dev/null -w '%{http_code}' ${_fr_pub}（密码从云上 relay-password.txt 读，不打印）"
+    fi
+    # 状态码含义（用户 2026-10-09 要求写清）：401 = Caddy 的 basic auth 在挡；
+    # 302 = 过了密码之后 broker 把 / 补成 /?token=…（手机收藏的地址就是它）；
+    # 200 = 带着有效 cookie 一路走到底（Caddy→隧道→broker→dsh web）；
+    # 000 = 连不上（隧道断 / 容器没跑 / 安全组没开）。
+    case $_fr_c1 in
+    401) _fr_m1="不带密码 401（Caddy 的 basic auth 在挡 —— 正常）" ;;
+    000) _fr_m1="不带密码 000（连不上：隧道 / dsh-relay 容器 / 安全组）" ;;
+    *) _fr_m1="不带密码 $_fr_c1（**不是 401：basic auth 可能没生效，去看云上的 Caddyfile**）" ;;
+    esac
+    if [ -z "$_fr_pw" ]; then
+        FR_PUB=warn
+        FR_PUB_TXT="$_fr_c1（只验到 Caddy 那一层）"
+        fr_step public warn "公网入口" \
+            "$_fr_m1；**没拿到云上的密码，带密码那两条没做**（隧道那头没验）" "$_fr_ev"
+        return 0
+    fi
+    case $_fr_c2 in
+    302) _fr_m2="带密码首跳 302（broker 在把 / 补成 /?token=… —— 手机收藏地址可用）" ;;
+    200) _fr_m2="带密码首跳 200（cookie 还有效，直接给了首页）" ;;
+    401) _fr_m2="带密码还是 401（密码不对，或 Caddy 没吃到新密码）" ;;
+    000) _fr_m2="带密码 000（连不上）" ;;
+    *) _fr_m2="带密码首跳 $_fr_c2" ;;
+    esac
+    case $_fr_c3 in
+    200) _fr_m3="跟随跳转 200（Caddy→隧道→broker→dsh web 全通）" ;;
+    000) _fr_m3="跟随跳转 000（连不上）" ;;
+    *) _fr_m3="跟随跳转 $_fr_c3" ;;
+    esac
+    if [ "$_fr_c1" = 401 ] && { [ "$_fr_c2" = 302 ] || [ "$_fr_c2" = 200 ]; } && [ "$_fr_c3" = 200 ]; then
+        FR_PUB=ok
+        FR_PUB_TXT="带密码 $_fr_c2 → 跟随跳转 $_fr_c3"
+        fr_step public ok "公网入口" "$_fr_m1；$_fr_m2；$_fr_m3" "$_fr_ev"
+    else
+        FR_PUB=fail
+        FR_PUB_TXT="不带密码 $_fr_c1 / 带密码 $_fr_c2 / 跟随跳转 $_fr_c3"
+        fr_step public fail "公网入口" "$_fr_m1；$_fr_m2；$_fr_m3" "$_fr_ev"
+    fi
+    return 0
+}
+
+# ---- 最后：结论（3–5 行）+ 下一步 -------------------------------------------------
+fr_conclude() {
+    _fr_state=ok
+    [ "$FR_BAD" = 0 ] || _fr_state=fail
+    for _fr_s in "$FR_TUN" "$FR_BROKER" "$FR_CLOUD" "$FR_WEB" "$FR_TOKEN" "$FR_PUB"; do
+        [ "$_fr_s" = fail ] && _fr_state=fail
+    done
+    _fr_next="都通了：手机上收藏 $(conf_any public_url PUBLIC_URL 2>/dev/null || printf 'dsh-remote url 打出来的地址')"
+    if [ "$FR_TOKEN" = fail ]; then
+        _fr_next="要新 token：**在机器上**跑 force-restart-dsh-remote --restart-web --yes（会打断正在跑的会话；别从云上/手机触发）"
+    elif [ "$FR_CLOUD" = fail ]; then
+        _fr_next="云上少一个隧道口：先看是谁占着（僵尸会话要你同意才能杀），再重跑这条命令"
+    elif [ "$FR_WEB" = fail ]; then
+        _fr_next="dsh web 没在跑：用 harness 起一个，或 force-restart-dsh-remote --restart-web --yes"
+    elif [ "$FR_PUB" = fail ]; then
+        _fr_next="公网那条不通：ssh 上云看容器日志（sudo docker logs dsh-relay），再 dsh-remote tunnel-status --probe"
+    fi
+    fr_summary "$_fr_state" \
+        "隧道 $(fr_mark "$FR_TUN") ${FR_TUN_TXT:-未测}｜broker $(fr_mark "$FR_BROKER") ${FR_BROKER_TXT:-未测}｜云上隧道口 $(fr_mark "$FR_CLOUD") ${FR_CLOUD_TXT:-未测}
+dsh web $(fr_mark "$FR_WEB") ${FR_WEB_WHO:-未测}｜token $(fr_mark "$FR_TOKEN") ${FR_TOKEN_TXT:-未测}
+公网 $(fr_mark "$FR_PUB") ${FR_PUB_TXT:-未测}" \
+        "$_fr_next"
+    return 0
+}
+
+cmd_force_restart() {
+    _fr_restart_web=0
+    _fr_yes=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --restart-web)
+            _fr_restart_web=1
+            shift
+            ;;
+        --yes | -y)
+            _fr_yes=1
+            shift
+            ;;
+        --json)
+            FR_JSON=1
+            shift
+            ;;
+        --from-broker)
+            FR_FROM_BROKER=1
+            shift
+            ;;
+        --help | -h)
+            usage
+            return 0
+            ;;
+        *) die "force-restart-dsh-remote 不认识的参数：$1（--restart-web / --yes / --json）" ;;
+        esac
+    done
+    if [ "$_fr_restart_web" = 1 ] && [ "$FR_FROM_BROKER" = 1 ]; then
+        die "云上的 /reset 不允许重启 dsh web（会把自己踢掉）。要在机器上跑：force-restart-dsh-remote --restart-web --yes"
+    fi
+    _fr_mode="安全档（只重置隧道 + broker，不碰 dsh web）"
+    if [ "$_fr_restart_web" = 1 ]; then
+        FR_TOTAL=7
+        _fr_mode="安全档 + --restart-web（会打断会话）"
+        # 大字警告走 stderr：--json 的 stdout 要保持是纯 JSON 流
+        {
+            printf '\n'
+            printf '================================================================\n'
+            printf '⚠️  --restart-web：会**打断正在跑的会话**（包括你正在看的这个）\n'
+            printf '     做法：只对占着 local_port 的那**一个** PID 发 SIGTERM（不是 pkill -f dsh），\n'
+            printf '           然后用 %s 起回来 —— 这样新 token 才会被 dsh-web-run\n' "$SERVE_UNIT_NAME"
+            printf '           抓进状态文件（修 stale token 的正路，H22）。旧 token 立刻作废。\n'
+            printf '================================================================\n'
+            printf '\n'
+        } >&2
+        if [ "$_fr_yes" != 1 ]; then
+            if [ -t 0 ] && [ -t 1 ]; then
+                printf '确认继续？输入 yes 回车: ' >&2
+                IFS= read -r _fr_ans || _fr_ans=
+                [ "$_fr_ans" = yes ] || die "没确认（要输入 yes）—— 什么都没做"
+            else
+                die "--restart-web 在非交互环境下必须显式加 --yes —— 什么都没做"
+            fi
+        fi
+    fi
+    fr_head "$_fr_mode"
+    fr_step_units
+    if [ "$_fr_restart_web" = 1 ]; then
+        if ! fr_restart_web; then
+            fr_conclude
+            return 1
+        fi
+    fi
+    fr_step_cloud
+    fr_step_web
+    fr_step_token
+    fr_step_public
+    fr_conclude
+    [ "$FR_BAD" = 0 ] && return 0
+    return 1
+}
+
 # ------------------------------------------------- 改密码（家里一条命令）
 # 为什么要有它：以前 relay-password.txt 里写的是"三步教程"，用户照做会撞两次墙
 # （relay.sh 先要 root、加 sudo 又说没有 docker compose），而且命令是**折行**的 ——
@@ -2150,6 +2747,10 @@ serve-install)
     ;;
 serve-uninstall) cmd_serve_uninstall ;;
 serve-status) cmd_serve_status ;;
+force-restart-dsh-remote)
+    shift
+    cmd_force_restart "$@"
+    ;;
 
 systemd)
     shift

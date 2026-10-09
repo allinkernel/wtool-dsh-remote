@@ -28,6 +28,26 @@
     带 token 参数的请求           → 400（那种请求该直接打 dsh web，不该走这儿）
     其它路径                     → 404；其它方法 → 405
     读不到 token 文件             → 503（**绝不** 302 到空 token）
+    GET  /reset                 手机上的"重置按钮"：一个极简确认页（含一次性 nonce 表单）
+    POST /reset                 让家里跑一遍 force-restart-dsh-remote 的**安全档**
+                                （reset-failed + 重启隧道/broker → 复验云上/本地/token/公网），
+                                结果渲染成"每步 ✓/✗ + 判据命令"的短页面。
+                                **云上永远不允许重启 dsh web**（会把自己踢掉）——
+                                页面里写明：要那样做只能在机器上跑。
+
+**`/reset` 为什么要绕一圈去调家里的命令**（ADR-0022）：重置要动的是**家里**的
+systemd 单元（`dsh-tunnel.service` / `dsh-token-broker.service`），云上够不着；
+broker 本来就跑在家里那台机器上、又正好是手机能打到的那一头，所以由它代跑。
+**不在 python 里重写一遍那几步** —— 直接跑 `dsh-remote force-restart-dsh-remote --json`
+（带 `DSH_REMOTE_FROM_BROKER=1`），把 JSON 行渲染成 HTML。
+两个后果都写进了页面：① 隧道会断几秒，所以 POST **先把"已开始"发出去**再跑
+（run 是 detached 的，见 `spawn_reset`）；② 从手机触发时 broker 不重启自己
+（`--from-broker` / `FR_FROM_BROKER`，那是命令那边的既有行为）。
+
+安全：`/reset` 只认**回环来源**（broker 本来就只绑 127.0.0.1，云上那条靠 SSH 反向隧道
+接进来）+ Caddy 的 basic auth（**不加新的鉴权方式**）；另外 POST 必须带 GET 页面发的
+**一次性 nonce**（basic auth 挡不住"带着凭据的跨站表单"，那条用 nonce 挡）。
+页面里**不回显任何 token / 密码**，响应一律 `Cache-Control: no-store`。
 
 **为什么"cookie 还有效吗"要在这儿判、而不是在 Caddy**（见 ADR-0018）：
 Caddy 只会看"有没有 `Cookie` 这个头"，不会验签，于是"带着过期 cookie 的浏览器"
@@ -46,13 +66,21 @@ dsh web 换完 cookie 303 回 `/`，这时 cookie 有效 → 探测 2xx → 首�
 from __future__ import annotations
 
 import argparse
+import html
 import http.client
+import ipaddress
+import json
 import os
 import re
+import secrets
+import shutil
 import socket
+import subprocess
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 DEFAULT_PORT = 3081
 DEFAULT_WEB_PORT = 3080
@@ -98,6 +126,213 @@ DROP_RESPONSE_HEADERS = frozenset(
     ("connection", "keep-alive", "proxy-connection", "transfer-encoding",
      "content-length", "server", "date")
 )
+
+# ── `/reset`：手机上的"重置按钮"（ADR-0022）────────────────────────────────────
+# 它不改任何东西，只是**在这里**把家里的 `force-restart-dsh-remote --json` 跑起来，
+# 再把 JSON 行渲染成页面 —— 逻辑只有一份（在 bin/dsh-remote 里），这里不重写。
+RESET_PATH = "/reset"
+# GET 页面里那个一次性 nonce 的有效期（秒）。过期/用过都不再接受 POST。
+RESET_NONCE_TTL = 600.0
+# 一次重置最多算它跑这么久；超过就当那个 pid 僵住了，不再拿它挡住下一次。
+RESET_MAX_RUN = 300.0
+# POST 先回响应、**隔这么久**才真去动隧道：不然重启隧道会把这次响应本身掐掉。
+RESET_START_DELAY = float(os.environ.get("DSH_REMOTE_RESET_DELAY", "2"))
+
+
+def state_dir() -> str:
+    """运行期目录（和 token 文件、web-url.txt 同一处）。"""
+    return os.environ.get(
+        "DSH_REMOTE_STATE_DIR",
+        os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "dsh-remote"),
+    )
+
+
+def reset_files(state: str) -> "tuple[str, str, str]":
+    """(结果 jsonl, stderr, pid 锁) —— 都在运行期目录下。"""
+    return (
+        os.path.join(state, "reset-last.jsonl"),
+        os.path.join(state, "reset-last.err"),
+        os.path.join(state, "reset-run.pid"),
+    )
+
+
+def reset_command() -> "list[str] | None":
+    """跑哪条命令：优先**同一个 bin/ 下**的 dsh-remote（安装后是软链，realpath 已解开）。
+
+    用 `sh <脚本>` 调，不依赖它的可执行位；找不到就退回 PATH 上那个薄封装。
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    sh = "/bin/sh" if os.path.exists("/bin/sh") else "sh"
+    cand = os.path.join(here, "dsh-remote")
+    if os.path.exists(cand):
+        return [sh, cand, "force-restart-dsh-remote", "--json"]
+    exe = shutil.which("dsh-force-restart-dsh-remote")
+    if exe:
+        return [sh, exe, "--json"]
+    return None
+
+
+def reset_running(state: str) -> "int | None":
+    """上一次重置还在跑吗（pid 锁 + 最长 RESET_MAX_RUN 秒兜底）。是就回那个 pid。
+
+    **先看结果里有没有 summary**：跑完的进程在我们这里可能还是个僵尸
+    （broker 不 wait 它），僵尸 `kill -0` 照样成功 —— 只看 pid 会永远显示"还在跑"。
+    """
+    _, _, pidf = reset_files(state)
+    try:
+        with open(pidf, "r", encoding="utf-8") as fh:
+            fields = fh.read().split()
+        pid = int(fields[0])
+        started = float(fields[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    if time.time() - started > RESET_MAX_RUN:
+        return None
+    _, _, summary, _, _ = read_reset_result(state)
+    if summary is not None:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def spawn_reset(state: str, log) -> "tuple[bool, str]":
+    """起一次重置：detached + 先睡一小会儿（让 POST 的响应先发出去），结果写文件。
+
+    为什么 detached：① 隧道一重启，这条 HTTP 连接就断了，必须先把响应发完；
+    ② 从手机触发时它是 broker 的子进程（同一个 cgroup），所以命令那边**不重启 broker**
+    （`DSH_REMOTE_FROM_BROKER=1` → `--from-broker`），否则等于把自己掐死。
+    """
+    cmd = reset_command()
+    if cmd is None:
+        return False, "找不到 dsh-remote（$WTOOL_PREFIX/bin 里那条命令没装？）"
+    jsonl, errf, pidf = reset_files(state)
+    try:
+        os.makedirs(state, exist_ok=True)
+    except OSError:
+        pass
+    delay = max(0.0, RESET_START_DELAY)
+    sh = "/bin/sh" if os.path.exists("/bin/sh") else "sh"
+    env = dict(os.environ)
+    env["DSH_REMOTE_FROM_BROKER"] = "1"
+    try:
+        with open(jsonl, "w", encoding="utf-8") as out, open(errf, "w", encoding="utf-8") as err:
+            proc = subprocess.Popen(
+                [sh, "-c", 'sleep %s; exec "$@"' % delay, "dsh-reset"] + cmd,
+                stdout=out,
+                stderr=err,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+                cwd=state,
+            )
+    except OSError as exc:
+        return False, "起不来：%s" % exc
+    try:
+        with open(pidf, "w", encoding="utf-8") as fh:
+            fh.write("%d %f\n" % (proc.pid, time.time()))
+    except OSError:
+        pass
+    log("已开始重置（pid %d → %s）" % (proc.pid, jsonl))
+    return True, "已开始重置（进程 %d，约 10 秒；隧道会断几秒）" % proc.pid
+
+
+class NonceStore:
+    """一次性 nonce：GET /reset 发一个，POST 必须带回来。
+
+    为什么需要它：Caddy 的 basic auth 只认"这个浏览器过了密码"，**挡不住跨站表单** ——
+    一个恶意页面可以用你浏览器里缓存的 basic auth 凭据往 `/reset` POST。
+    nonce 只有从我们页面里才拿得到（跨域读不到响应体），一次一用、10 分钟过期。
+    """
+
+    def __init__(self, ttl: float = RESET_NONCE_TTL) -> None:
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._items: "dict[str, float]" = {}
+
+    def issue(self) -> str:
+        token = secrets.token_urlsafe(18)
+        now = time.time()
+        with self._lock:
+            for key, exp in list(self._items.items()):
+                if exp < now:
+                    self._items.pop(key, None)
+            self._items[token] = now + self._ttl
+        return token
+
+    def consume(self, token: str) -> bool:
+        if not token:
+            return False
+        with self._lock:
+            exp = self._items.pop(token, None)
+        return exp is not None and exp >= time.time()
+
+
+def read_reset_result(state: str):
+    """把上一次（或正在跑的）重置结果读成 (head, steps, summary, 格式坏的行数, stderr)。"""
+    jsonl, errf, _ = reset_files(state)
+    head = None
+    steps: "list[dict]" = []
+    summary = None
+    broken = 0
+    if os.path.exists(jsonl):
+        try:
+            with open(jsonl, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        broken += 1
+                        continue
+                    kind = obj.get("kind")
+                    if kind == "head":
+                        head = obj
+                    elif kind == "step":
+                        steps.append(obj)
+                    elif kind == "summary":
+                        summary = obj
+        except OSError:
+            broken += 1
+    err_text = ""
+    if os.path.exists(errf):
+        try:
+            with open(errf, "r", encoding="utf-8", errors="replace") as fh:
+                err_text = fh.read().strip()
+        except OSError:
+            err_text = ""
+    return head, steps, summary, broken, err_text
+
+
+def html_page(title: str, body: str) -> str:
+    """极简页面：没有外部资源、没有 JS（手机上打开就能看，也不回显任何密钥）。"""
+    return (
+        "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<meta name=\"robots\" content=\"noindex\">\n"
+        "<title>%s</title>\n"
+        "<style>\n"
+        "body{font-family:system-ui,-apple-system,'Noto Sans CJK SC',sans-serif;"
+        "margin:0;padding:16px;line-height:1.5;color:#111;background:#fafafa}\n"
+        "h1{font-size:1.2rem;margin:0 0 12px}\n"
+        "h2{font-size:1rem;margin:18px 0 6px}\n"
+        "ul{padding-left:1.1em;margin:6px 0}\n"
+        "li{margin:6px 0}\n"
+        ".ok{color:#0a7d28;font-weight:600}\n.fail{color:#b00020;font-weight:600}\n"
+        ".warn{color:#8a5300;font-weight:600}\n"
+        ".muted{color:#555;font-size:.85rem}\n"
+        "code{background:#eee;padding:1px 4px;border-radius:3px;"
+        "font-size:.85rem;word-break:break-all}\n"
+        "button{font-size:1rem;padding:10px 18px;border-radius:8px;border:0;"
+        "background:#b00020;color:#fff}\n"
+        ".muted code{background:#e4e4e4}\n"
+        "</style>\n</head>\n<body>\n<h1>%s</h1>\n%s\n</body>\n</html>\n"
+        % (html.escape(title), html.escape(title), body)
+    )
 
 
 def read_token(path: str) -> "str | None":
@@ -196,6 +431,172 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send_html(self, code: int, body: str, headers=()) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        # 页面里可能带"上一次跑成什么样"，别让中间任何一层缓存它
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
+
+    # ------------------------------------------------------------ /reset（手机按钮）
+    def _client_is_local(self) -> bool:
+        """来源是不是回环。
+
+        broker 本来就只绑 127.0.0.1；云上那条是 SSH 反向隧道接进来的，在**家里**这一侧
+        看也是从 127.0.0.1 来的。这条是"万一有人把 broker 绑到别处"时的兜底闸。
+        """
+        addr = self.client_address[0] if self.client_address else ""
+        try:
+            return ipaddress.ip_address(addr).is_loopback
+        except ValueError:
+            return addr in ("", "localhost")
+
+    def _reset_result_html(self, state: str) -> str:
+        head, steps, summary, broken, err_text = read_reset_result(state)
+        running = reset_running(state)
+        parts: "list[str]" = []
+        if running is not None:
+            parts.append("<p class=\"warn\">上一次重置还在跑（进程 %d）—— 刷新本页看进度。</p>" % running)
+        if head is None and not steps:
+            parts.append("<p class=\"muted\">这台机器上还没有跑过重置。</p>")
+            return "".join(parts)
+        if head is not None:
+            parts.append(
+                "<p class=\"muted\">%s 在 %s 上跑的（%s；模式：%s）</p>"
+                % (
+                    html.escape(str(head.get("tool", "force-restart-dsh-remote"))),
+                    html.escape(str(head.get("host", "?"))),
+                    html.escape(str(head.get("at", "?"))),
+                    html.escape(str(head.get("mode", "?"))),
+                )
+            )
+        if steps:
+            items = []
+            for step in steps:
+                state_word = str(step.get("state", "warn"))
+                mark = {"ok": "✓", "fail": "✗"}.get(state_word, "!")
+                cls = state_word if state_word in ("ok", "fail", "warn") else "warn"
+                detail = html.escape(str(step.get("detail", "")))
+                evidence = html.escape(str(step.get("evidence", "")))
+                n = html.escape(str(step.get("n", "?")))
+                total = html.escape(str(step.get("total", "?")))
+                items.append(
+                    "<li><span class=\"%s\">%s</span> <strong>[%s/%s] %s</strong><br>%s%s</li>"
+                    % (
+                        cls,
+                        mark,
+                        n,
+                        total,
+                        html.escape(str(step.get("title", ""))),
+                        detail,
+                        ("<br><span class=\"muted\">判据 <code>%s</code></span>" % evidence) if evidence else "",
+                    )
+                )
+            parts.append("<h2>最近一次的结果</h2>\n<ul>\n%s\n</ul>" % "\n".join(items))
+        if summary is not None:
+            cls = "ok" if str(summary.get("state")) == "ok" else ("fail" if str(summary.get("state")) == "fail" else "warn")
+            parts.append(
+                "<p><span class=\"%s\">结论</span> %s</p>"
+                % (cls, html.escape(str(summary.get("detail", ""))).replace("｜", "｜<br>"))
+            )
+            nxt = str(summary.get("next", ""))
+            if nxt:
+                parts.append("<p class=\"muted\">下一步 %s</p>" % html.escape(nxt))
+        if broken:
+            parts.append("<p class=\"muted\">（有 %d 行看不懂的输出被跳过了）</p>" % broken)
+        if err_text:
+            parts.append("<h2>stderr</h2>\n<p class=\"muted\"><code>%s</code></p>" % html.escape(err_text[:2000]))
+        return "".join(parts)
+
+    def _render_reset_page(self, nonce: str) -> str:
+        state = self.server.state_dir  # type: ignore[attr-defined]
+        return html_page(
+            "重置家里的隧道",
+            "<p>这条按钮会在这台**家里**的机器上跑一遍"
+            " <code>force-restart-dsh-remote</code> 的安全档：</p>\n"
+            "<ul>\n"
+            "<li><code>systemctl --user reset-failed dsh-tunnel.service</code>"
+            " 然后重启隧道和 token broker（隧道断几秒，之后自己回来）</li>\n"
+            "<li>云上只读复验两个隧道口、本地 dsh web、token 新鲜度、公网入口</li>\n"
+            "<li><b>不会</b>打断当前会话 —— 它<b>不碰</b> <code>dsh web</code></li>\n"
+            "</ul>\n"
+            "<form method=\"post\" action=\"/reset\">\n"
+            "<input type=\"hidden\" name=\"nonce\" value=\"%s\">\n"
+            "<button type=\"submit\">确认重置</button>\n"
+            "</form>\n"
+            "<p class=\"muted\">要重启 <code>dsh web</code>（换来一个**新 token**，会打断会话）"
+            "只能在机器上跑：<br><code>force-restart-dsh-remote --restart-web --yes</code>"
+            " —— 这个页面故意不给做，从云上做会把你自己踢掉。</p>\n"
+            "<p class=\"muted\">响应 <code>Cache-Control: no-store</code>；"
+            "页面里不会出现 token 或密码。</p>\n%s"
+            % (html.escape(nonce, quote=True), self._reset_result_html(state)),
+        )
+
+    def _handle_reset(self) -> None:
+        if not self._client_is_local():
+            self._log("拒绝 /reset：来源 %s 不是回环" % (self.client_address[0] if self.client_address else "?"))
+            self._respond(403, "dsh-token-broker: /reset 只允许本机 / 隧道来的请求\n")
+            return
+        state = self.server.state_dir  # type: ignore[attr-defined]
+        if self.command != "POST":
+            # GET / HEAD：发一个一次性 nonce + 上次结果
+            self._send_html(200, self._render_reset_page(self.server.nonces.issue()))  # type: ignore[attr-defined]
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if 0 < length <= 64 * 1024 else b""
+        fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+        nonce = (fields.get("nonce") or [""])[0]
+        if not self.server.nonces.consume(nonce):  # type: ignore[attr-defined]
+            self._log("拒绝 /reset POST：nonce 不对/过期/用过")
+            self._send_html(
+                403,
+                html_page(
+                    "重置：确认页过期了",
+                    "<p>这个确认页已经用过、或者超过 10 分钟了。</p>"
+                    "<p>回 <a href=\"/reset\">/reset</a> 重新打开一次。</p>",
+                ),
+            )
+            return
+        running = reset_running(state)
+        if running is not None:
+            self._send_html(
+                200,
+                html_page(
+                    "重置：已经有一次在跑",
+                    "<p>上一次重置（进程 %d）还没结束 —— 等它跑完，刷新本页看结果。</p>"
+                    "<p><a href=\"/reset\">刷新</a></p>" % running,
+                ),
+            )
+            return
+        ok, msg = spawn_reset(state, self._log)
+        if not ok:
+            self._log("起不来：%s" % msg)
+            self._send_html(500, html_page("重置：没跑起来", "<p>%s</p>" % html.escape(msg)))
+            return
+        self._send_html(
+            202,
+            html_page(
+                "重置：已开始",
+                "<p>%s</p>\n"
+                "<p>隧道会断几秒 —— 这一页的自动刷新可能会失败一次，"
+                "过几秒手动刷新就能看到结果。</p>\n"
+                "<p><a href=\"/reset\">刷新看结果</a>"
+                "<span class=\"muted\">（页面每 10 秒自己刷新一次）</span></p>\n"
+                "<meta http-equiv=\"refresh\" content=\"10\">" % html.escape(msg),
+            ),
+        )
+
     # ------------------------------------------------------------ 代发那一条 GET /
     def _web_request(self, port: int, timeout: float, cookie_header: str, method: str = "GET"):
         """向本地 dsh web 发一条请求，返回 (状态码, 响应头列表, body)；连不上返回 None。"""
@@ -293,8 +694,12 @@ class Handler(BaseHTTPRequestHandler):
         path = parts.path or "/"
         has_token = "token=" in parts.query
 
+        if path in (RESET_PATH, RESET_PATH + "/"):
+            # 手机上的"重置按钮"（GET 确认页 / POST 真跑）—— 和下面那条 token 链路无关
+            self._handle_reset()
+            return
         if path not in REDIRECT_PATHS:
-            self._respond(404, "dsh-token-broker: 这个端口只做 / 和 /go 的重定向\n")
+            self._respond(404, "dsh-token-broker: 这个端口只做 /、/go 和 /reset\n")
             return
         if has_token and path != "/go":
             self._respond(400, "dsh-token-broker: 带 token 的请求请直接打 dsh web（这儿只补 token）\n")
@@ -336,7 +741,11 @@ class Handler(BaseHTTPRequestHandler):
         self._handle()
 
     def do_POST(self) -> None:  # noqa: N802
-        self._respond(405, "dsh-token-broker: 只认 GET / HEAD\n", (("Allow", "GET, HEAD"),))
+        parts = urlsplit(self.path)
+        if (parts.path or "/") in (RESET_PATH, RESET_PATH + "/"):
+            self._handle_reset()
+            return
+        self._respond(405, "dsh-token-broker: 只认 GET / HEAD（/reset 额外认 POST）\n", (("Allow", "GET, HEAD"),))
 
 
 def main(argv) -> int:
@@ -355,22 +764,26 @@ def main(argv) -> int:
                     help="带 cookie 时探测 dsh web 的超时秒数（默认 %.0f）" % PROBE_TIMEOUT)
     args = ap.parse_args(argv)
 
+    state = state_dir()
     if not args.token_file:
-        state = os.environ.get(
-            "DSH_REMOTE_STATE_DIR",
-            os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "dsh-remote"),
-        )
         args.token_file = os.path.join(state, "current-token.txt")
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.token_file = args.token_file       # type: ignore[attr-defined]
     server.web_port = args.web_port           # type: ignore[attr-defined]
     server.probe_timeout = args.probe_timeout  # type: ignore[attr-defined]
+    server.state_dir = state                  # type: ignore[attr-defined]
+    server.nonces = NonceStore()              # type: ignore[attr-defined]
     server.daemon_threads = True
     sys.stdout.write(
         "dsh-token-broker: http://%s:%d/ → 没 cookie 就 302 /?token=；带 dsh-auth-* cookie 先探测"
         "（%.0fs；token 文件：%s；dsh web 端口：%d）\n"
         % (args.host, args.port, args.probe_timeout, args.token_file, args.web_port)
+    )
+    sys.stdout.write(
+        "dsh-token-broker: http://%s:%d/reset → 手机上的重置按钮（跑 force-restart-dsh-remote"
+        " 的安全档；结果 $STATE_DIR/reset-last.jsonl，state=%s；延迟 %.0fs 再动隧道）\n"
+        % (args.host, args.port, state, RESET_START_DELAY)
     )
     sys.stdout.flush()
     try:

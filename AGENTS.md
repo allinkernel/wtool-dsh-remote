@@ -139,7 +139,7 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd tools/dsh-remote
-sh tests/run_tests.sh         # 556 条（以跑出来的 PASS 行为准），一两分钟
+sh tests/run_tests.sh         # 675 条（以跑出来的 PASS 行为准），两三分钟
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
                               #   J 节用 DSH_REMOTE_UNIT_DIR + systemctl/tmux 桩，不碰真 unit / 真 tmux
@@ -154,8 +154,27 @@ sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再�
 C `dsh-notify` 22 / D Caddyfile 渲染 34 / E 子命令 53 / F `cloud-install` 14 /
 G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 55 / J 常驻隧道 100 /
 K token 固定地址 55 / L 二维码 17 / M 一条命令装好 46 / N 改密码 22 /
-O dsh web 常驻 + harness 四态 + 代理 108 = **556**。
+O dsh web 常驻 + harness 四态 + 代理 142 / P 一键强制重置 + 手机 `/reset` 85 = **675**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
+
+### ⚠️ 验证的铁律：**绝不碰 3080**（2026-10-09 用户明确要求）
+
+3080 上跑的是**用户正在用的那个 `dsh web`**（多半是手工起的，token 只在它内存里）。
+它断了 = 用户的会话断了，**没有任何测试值得这个代价**：
+
+- 端口一律用 **3181 以上**（或 `mktemp`/`socket.bind(0)` 现挑的空闲端口 + 桩）；
+  **绝不**在 3080 上起 / 停 / 重启 / 杀任何东西；
+- **绝不** `systemctl --user restart/stop dsh-web.service`、**绝不** `pkill`/`kill` 任何
+  `dsh web` 进程 —— 唯一例外：用户**当轮明确**让你跑
+  `force-restart-dsh-remote --restart-web --yes`（那正是那条命令存在的原因，见 ADR-0022）；
+- 状态 / 配置 / 单元落点一律指到临时目录（`DSH_REMOTE_STATE_DIR` / `DSH_REMOTE_CONF_DIR` /
+  `DSH_REMOTE_UNIT_DIR` / `DSH_REMOTE_LIB_DIR` / `HOME=`），也就是**影子 HOME**；
+- 判据：整轮跑完 `ss -ltnp | grep ':3080 '` 打出来的 PID **必须还是原来那个**
+  （2026-10-09 之前的几轮里，这条判据在 journal 里每次都记一笔）。
+
+`harness` 那边同理：它的"没起来"诊断**先看端口**（`ss -ltnp`）再谈 systemd ——
+有人听就是"端口被别人占着（PID x）"，没人听才分"服务失败 exit N / 还在起第 N 次重试 /
+服务没在跑"三档，每档都带一条能原地复现的判据（hazards H29、ADR-0020 的输出契约）。
 
 ⚠️ 两个要 docker 的脚本**没有 docker 时打印"跳过"并 `exit 77`**（跳过码）：
 **77 是"没测"，不是通过**。以前是 `exit 0`（放进 CI / `&&` 链里空跑也算绿的假绿），
