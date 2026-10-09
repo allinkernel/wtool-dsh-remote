@@ -956,3 +956,35 @@ grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run
   —— 这是**改行为**，要先问用户（见 `BACKLOG.md` U14）。
 - **验证程度**：用户 2026-10-09 实测撞到 1 次；本轮只读核对代码 + 上面 3 条命令各跑 1 次
   （`a#b` / `a b` 拒绝、`a@b` 通过），**未改代码**。
+
+## H27. `RestartSec` 小 + `StartLimitIntervalSec=0`：对端持续掐连接时**自我维持成风暴**
+
+- **现象**：云上那个反向端口被占着（或密钥/账号被拒）时，ssh 起来就秒退；
+  `Restart=always` + `RestartSec=3` + `StartLimitIntervalSec=0`（无限重试）合起来
+  是一个**自我维持**的循环 —— 2026-10-08 现场记录的 `NRestarts` 累计到 **1708**。
+  更坏的是它**看起来是好的**：`systemctl --user is-active dsh-tunnel.service` 回 `active`
+  （`Type=simple` 只看 fork 成没成），人第一眼会去怀疑手机那一头。
+- **判据（怎么看出来）**：
+
+  ```sh
+  systemctl --user show dsh-tunnel.service -p NRestarts -p StartLimitIntervalUSec -p RestartUSec
+  # 风暴时：NRestarts 一路涨、StartLimitIntervalUSec=infinity、RestartUSec=3s
+  # 隔 30 秒采样两次，ActiveEnterTimestamp 也在往前跳（进程根本没活过 30 秒）
+  journalctl --user -u dsh-tunnel.service -n 20      # 一屏都是 "Main process exited … Failed with result"
+  ```
+- **修法**（ADR-0019）：`StartLimitIntervalSec=300` + `StartLimitBurst=10`（300 秒内失败 10 次
+  就停下并标 `failed`）+ `RestartSec` 默认 3→5；停下之后由
+  `dsh-tunnel-watch.timer`（家里，每 5 分钟一次只读探测）来看一眼、真断了才重启。
+  回归守卫：J 节断言渲染出的单元里有这三个键、且**不在 `[Service]` 段**（放那儿会被忽略）。
+  复盘：`dsh-remote tunnel-install --restart-sec 3 --start-limit-interval 0 --no-watch`
+  能退回旧行为 —— **别退**，除非你在复现这个 hazard。
+- **为什么"无限重试"是错的**：它只对**暂时性**故障有用。对**持续性**拒绝它是纯自伤
+  （每 3 秒锤一次对端 + 刷爆 journald + 用 `active` 骗人），而且永远等不到恢复。
+- **验证程度**：1708 这个数字来自 2026-10-08 的现场（用户/上一轮记录，本轮**没有复现那次故障**）；
+  本轮实测的是"修完之后"：`StartLimitIntervalUSec=5min` / `StartLimitBurst=10` / `RestartUSec=5s`、
+  `NRestarts=0`（`systemctl --user show` 当场读的）。自愈件的演练分两次：
+  **13:39 那次是真演练**（`WATCH_PORT=19999` → journal 两行"不在听 → 重启"、"重启后 probe='0'"，
+  隧道 `ExecMainStartTimestamp` 跟着跳到 13:39:12、PID 换了一个）；
+  13:49 那次是助手在**沙箱**里跑渲染出来的脚本（`systemctl` 是桩、**没有**真重启），
+  但它**没给 `logger` 打桩**，所以真 journal 里多了两行 —— 拿这个脚本做实验时记得
+  连 `logger` 一起桩掉（`tests/run_tests.sh` 的 J 节就是这么干的）。

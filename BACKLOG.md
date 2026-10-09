@@ -644,3 +644,35 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
   自检 401 / 隧道 401 / broker 302 全绿；改完复验**当前密码 302、旧密码（含 `#` 那个）401**。
 - **没验 / 风险**：真手机浏览器（还是 curl 在验）；broker 那条"探测误判"的极端情况
   （上游回 500 等）只在夹具上验过；首页那次请求会打到 `dsh web` 两次（探测+代发）。
+
+## ✅ 2026-10-09：隧道风暴 + 没有自愈（U16）
+
+- **现场**：2026-10-08 对端持续掐连接，`RestartSec=3` + `StartLimitIntervalSec=0`（无限重试）
+  自我维持成风暴 —— 单元 `NRestarts` 累计到 **1708**；而且 `is-active` 一直回 `active`，
+  看起来"隧道是好的"（`Type=simple` 只看 fork）。详见 hazards **H27**。
+- **做了什么**（ADR-0019）：
+  1. `tunnel-install` 渲染的单元加两个键：`StartLimitIntervalSec=300` + `StartLimitBurst=10`
+     （300 秒内失败 10 次就停下并标 `failed`），`RestartSec` 默认 **3 → 5**；
+     新开关 `--start-limit-burst` / `--start-limit-interval` / `--restart-sec`（都是默认值可用、
+     显式给值可覆盖）。
+  2. **自愈件（内部件）**：`~/.local/lib/dsh-remote/tunnel-watch.sh`（0755，不在 `PATH` 上）
+     + `dsh-tunnel-watch.service`（oneshot）+ `dsh-tunnel-watch.timer`（`OnBootSec=2min` /
+     `OnUnitActiveSec=5min` / `AccuracySec=30s`）：上云做一次**只读**探测
+     （`ss -ltn | grep -c 127.0.0.1:<remote_port>`，`ConnectTimeout=8`），不是 `1` 就
+     `systemctl --user restart dsh-tunnel.service` → 6 秒后复检 → 写 `logger -t dsh-tunnel-watch`。
+     `--no-watch` 跳过安装、`--watch-sec` 改周期；`tunnel-uninstall` **先停 timer** 再撤三件。
+- **验证**：
+  - 本机（离线，全在临时目录 + 桩里）：`sh tests/run_tests.sh` → **468 通过 0 失败**
+    （J 节 69 → **100**：三个键的默认值/可覆盖/不许落在 `[Service]` 段；自愈脚本落点与
+    `sh -n`、两个单元、timer 被 `enable --now`、**拿假端口真跑一遍脚本**（rc=1 且调用 restart）、
+    `--no-watch` 不写、卸载撤三件；练脚本的 `systemctl`/`ssh`/`logger` 全是桩）。
+  - 真机（现状，只读复核）：`StartLimitIntervalUSec=5min` / `StartLimitBurst=10` /
+    `RestartUSec=5s` / `NRestarts=0`；timer `is-active=active`、`list-timers` 里 NEXT 在 5 分钟内；
+    13:39 那次真演练的 journal 两行还在（"不在听 → 重启"、"重启后 probe='0'"）。
+  - **渲染与线上单元逐键比对**：`tunnel-install --dry-run` 出来的
+    `StartLimitIntervalSec=300` / `StartLimitBurst=10` / `RestartSec=5` / `ExecStart` 与线上
+    `~/.config/systemd/user/dsh-tunnel.service` **逐个相同**（线上那份是上一轮手工写的，
+    注释措辞不同、键一样）。
+- **没验 / 风险**：1708 那次风暴**没有复现**（只是把修完的状态量了一遍）；
+  "自愈件真的在真机上按 timer 触发并恢复隧道"只在 13:39 那次演练里见到过（上一轮做的），
+  本轮没有再动生产隧道；自愈脚本的 `ssh` 用 `PATH` 里的（systemd oneshot 有正常 `PATH`）。

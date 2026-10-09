@@ -77,6 +77,8 @@ dsh-remote cloud-install --domain dsh.example.com --email me@example.com
 cp ~/.config/dsh-remote/remote.conf.example ~/.config/dsh-remote/remote.conf
 #   填 cloud_host / cloud_user / identity，并把 public_url 填成云端脚本打印的那个地址
 dsh-remote tunnel-install     # systemd --user 单元 dsh-tunnel.service：Restart=always + ssh 保活
+#   一直连不上时它不会无限重试（默认 300 秒内失败 10 次就停下并标 failed，不再锤对端）；
+#   真断了由家里那个几分钟一次的自愈检查拉回来，手机那头还是"断了会自己回来"
 #   想先前台看日志：dsh-remote tunnel（Ctrl-C 退出）
 #   想让它在你没登录时也活着：loginctl enable-linger "$USER"（本机实测不需要 sudo）
 dsh-remote tunnel-status --probe                   # 体检（含云上只读检查）
@@ -137,8 +139,8 @@ dsh-remote serve-uninstall   # 撤掉常驻服务（**不动**正在跑的会话
 | `dsh-remote status` | 体检：harness / 隧道 / 推送 / 手机地址 |
 | `dsh-remote serve` | 在**后台**起 `dsh web --no-open`，把带 token 的地址存下来 |
 | `dsh-remote tunnel` | 前台保活反向隧道（调试用；常驻用 `tunnel-install`） |
-| `dsh-remote tunnel-install` | 装成 systemd `--user` 常驻服务：`Restart=always`（默认 3s）+ ssh 的 `ServerAlive*`，日志进 journald |
-| `dsh-remote tunnel-uninstall` | 撤掉它（`disable --now` + 删单元文件） |
+| `dsh-remote tunnel-install` | 装成 systemd `--user` 常驻服务：`Restart=always`（默认 5s）+ ssh 的 `ServerAlive*`，日志进 journald；**一直失败会停下**（默认 300 秒内 10 次）而不是无限重试，之后交给自愈检查 |
+| `dsh-remote tunnel-uninstall` | 撤掉它（`disable --now` + 删单元文件 + 撤自愈检查） |
 | `dsh-remote tunnel-status` | 看单元/进程/端口/云上隧道口/公网；`--probe` 会 ssh 上云做**只读**检查 |
 | `dsh-remote systemd` | 旧名字：只生成单元不 enable（= `tunnel-install --no-enable`） |
 | `dsh-remote token-broker` | 前台跑"固定地址"那个小服务：没 cookie 就 302 补 token，带 cookie 就先探一次、有效就把首页代发（常驻用 `broker-install`） |
@@ -360,14 +362,16 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-09 实测，合计 **437**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-09 实测，合计 **468**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
-`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 69** /
+`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 100** /
 **固定地址那条链路 K 55** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22** /
 **dsh web 常驻 O 20**。
 K 节里 broker 起**真进程**、`dsh web` 用 `tests/fake_dsh_web.py` 这个**假夹具**
 （按 cookie 的值造 200/401/303/500/慢响应），所以"过期 cookie → 跳转""有效 cookie →
 代发首页""判断不出来 → 503"三条都**离线**测得出来。
+J 节的隧道单元与自愈检查也全在临时目录 + 桩命令里跑（`systemctl`/`tmux`/`ssh`/`logger` 都是桩），
+跑完还会比对真 `$HOME` 里那几个文件的指纹。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
 

@@ -517,3 +517,61 @@ SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/�
 
 **没验 / 风险**：真手机浏览器（仍是 curl 在验）；"上游回 500 / 探测超时"两条只在夹具上验；
 首页那次会打到 `dsh web` 两次（探测 + 代发，多一次本地回环）。
+
+## 2026-10-09（隧道防风暴 + 自愈件）—— 从"无限重试"改成"失败 10 次停下 + 每 5 分钟看一眼"（ADR-0019）
+
+**谁**：用户 2026-10-09 说"改"；上一轮已在本机**手工**把三处加固 + 一个自愈件做上并演练过，
+本轮的任务是把它**变成项目能力**（`tunnel-install` 渲染 + 卸载路径 + 测试 + 文档）。
+
+**背景（2026-10-08 现场）**：对端持续掐连接 → `RestartSec=3` + `StartLimitIntervalSec=0`
+（无限重试）自我维持成风暴，单元 `NRestarts` 累计 **1708**；而 `is-active` 一路回 `active`
+（`Type=simple` 只看 fork），看起来"隧道是好的"。以后果最隐蔽的一条记进 hazards **H27**。
+
+**改了什么**（代码 + 文档同一个提交）：
+
+1. `bin/dsh-remote` 的 `unit_body` 加两个键、改一个默认值：
+   `StartLimitIntervalSec=300`（`--start-limit-interval`）、`StartLimitBurst=10`
+   （`--start-limit-burst`）、`RestartSec` 默认 **3 → 5**（`--restart-sec`）。
+   不带参数就是加固后的值；`--restart-sec 3 --start-limit-interval 0 --no-watch`
+   能整条退回旧行为（留给"复现 hazard"用）。
+2. **自愈件（内部件）**：新增 `watch_script_body` / `watch_unit_body` / `watch_timer_body`
+   三个渲染函数 + `lib_dir()` / `watch_*_file()` 落点函数；`tunnel-install` 顺手写
+   `~/.local/lib/dsh-remote/tunnel-watch.sh`（0755）+ `dsh-tunnel-watch.service`（oneshot）
+   + `dsh-tunnel-watch.timer`（`OnBootSec=2min` / `OnUnitActiveSec=5min` / `AccuracySec=30s`）
+   并 `enable --now` 那个 timer；`--no-watch` 跳过、`--watch-sec` 改周期（<30s 直接拒）。
+   `tunnel-uninstall` 里**先停 timer**（不停它过 5 分钟又把隧道拉起来）再撤三件、空目录 `rmdir`。
+   按用户 2026-10-09 的规矩：**不进 `PATH`、没有子命令**，只在 install 输出、代码注释和
+   `architecture.md` §3.1.1（标明"内部件"）里出现。
+3. 测试 J 节 69 → **100 条**：三个键的默认值 / 可覆盖 / 不许落在 `[Service]` 段；
+   自愈脚本落点与可执行与 `sh -n`、内容（主机/端口/`-p`/restart/logger）、
+   service/timer 内容、timer 被 `enable --now`、**拿假端口真跑一遍渲染出来的脚本**
+   （rc=1、调用了 restart、写了 journal）、`--no-watch` 不写、卸载撤三件。
+   自愈脚本的落点也钉到 `DSH_REMOTE_LIB_DIR`（**不钉就会写到真 `~/.local/lib`**），
+   并把这三个文件加进"真 `$HOME` 指纹"那两条断言。
+4. 文档：**ADR-0019**、hazards **H27**、`architecture.md` §3.1（表格三行 + 单元现状 + 新
+   §3.1.1 内部件）、§3 子命令表、§10/§11/§12、`BACKLOG.md` U16 ✅（U14/U15 两条待决定）、
+   `README.md`（`RestartSec` 默认 5 + "一直失败会停下"；**不写内部件的文件与命令**）。
+
+**验证**：
+
+- 本机离线：`sh tests/run_tests.sh` → **468 通过 0 失败**（J 100 / K 55 / O 20）。
+- **渲染产物 vs 线上单元逐键比对**（只读）：
+  `dsh-remote tunnel-install --dry-run` 出来的 `StartLimitIntervalSec=300`、
+  `StartLimitBurst=10`、`RestartSec=5`、`ExecStart=…` 与线上
+  `~/.config/systemd/user/dsh-tunnel.service` **逐个相同**（线上是上一轮手工写的，
+  只有注释措辞不同）；`systemd-analyze verify` 三个单元（隧道 + 自愈 service/timer）
+  都不报 Unknown key。
+- 线上状态复核（只读）：`StartLimitIntervalUSec=5min` / `StartLimitBurst=10` /
+  `RestartUSec=5s` / `NRestarts=0`；`dsh-tunnel-watch.timer` `is-active=active`、
+  `list-timers` 的 NEXT 在 5 分钟以内；13:39 那次真演练的两行 journal 还在。
+- **没动生产隧道**：本轮**没有**再跑一次真演练，也**没有**在真机上重跑 `tunnel-install`
+  —— 线上已经是想要的状态（上一轮手工做的），重跑只会白断一次手机链路。
+  代价是线上那份 `tunnel-watch.sh` 仍是上一轮手写的版本（少一个 `-p <ssh_port>`），
+  下次跑 `dsh-remote tunnel-install` 会把它换成项目渲染的版本（那时会 restart 一次隧道）。
+- **踩到的小坑（诚实记一笔）**：助手在沙箱里手工跑渲染出来的自愈脚本时**只桩了 `ssh`、
+  没桩 `logger`**，于是真 journal 里多了两行 `dsh-tunnel-watch`（13:49，端口 19999）——
+  那次 `systemctl` 是桩、**没有真重启**（隧道 `ExecMainStartTimestamp` 仍是 13:39:12）。
+  `run_tests.sh` 的 J 节把 `logger` 也桩掉了，所以跑测试不会写真 journal。
+
+**没验 / 风险**：1708 那次风暴没有复现（只量了修完的状态）；"timer 在真机上自己触发并恢复"
+仍是上一轮 13:39 那次的观察；自愈脚本用 `PATH` 里的 `ssh`（systemd oneshot 有正常 `PATH`）。

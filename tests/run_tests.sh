@@ -23,11 +23,14 @@
 #   I 安装脚本：源问 WTOOL_PROJECT_DIR 要（手跑按 $0 自推）、落点从
 #     WTOOL_HOME/WTOOL_PREFIX 推、换 WTOOL_HOME 装到别处、源找不到不建悬空链、
 #     --uninstall 撤干净 —— 全程临时 HOME（跑完比真 $HOME 的指纹）
-#   J 隧道常驻：systemd 单元渲染（Restart=always/保活参数/journald）、
+#   J 隧道常驻：systemd 单元渲染（Restart=always/保活参数/journald/**防风暴三个键**）、
 #     daemon-reload + enable --now 的调用、幂等、旧 tmux 会话抢端口的检测与停掉、
-#     用户管理器不可用时"还没动旧隧道就停手"、tunnel-status 的漂移检测、卸载
-#     —— 单元落点用 DSH_REMOTE_UNIT_DIR 钉到临时目录，systemctl/tmux 全是桩
-#     （真 tmux 上可能正跑着生产隧道），跑完比真 ~/.config/systemd/user 的指纹
+#     用户管理器不可用时"还没动旧隧道就停手"、tunnel-status 的漂移检测、卸载；
+#     **自愈件（内部件）**：脚本落点/可执行/sh -n/内容、两个单元、timer 被 enable、
+#     拿假端口真跑一遍脚本（rc 非 0 且调用了 restart）、--no-watch 不写、卸载撤三件
+#     —— 单元落点用 DSH_REMOTE_UNIT_DIR、脚本落点用 DSH_REMOTE_LIB_DIR 钉到临时目录，
+#     systemctl/tmux/ssh/logger 全是桩（真 tmux 上可能正跑着生产隧道），
+#     跑完比真 ~/.config/systemd/user 与真 ~/.local/lib/dsh-remote 的指纹
 #   K token 重定向（固定地址那半）：Caddyfile 两份模板的 @entry 只按 token 排、
 #     不按 cookie 排；broker 起真进程 + **假 dsh web 夹具**（tests/fake_dsh_web.py，
 #     按 cookie 的值造 401/200/303/500/慢响应）验：过期 cookie → 302 + 清 cookie、
@@ -776,7 +779,9 @@ printf 'J. 隧道常驻：单元渲染 / 旧 tmux 抢端口 / 卸载\n'
 #   * 单元落点用 DSH_REMOTE_UNIT_DIR 钉到临时目录（绝不碰真 ~/.config/systemd/user）
 #   * systemctl / tmux /（probe 用的）ssh 全是桩（真 tmux 上可能正跑着生产隧道）
 real_unit_fp() {
-    for p in "$HOME/.config/systemd/user/dsh-tunnel.service" "$HOME/.config/systemd/user/dsh-remote-tunnel.service"; do
+    for p in "$HOME/.config/systemd/user/dsh-tunnel.service" "$HOME/.config/systemd/user/dsh-remote-tunnel.service" \
+        "$HOME/.config/systemd/user/dsh-tunnel-watch.service" "$HOME/.config/systemd/user/dsh-tunnel-watch.timer" \
+        "$HOME/.local/lib/dsh-remote/tunnel-watch.sh"; do
         if [ -e "$p" ]; then
             printf '%s|%s|%s\n' "$p" "$(stat -c '%s' "$p")" "$(stat -c '%Y' "$p")"
         else
@@ -813,6 +818,8 @@ chmod +x "$jstub/systemctl" "$jstub/tmux"
 
 export J_LOG="$TMP/j.log"
 export DSH_REMOTE_UNIT_DIR="$TMP/junits"
+# 自愈件（内部件）的脚本落点也要钉到临时目录 —— 不钉就写到真 ~/.local/lib 去了
+export DSH_REMOTE_LIB_DIR="$TMP/jlib"
 export DSH_REMOTE_SYSTEMCTL="$jstub/systemctl"
 export DSH_REMOTE_TMUX="$jstub/tmux"
 export DSH_REMOTE_CONF="$TMP/j-remote.conf"
@@ -847,11 +854,14 @@ junit="$DSH_REMOTE_UNIT_DIR/dsh-tunnel.service"
 if [ -f "$junit" ]; then ok "单元落在 \$DSH_REMOTE_UNIT_DIR/dsh-tunnel.service"; else bad "单元落点" "$(ls -A "$DSH_REMOTE_UNIT_DIR" 2>/dev/null)"; fi
 ju=$(cat "$junit" 2>/dev/null)
 check_contains "单元：Restart=always" "Restart=always" "$ju"
-check_contains "单元：RestartSec=3（默认 3-5s 档）" "RestartSec=3" "$ju"
-check_contains "单元：StartLimitIntervalSec=0（断了无限重试）" "StartLimitIntervalSec=0" "$ju"
+check_contains "单元：RestartSec=5（2026-10-09 起默认 5，别 3 秒一锤对端）" "RestartSec=5" "$ju"
+# 防风暴（ADR-0019 / hazards H27）：对端持续掐连接时，RestartSec 小 + StartLimitIntervalSec=0
+# 会自我维持成风暴（实测 NRestarts 累计到 1708）→ 默认改成"300 秒内失败 10 次就停下"
+check_contains "单元：StartLimitIntervalSec=300（默认防风暴）" "StartLimitIntervalSec=300" "$ju"
+check_contains "单元：StartLimitBurst=10" "StartLimitBurst=10" "$ju"
 # 这个键属于 [Unit]；写在 [Service] 里 systemd 只警告 Unknown key 然后忽略（实测踩过）
-check "单元：StartLimitIntervalSec 不在 [Service] 段（放那儿会被忽略）" "0" \
-    "$(sed -n '/^\[Service\]/,$p' "$junit" | grep -c StartLimitIntervalSec || true)"
+check "单元：StartLimit 两个键都不在 [Service] 段（放那儿会被忽略）" "0" \
+    "$(sed -n '/^\[Service\]/,$p' "$junit" | grep -c StartLimit || true)"
 check_contains "单元：ServerAliveInterval=15" "ServerAliveInterval=15" "$ju"
 check_contains "单元：ServerAliveCountMax=3" "ServerAliveCountMax=3" "$ju"
 check_contains "单元：TCPKeepAlive=yes" "TCPKeepAlive=yes" "$ju"
@@ -869,6 +879,34 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     check_not_contains "systemd-analyze verify：没点名我们的单元" "$junit:" "$jv"
 else
     ok "没有 systemd-analyze，跳过单元语法校验"
+fi
+
+# ②b 内部件（自愈检查，ADR-0019）：脚本落在 lib 目录、两个单元落在 unit 目录、timer 被 enable
+#     它**不是给用户敲的命令**（不进 PATH），所以只在 install 的输出和这里出现
+jwscript="$DSH_REMOTE_LIB_DIR/tunnel-watch.sh"
+jwunit="$DSH_REMOTE_UNIT_DIR/dsh-tunnel-watch.service"
+jwtimer="$DSH_REMOTE_UNIT_DIR/dsh-tunnel-watch.timer"
+if [ -f "$jwscript" ]; then ok "自愈件：脚本落在 \$DSH_REMOTE_LIB_DIR（不进 PATH）"; else bad "自愈件：脚本落点" "$(ls -A "$DSH_REMOTE_LIB_DIR" 2>/dev/null)"; fi
+if [ -x "$jwscript" ]; then ok "自愈件：脚本可执行（timer 直接跑它）"; else bad "自愈件：脚本可执行"; fi
+if sh -n "$jwscript" 2>"$TMP/jw.err"; then ok "自愈件：脚本过 sh -n"; else bad "自愈件：脚本过 sh -n" "$(cat "$TMP/jw.err")"; fi
+jws=$(cat "$jwscript" 2>/dev/null)
+check_contains "自愈件：探的是 remote.conf 里的主机" "alice@203.0.113.9" "$jws"
+check_contains "自愈件：端口默认取 remote_port（18099）" 'WATCH_PORT:-18099' "$jws"
+check_contains "自愈件：ssh 带上 conf 里的端口（-p 2222）" '-p "$SSH_PORT"' "$jws"
+check_contains "自愈件：不在听就重启隧道" "--user restart dsh-tunnel.service" "$jws"
+check_contains "自愈件：重启后复检、没恢复就非 0（写进 journal）" 'logger -t dsh-tunnel-watch' "$jws"
+jwu=$(cat "$jwunit" 2>/dev/null)
+check_contains "自愈件：service 是 oneshot" "Type=oneshot" "$jwu"
+check_contains "自愈件：service 的 ExecStart 指向那个脚本" "ExecStart=$jwscript" "$jwu"
+jwt=$(cat "$jwtimer" 2>/dev/null)
+check_contains "自愈件：timer 开机 2 分钟后第一次" "OnBootSec=2min" "$jwt"
+check_contains "自愈件：timer 每 5 分钟一次" "OnUnitActiveSec=5min" "$jwt"
+check_contains "自愈件：timer 挂 timers.target（开机自启）" "WantedBy=timers.target" "$jwt"
+check "自愈件：install 会把 timer enable --now" "1" \
+    "$(grep -c -- '--user enable --now dsh-tunnel-watch.timer' "$J_LOG" || true)"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    jwv=$(systemd-analyze verify "$jwunit" "$jwtimer" 2>&1)
+    check_not_contains "systemd-analyze verify（自愈件）：没有 Unknown key" "Unknown key name" "$jwv"
 fi
 jlg=$(cat "$J_LOG")
 check_contains "装的时候 daemon-reload" "--user daemon-reload" "$jlg"
@@ -952,13 +990,74 @@ check_contains "单元跟着配置变（18222）" "-R 127.0.0.1:18222:127.0.0.1:
 check_contains "内容变了会 restart" "--user restart dsh-tunnel.service" "$(cat "$J_LOG")"
 check "内容变了会留 .bak" "1" "$(ls "$DSH_REMOTE_UNIT_DIR" | grep -c '\.bak-' || true)"
 
+# ⑨b 自愈件的演练（ADR-0019）：拿一个**假端口**跑一遍渲染出来的脚本 ——
+#     不在听 → 重启一次隧道 → 复检还是不在 → 非 0。ssh / systemctl / logger 全是桩，
+#     **绝不可能**碰到真云端和真隧道。
+mkdir -p "$TMP/jwatchbin"
+cat >"$TMP/jwatchbin/ssh" <<'STUB'
+#!/bin/sh
+printf 'SSH: %s\n' "$*" >>"$J_LOG"
+printf '0\n'   # 假装云上那个端口不在听
+STUB
+cat >"$TMP/jwatchbin/logger" <<'STUB'
+#!/bin/sh
+printf 'LOGGER: %s\n' "$*" >>"$J_LOG"
+STUB
+chmod +x "$TMP/jwatchbin/ssh" "$TMP/jwatchbin/logger"
+: >"$J_LOG"
+PATH="$TMP/jwatchbin:$PATH" WATCH_PORT=19999 sh "$jwscript" >"$TMP/jwatch.out" 2>&1
+jw_rc=$?
+[ "$jw_rc" -ne 0 ] && ok "自愈件演练：假端口（没人听）→ 脚本非 0（不谎报好了）" \
+    || bad "自愈件演练：假端口（没人听）→ 脚本非 0" "rc=$jw_rc"
+check_contains "自愈件演练：探的是那个假端口" "127.0.0.1:19999" "$(cat "$J_LOG")"
+check_contains "自愈件演练：探到不在听 → 重启隧道" "--user restart dsh-tunnel.service" "$(cat "$J_LOG")"
+check_contains "自愈件演练：写 journal 说清原因" "不在听" "$(cat "$J_LOG")"
+
+# ⑨c 防风暴那几个开关：不带参数是加固值（上面 ② 验过），带了要能覆盖
+mkdir -p "$TMP/junits5"
+: >"$J_LOG"
+DSH_REMOTE_UNIT_DIR="$TMP/junits5" DSH_REMOTE_LIB_DIR="$TMP/jlib5" DSH_REMOTE_CONF="$TMP/j-remote.conf" \
+    "$remote" tunnel-install --restart-sec 7 --start-limit-burst 3 --start-limit-interval 60 \
+    --watch-sec 90 >"$TMP/j13.out" 2>&1
+check "防风暴开关：install 退出 0" "0" "$?"
+j13u=$(cat "$TMP/junits5/dsh-tunnel.service" 2>/dev/null)
+check_contains "开关生效：--restart-sec 7" "RestartSec=7" "$j13u"
+check_contains "开关生效：--start-limit-burst 3" "StartLimitBurst=3" "$j13u"
+check_contains "开关生效：--start-limit-interval 60" "StartLimitIntervalSec=60" "$j13u"
+check_contains "开关生效：--watch-sec 90（不是整分钟就写 90s）" "OnUnitActiveSec=90s" \
+    "$(cat "$TMP/junits5/dsh-tunnel-watch.timer" 2>/dev/null)"
+check_contains "自愈脚本跟着新端口重渲染" 'WATCH_PORT:-18099' \
+    "$(cat "$TMP/jlib5/tunnel-watch.sh" 2>/dev/null)"
+mkdir -p "$TMP/junits6"
+DSH_REMOTE_UNIT_DIR="$TMP/junits6" DSH_REMOTE_LIB_DIR="$TMP/jlib6" DSH_REMOTE_CONF="$TMP/j-remote.conf" \
+    "$remote" tunnel-install --no-watch --no-enable >/dev/null 2>&1
+check "--no-watch：只写隧道单元、不写自愈件" "dsh-tunnel.service" "$(ls -A "$TMP/junits6" 2>/dev/null)"
+check "--no-watch：lib 目录下没有脚本" "" "$(ls -A "$TMP/jlib6" 2>/dev/null)"
+DSH_REMOTE_UNIT_DIR="$TMP/junits5" DSH_REMOTE_LIB_DIR="$TMP/jlib5" DSH_REMOTE_CONF="$TMP/j-remote.conf" \
+    "$remote" tunnel-uninstall >/dev/null 2>&1
+# 只看那三个文件在不在（目录里可能留着 .bak-<时间戳>，那是重渲染时的备份，正常）
+if [ ! -e "$TMP/junits5/dsh-tunnel-watch.timer" ] && [ ! -e "$TMP/junits5/dsh-tunnel-watch.service" ] \
+    && [ ! -e "$TMP/jlib5/tunnel-watch.sh" ]; then
+    ok "自愈件卸载：timer + service + 脚本都撤了"
+else
+    bad "自愈件卸载：timer + service + 脚本都撤了" "$(ls -A "$TMP/junits5" "$TMP/jlib5" 2>/dev/null)"
+fi
+
 # ⑨ 卸载：disable --now + 删文件 + daemon-reload
 : >"$J_LOG"
 DSH_REMOTE_UNIT_DIR="$TMP/junits" "$remote" tunnel-uninstall >"$TMP/j9.out" 2>&1
 check "tunnel-uninstall 退出 0" "0" "$?"
 if [ ! -e "$TMP/junits/dsh-tunnel.service" ]; then ok "单元文件删掉了"; else bad "单元文件删掉了"; fi
+if [ ! -e "$TMP/junits/dsh-tunnel-watch.timer" ] && [ ! -e "$TMP/junits/dsh-tunnel-watch.service" ] \
+    && [ ! -e "$TMP/jlib/tunnel-watch.sh" ]; then
+    ok "自愈件也一起撤了（timer + service + 脚本）"
+else
+    bad "自愈件也一起撤了" "$(ls -A "$TMP/junits" "$TMP/jlib" 2>/dev/null)"
+fi
 jlg=$(cat "$J_LOG")
 check_contains "卸载：disable --now dsh-tunnel.service" "--user disable --now dsh-tunnel.service" "$jlg"
+check_contains "卸载：先停自愈 timer（不然它过 5 分钟又把隧道拉起来）" \
+    "--user disable --now dsh-tunnel-watch.timer" "$jlg"
 check_contains "卸载：daemon-reload" "--user daemon-reload" "$jlg"
 
 # ⑩ 旧名字 systemd：等价 --no-enable（以前就是"只生成不 enable"）；旧单元文件要一起撤

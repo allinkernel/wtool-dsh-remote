@@ -266,9 +266,20 @@ LEGACY_UNIT_NAME=dsh-remote-tunnel.service # 旧版 `dsh-remote systemd` 写的�
 SYSTEMCTL=${DSH_REMOTE_SYSTEMCTL:-systemctl}
 TMUX_BIN=${DSH_REMOTE_TMUX:-tmux}
 
+# ---- 内部件：隧道自愈检查（**不在 PATH 上、不是给用户敲的命令**；见 architecture.md §3.1.1）
+# 每 5 分钟看一眼云上的反向隧道口在不在听，不在就重启隧道。为什么放家里不放云上：
+# 见 docs/adr/0019（云上看不到"家里还有没有别的东西在跑"，也不该由云上按 ssh 进来重启）。
+WATCH_UNIT_NAME=dsh-tunnel-watch.service
+WATCH_TIMER_NAME=dsh-tunnel-watch.timer
+WATCH_SCRIPT_NAME=tunnel-watch.sh
+
 unit_dir() { printf '%s' "${DSH_REMOTE_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"; }
 unit_file() { printf '%s/%s' "$(unit_dir)" "$UNIT_NAME"; }
 legacy_unit_file() { printf '%s/%s' "$(unit_dir)" "$LEGACY_UNIT_NAME"; }
+lib_dir() { printf '%s' "${DSH_REMOTE_LIB_DIR:-$HOME/.local/lib/dsh-remote}"; }
+watch_script_file() { printf '%s/%s' "$(lib_dir)" "$WATCH_SCRIPT_NAME"; }
+watch_unit_file() { printf '%s/%s' "$(unit_dir)" "$WATCH_UNIT_NAME"; }
+watch_timer_file() { printf '%s/%s' "$(unit_dir)" "$WATCH_TIMER_NAME"; }
 
 # systemctl --user 靠 $XDG_RUNTIME_DIR 找用户总线。**非登录 shell 里它可能是空的**
 # （WSL / cron / 手工 sh 都会），那时报 "Failed to connect to bus"，而用户管理器其实活着。
@@ -306,8 +317,10 @@ sd_quote() {
     esac
 }
 
-unit_body() { # 用法：unit_body <RestartSec>；ExecStart 用 tunnel_conf 设好的全局量渲染
+unit_body() { # 用法：unit_body <RestartSec> <StartLimitBurst> <StartLimitIntervalSec>
     _sec=$1
+    _burst=$2
+    _interval=$3
     tunnel_conf
     _ssh=${DSH_REMOTE_SSH:-$(command -v ssh 2>/dev/null || printf '')}
     [ -n "$_ssh" ] || die "PATH 里没有 ssh（单元里的 ExecStart 必须写绝对路径）"
@@ -317,10 +330,14 @@ unit_body() { # 用法：unit_body <RestartSec>；ExecStart 用 tunnel_conf 设�
 [Unit]
 Description=DSH 反向隧道（手机远程接管家里这台机器）
 Documentation=file:$PROJ_DIR/README.md
-# 断了就无限重试：0 = 关掉"短时间失败太多次就判 failed"（默认 10s 内 5 次）。
-# ⚠️ 这个键属于 [Unit]；写在 [Service] 里 systemd 只警告 "Unknown key name" 然后忽略
+# 防风暴（2026-10-09 加，ADR-0019）：$_burst 次失败发生在 $_interval 秒内就**停下并标 failed**，
+# 不再无限锤对端。起因：对端持续掐连接时，RestartSec 小 + StartLimitIntervalSec=0 会
+# 自我维持成风暴（2026-10-08 实测 NRestarts 累计到 1708；hazards H27）。
+# 停了之后靠 dsh-tunnel-watch.timer（同目录，内部件）定时看一眼（默认 5 分钟），真断了才重启。
+# ⚠️ 这两个键属于 [Unit]；写在 [Service] 里 systemd 只警告 "Unknown key name" 然后忽略
 # （2026-10-07 被 systemd-analyze --user verify 抓出来，别搬回去）。
-StartLimitIntervalSec=0
+StartLimitIntervalSec=$_interval
+StartLimitBurst=$_burst
 
 [Service]
 Type=simple
@@ -335,6 +352,82 @@ SyslogIdentifier=dsh-tunnel
 
 [Install]
 WantedBy=default.target
+EOF
+}
+
+# ---- 内部件（自愈检查）的三个文件：脚本 + service + timer ------------------
+# 脚本由 timer 调；`WATCH_PORT` 只为自测留的覆盖口（拿一个假端口跑一遍，验"不在听 → 重启"）。
+# ssh 用 PATH 里的（systemd --user 的 oneshot 有正常 PATH）；systemctl 用渲染时那个值，
+# 这样测试能用桩把它接住（**真机上永远不该让测试去 restart 生产隧道**）。
+watch_script_body() {
+    tunnel_conf
+    _port=${remote_port_v:-18080}
+    _host_spec=$ssh_user@$host
+    _keyopt=
+    if [ -n "$identity_key" ]; then
+        _keyopt=" -i $identity_key"
+    fi
+    cat <<EOF
+#!/bin/sh
+# dsh-remote 内部件（**不在 PATH 上、不是给用户敲的命令**）：
+# 定时看一眼云上 127.0.0.1:${_port}（反向隧道口）在不在听；不在就重启隧道并记一行日志（周期见 timer）。
+# 由 $WATCH_TIMER_NAME 调。自测用 WATCH_PORT=<假端口> 跑一遍（那时应该 rc=1 并去重启一次）。
+# 为什么是"看一眼端口"而不是"看本地进程"：进程活着、端口也可能已经被对端掐掉了
+# （ExitOnForwardFailure 只管建立那一刻）—— 端口在不在听才是手机能不能用的判据。
+set -u
+HOST="${_host_spec}"
+PORT="\${WATCH_PORT:-${_port}}"
+SSH_PORT="${ssh_port}"
+probe() {
+    ssh -o BatchMode=yes -o IdentitiesOnly=yes${_keyopt} -p "\$SSH_PORT" -o ConnectTimeout=8 \\
+        -o StrictHostKeyChecking=accept-new "\$HOST" \\
+        "ss -ltn | grep -c '127.0.0.1:\$PORT'" 2>/dev/null || echo ERR
+}
+n=\$(probe)
+[ "\$n" = "1" ] && exit 0
+logger -t dsh-tunnel-watch "云上 127.0.0.1:\$PORT 不在听（probe='\$n'）→ 重启 $UNIT_NAME"
+$SYSTEMCTL --user restart $UNIT_NAME || true
+sleep 6
+n2=\$(probe)
+logger -t dsh-tunnel-watch "重启后 probe='\$n2'（1=已恢复）"
+[ "\$n2" = "1" ] || exit 1
+EOF
+}
+
+watch_unit_body() {
+    cat <<EOF
+[Unit]
+Description=DSH 隧道自愈检查（内部件，由 $WATCH_TIMER_NAME 调）
+Documentation=file:$PROJ_DIR/architecture.md
+
+[Service]
+Type=oneshot
+ExecStart=$(watch_script_file)
+EOF
+}
+
+watch_timer_body() { # 用法：watch_timer_body <秒>
+    _every=$1
+    # systemd 两种写法都认；整分钟就写 5min（跟人手写的一样好读），否则写 90s
+    if [ "$((_every % 60))" = 0 ]; then
+        _every_txt="$((_every / 60))min"
+        _every_zh="$((_every / 60)) 分钟"
+    else
+        _every_txt="${_every}s"
+        _every_zh="${_every} 秒"
+    fi
+    cat <<EOF
+[Unit]
+Description=每 ${_every_zh}检查一次 DSH 反向隧道口
+Documentation=file:$PROJ_DIR/architecture.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=$_every_txt
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -381,7 +474,11 @@ unit_enable() {
 }
 
 cmd_tunnel_install() {
-    _sec=3
+    _sec=5                 # 2026-10-09 起默认 5（原来是 3）：给对端一点喘息，别 3 秒一锤
+    _burst=10              # 防风暴：StartLimitBurst / StartLimitIntervalSec（见 hazards H27）
+    _interval=300
+    _watch=1               # 顺带装内部件（自愈 timer）；--no-watch 关掉
+    _watch_sec=300
     _rp=
     _lp=
     _new_user=
@@ -393,6 +490,22 @@ cmd_tunnel_install() {
         --restart-sec)
             _sec=${2:-}
             shift 2
+            ;;
+        --start-limit-burst)
+            _burst=${2:-}
+            shift 2
+            ;;
+        --start-limit-interval)
+            _interval=${2:-}
+            shift 2
+            ;;
+        --watch-sec)
+            _watch_sec=${2:-}
+            shift 2
+            ;;
+        --no-watch)
+            _watch=0
+            shift
             ;;
         --remote-port)
             _rp=${2:-}
@@ -423,6 +536,12 @@ cmd_tunnel_install() {
     done
     case $_sec in '' | *[!0-9]*) die "--restart-sec 要正整数（秒）：$_sec" ;; esac
     [ "$_sec" -ge 1 ] || die "--restart-sec 至少 1 秒"
+    case $_burst in '' | *[!0-9]*) die "--start-limit-burst 要正整数（次）：$_burst" ;; esac
+    [ "$_burst" -ge 1 ] || die "--start-limit-burst 至少 1 次"
+    case $_interval in '' | *[!0-9]*) die "--start-limit-interval 要正整数（秒）：$_interval" ;; esac
+    [ "$_interval" -ge 1 ] || die "--start-limit-interval 至少 1 秒"
+    case $_watch_sec in '' | *[!0-9]*) die "--watch-sec 要正整数（秒）：$_watch_sec" ;; esac
+    [ "$_watch_sec" -ge 30 ] || die "--watch-sec 至少 30 秒（再密就是拿 ssh 打对端了）"
 
     tunnel_conf
     [ -n "$_rp" ] && remote_port_v=$_rp
@@ -435,7 +554,7 @@ cmd_tunnel_install() {
     uf=$(unit_file)
     say "常驻隧道  云上 127.0.0.1:${remote_port_v} → 家里 127.0.0.1:${local_port_v}"
     say "登录      ${ssh_user}@${host}:${ssh_port}$([ -n "$identity_key" ] && printf '（-i %s）' "$identity_key")"
-    say "单元      $uf（Restart=always，RestartSec=${_sec}s）"
+    say "单元      $uf（Restart=always，RestartSec=${_sec}s，${_interval}s 内失败 ${_burst} 次就停下）"
     say ""
 
     # 0) 先探 systemd --user：必须在停掉旧隧道**之前**探，装不上就别把正在跑的弄没了
@@ -477,7 +596,7 @@ cmd_tunnel_install() {
 
     # 2) 渲染 → 落盘（内容一样就不动文件，幂等；不一样先备份）
     _tmp=$(mktemp) || die "mktemp 失败"
-    unit_body "$_sec" >"$_tmp" || {
+    unit_body "$_sec" "$_burst" "$_interval" >"$_tmp" || {
         rm -f -- "$_tmp"
         die "渲染单元失败"
     }
@@ -485,10 +604,19 @@ cmd_tunnel_install() {
         say "== --dry-run：单元内容如下（一个字节都没写）"
         cat -- "$_tmp"
         rm -f -- "$_tmp"
+        if [ "$_watch" = 1 ]; then
+            say ""
+            say "== 内部件（自愈检查）也会写这三个（--no-watch 可关掉；**不是给用户敲的命令**）"
+            say "  $(watch_script_file)（0755）"
+            say "  $(watch_unit_file)"
+            say "  $(watch_timer_file)   # 每 ${_watch_sec}s 跑一次"
+            _wtmp=$(mktemp) && watch_script_body >"$_wtmp" && { say ""; cat -- "$_wtmp"; rm -f -- "$_wtmp"; }
+        fi
         say ""
         say "真跑时会执行："
         say "  $SYSTEMCTL --user daemon-reload"
         say "  $SYSTEMCTL --user enable --now $UNIT_NAME"
+        [ "$_watch" = 1 ] && say "  $SYSTEMCTL --user enable --now $WATCH_TIMER_NAME"
         return 0
     fi
     _changed=1
@@ -498,10 +626,45 @@ cmd_tunnel_install() {
     fi
     rm -f -- "$_tmp"
 
+    # 2b) 内部件：自愈检查的脚本 + service + timer（**不在 PATH 上、不是给用户敲的命令**）
+    _wtimer_changed=1
+    if [ "$_watch" = 1 ]; then
+        wsf=$(watch_script_file)
+        wuf=$(watch_unit_file)
+        wtf=$(watch_timer_file)
+        if [ "$_no_enable" = 1 ]; then
+            say "内部件      自愈检查：$wsf + $wuf + $wtf（--no-enable：先不 enable）"
+        else
+            say "内部件      自愈检查：每 ${_watch_sec}s 看一眼隧道口（$WATCH_TIMER_NAME）"
+        fi
+        _tmp=$(mktemp) || die "mktemp 失败"
+        watch_script_body >"$_tmp" || {
+            rm -f -- "$_tmp"
+            die "渲染自愈脚本失败"
+        }
+        unit_write "$wsf" "$_tmp" >/dev/null || true
+        chmod 0755 -- "$wsf" || die "chmod $wsf 失败"
+        _tmp=$(mktemp) || die "mktemp 失败"
+        watch_unit_body >"$_tmp" || {
+            rm -f -- "$_tmp"
+            die "渲染自愈单元失败"
+        }
+        unit_write "$wuf" "$_tmp" >/dev/null || true
+        _tmp=$(mktemp) || die "mktemp 失败"
+        watch_timer_body "$_watch_sec" >"$_tmp" || {
+            rm -f -- "$_tmp"
+            die "渲染自愈 timer 失败"
+        }
+        if unit_write "$wtf" "$_tmp"; then
+            _wtimer_changed=0
+        fi
+    fi
+
     if [ "$_no_enable" = 1 ]; then
         say ""
         say "--no-enable：只写了单元，没 daemon-reload / enable / start。自己来："
         say "  systemctl --user daemon-reload && systemctl --user enable --now $UNIT_NAME"
+        [ "$_watch" = 1 ] && say "  systemctl --user enable --now $WATCH_TIMER_NAME"
         return 0
     fi
 
@@ -509,6 +672,11 @@ cmd_tunnel_install() {
     say "== daemon-reload + enable --now $UNIT_NAME"
     _nr_before=$(systemctl_user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || printf '')
     unit_enable "$UNIT_NAME" "$_changed" || return 1
+    if [ "$_watch" = 1 ]; then
+        # 自愈 timer：它只是"每 5 分钟看一眼"，enable 失败不该把隧道那条算失败
+        say "== enable --now $WATCH_TIMER_NAME（内部件）"
+        unit_enable "$WATCH_TIMER_NAME" "$_wtimer_changed" || warn "自愈 timer 没 enable 上（隧道本身不受影响）"
+    fi
 
     # 3) 起来之后**停 3 秒再看一遍**：Type=simple 的 active 只说明进程被 fork 出来了；
     #    认证失败 / 端口被占的 ssh 会立刻退，光看 is-active 看不出来 —— 要看 NRestarts。
@@ -532,6 +700,10 @@ cmd_tunnel_install() {
     say "公网      curl -sk https://<public_url 的 host:port>/   # 不带密码应 401（basic auth 在挡）"
     say "一键体检  dsh-remote tunnel-status --probe"
     say "断线自测  kill ${_pid_txt} → 过几秒 systemctl --user is-active $UNIT_NAME 应回 active"
+    if [ "$_watch" = 1 ]; then
+        say "内部件    $WATCH_TIMER_NAME 每 5 分钟看一眼云上那个口（不在听才重启；看它："
+        say "          systemctl --user list-timers $WATCH_TIMER_NAME；日志：journalctl -t dsh-tunnel-watch）"
+    fi
     say "linger    Linger=$_lg"
     [ "$_lg" = yes ] || say "          登录会话一结束服务就停 → loginctl enable-linger $_me"
 
@@ -545,7 +717,8 @@ cmd_tunnel_install() {
             warn "⚠️ 这次起来之后它已经在重启了（NRestarts $_nr_before → $_nr）："
             warn "   多半是云上 ${remote_port_v} 被别的隧道占着"
             warn "   （ExitOnForwardFailure=yes 让 ssh 秒退 → Restart=always 无限重试，hazards H14），"
-            warn "   或者登录 / 密钥不对（auth 失败也是 3 秒一次地重试，不会自己停下 —— H16）。最近几行："
+            warn "   或者登录 / 密钥不对（auth 失败也会一次次重试 —— H16）。"
+            warn "   ${_interval}s 内失败 ${_burst} 次它会自己停下（H27），之后等自愈 timer 来看。最近几行："
             systemctl_user --no-pager -l status "$UNIT_NAME" 2>&1 | tail -n 12 >&2 || true
         fi
     fi
@@ -564,8 +737,12 @@ cmd_tunnel_uninstall() {
     done
     uf=$(unit_file)
     lf=$(legacy_unit_file)
+    wsf=$(watch_script_file)
+    wuf=$(watch_unit_file)
+    wtf=$(watch_timer_file)
     say "撤销单元  $uf"
     [ -f "$lf" ] && say "          $lf（旧版生成的，一起撤）"
+    say "内部件    $wuf + $wtf + $wsf（自愈检查，一起撤）"
     if [ "$_dry" = 1 ]; then
         say "（--dry-run：会 disable --now、删单元文件、daemon-reload；一个字节都没动）"
         return 0
@@ -573,6 +750,9 @@ cmd_tunnel_uninstall() {
     if systemd_user_ok; then
         systemctl_user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
         [ -f "$lf" ] && systemctl_user disable --now "$LEGACY_UNIT_NAME" >/dev/null 2>&1
+        # 自愈 timer 要先停：它每 5 分钟会 restart 一次隧道，不停就把刚停掉的又拉起来
+        [ -f "$wtf" ] && systemctl_user disable --now "$WATCH_TIMER_NAME" >/dev/null 2>&1
+        [ -f "$wuf" ] && systemctl_user disable --now "$WATCH_UNIT_NAME" >/dev/null 2>&1
         systemctl_user daemon-reload >/dev/null 2>&1 || true
         say "已 disable --now（服务停了、开机不再自启）"
     else
@@ -582,6 +762,11 @@ cmd_tunnel_uninstall() {
     if [ -f "$lf" ]; then
         rm -f -- "$lf" && say "已删 $lf"
     fi
+    [ -f "$wuf" ] && rm -f -- "$wuf" && say "已删 $wuf"
+    [ -f "$wtf" ] && rm -f -- "$wtf" && say "已删 $wtf"
+    [ -f "$wsf" ] && rm -f -- "$wsf" && say "已删 $wsf"
+    # 目录只在空的时候删（里面可能有别的东西；空目录也说明我们撤干净了）
+    rmdir -- "$(dirname -- "$wsf")" 2>/dev/null || true
     say "想临时跑前台隧道：dsh-remote tunnel"
 }
 
