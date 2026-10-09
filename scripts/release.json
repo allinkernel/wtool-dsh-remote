@@ -2,11 +2,11 @@
   "schema": 1,
   "project": "tools/dsh-remote",
   "repo": "allinkernel/wtool-dsh-remote",
-  "tag": "ds_dev-2026-10-07",
-  "base_url": "https://github.com/allinkernel/wtool-dsh-remote/releases/download/ds_dev-2026-10-07",
-  "commit": "603d1c9c2cf5a5827e814e3b826521fe553f921c",
-  "packed_at": "2026-10-08T01:05:11+0800",
-  "published_at": "2026-10-08T01:07:44+08:00",
+  "tag": "ds_dev-2026-10-09",
+  "base_url": "https://github.com/allinkernel/wtool-dsh-remote/releases/download/ds_dev-2026-10-09",
+  "commit": "90a65a71adf28f6a852ebb572446304f61e6adc2",
+  "packed_at": "2026-10-09T15:32:07+0800",
+  "published_at": "2026-10-09T15:36:10+08:00",
   "wtool_engine": "1.0.0",
   "dirty": false,
   "volume_size": "32M",
@@ -20,33 +20,21 @@
     {
       "name": "dist.json",
       "role": "",
-      "bytes": 932,
-      "sha256": "3f4698193d2c997b4d855fdcb1559ad448ad9446d974162e80f7074b878634d1"
+      "bytes": 868,
+      "sha256": "829adb141d1925aee6094aa79caefbf52c00915a559c0cd4efbd2c6b47b64e54"
     },
     {
-      "name": "release-hash.txt",
-      "role": "",
-      "bytes": 78,
-      "sha256": "cdce6f602a8dac51427c459b4b46e4af34e238c583dc686eea5d4b7f6850da5c"
-    },
-    {
-      "name": "release.zip",
-      "role": "release",
-      "bytes": 8850,
-      "sha256": "0e4d51dd58eb842d6ad03be6ad92a8513d9151a8e4452ca35d1467689b4eaaaf"
-    },
-    {
-      "name": "源码-hash.txt",
+      "name": "source-hash.txt",
       "role": "",
       "bytes": 77,
-      "sha256": "a7391fb7d28ba7d01dd87899b0b0be64d518ae1f0eeea859d4bbb20f8d8da10a"
+      "sha256": "56e130f53045d3d2305225dde947e09dc5e6a3e1d08ec49fe3bb08493fd9af44"
     },
     {
-      "name": "源码.zip",
+      "name": "source.zip",
       "role": "source",
-      "bytes": 250097,
-      "sha256": "ec3dfccd0e1baacedc739da09121c31bd8bb7896347c9fc4402116a1428a7860"
+      "bytes": 287932,
+      "sha256": "ce9aa6d5a90ca481b6393da4697e3652f52d1cb7c74ab8e4549b48bbc8eef544"
     }
   ],
-  "how": "wtool download-release tools/dsh-remote   # 下到项目的 __release/（按本文件的 sha256 校验）\nwtool unpack-release tools/dsh-remote     # 拼分卷 + 解到 __output/\nwtool install tools/dsh-remote            # 装到本机"
+  "how": "wtool download-release tools/dsh-remote   # 下到项目的 __release/（按本文件的 sha256 校验）\nwtool unpack-release tools/dsh-remote     # 拼分卷 + 把源码铺回项目目录\nwtool install tools/dsh-remote            # 装到本机"
 }
