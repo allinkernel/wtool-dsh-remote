@@ -575,3 +575,91 @@ SVG `width/height=1036`、`viewBox="0 0 37 37"`。测试 L 节 +5 条（尺寸/�
 
 **没验 / 风险**：1708 那次风暴没有复现（只量了修完的状态）；"timer 在真机上自己触发并恢复"
 仍是上一轮 13:39 那次的观察；自愈脚本用 `PATH` 里的 `ssh`（systemd oneshot 有正常 `PATH`）。
+
+---
+
+## 2026-10-09（第 24 轮）`harness` 输出"状态 + 原因" + `dsh-web-run` 默认清空代理（U17）
+
+**用户要求（原话）**：`harness` "打印的废话太多"，要"**明确地指出：dsh 服务到底起来没有；
+没起来的原因是什么（是后台 systemd 已经自动起来了？还是一直在等待远端？）"；
+外加"把我之前答应的一处加固一起做掉"（= 任务 ②：坏代理把常驻服务卡死）。
+
+**做了什么**
+
+1. **`env.zsh` / `env.bash`（逐字等价，只差第 1 行标题）**：`harness` 重做成
+   **状态行 + 原因行 + 判据命令**（ADR-0020），正常 2–5 行：
+   - ① 端口有人听 → 复用；再判"是不是 systemd 那个单元在服务"
+     （`MainPID` 比对 **+** `/proc/<pid>/cgroup` 里有 `dsh-web.service`）；
+     不是、且单元在 `activating/failed` → `没起来 ✗ 原因：<端口> 被另一个实例占着（PID …，不是 systemd 管的）`
+     + 接管办法 + `systemd: activating/auto-restart（已重试 N 次，每 30s 一次）`。
+   - ② 没人在听但有单元 → 先打 `等 systemd 写出地址（最多 20s）…`，`start --no-block`，
+     逐秒等；成功判据 = `web-url.txt` **这次刚写的**（比起点标记新**或**内容变了）+
+     端口真在听；等不到就按**实测**三选一报因：端口被别人占 / 单元 `failed`
+     （exit code + `journalctl -o cat -n 1` 最后一行**原文**）/ 还在 `activating` 或 `inactive`
+     （附 `systemd=<实测状态>` + 判据命令）。
+   - ③ 没有单元（或 `DSH_REMOTE_HARNESS_NO_REUSE=1`）→ 前台老行为不变，先打一行说明走哪条路。
+   - 新增 9 个**只读**探测 `_hr_*`（`ss -ltnp` 拿 PID、`systemctl --user show` 拿状态/重试/退出码、
+     `journalctl -o cat -n 1`、拿真请求探 token、`-nt`/内容双判据的 `_hr_url_fresh`）；
+     新环境变量 `DSH_REMOTE_HARNESS_WAIT`（等待上限，默认 20，测试用）。
+2. **`bin/dsh-web-run`**：起 npx 前默认 `unset` 六个代理变量（保留 `no_proxy`/`NO_PROXY`），
+   `remote.conf` 的 `web_proxy=` 或 `DSH_REMOTE_WEB_PROXY`（优先）可显式指定；
+   日志打一行 `代理: 已清空（…）/ =<值>（来自 …）`（ADR-0021、hazards H28）。
+   `remote.conf.example` 加 `web_proxy=` 一条（含为什么默认清空）。
+3. **测试**：O 节从 20 → **108 条** —— 四态 + "刚被拉起" + "等超时"（`systemctl`/`journalctl` 桩 +
+   真回环监听，**bash/zsh 各跑一遍同一张表**），加 ⑦ 代理三条路（桩 npx dump **子进程**的
+   `env | grep -i proxy` 对账）。文件头覆盖说明同步改。
+4. **文档**：ADR-0020 / ADR-0021（+ 索引两行）、hazards **H28**、
+   `architecture.md` §3.5 重写（§3.5.1 输出契约表 + §3.5.2 代理策略 + 现状判据）、
+   文件表/测试表/状态文件表、`BACKLOG.md` U17 ✅（U15 那条注明"①已经做到"）、
+   `README.md`（harness 段 + 测试条数 199/468 → 556）、`AGENTS.md`（测试条数）。
+
+**验证**
+
+- **真机（只读，本机现状就是"端口被非 systemd 实例占"那一态）**：
+  `bash -c '. env.bash; harness'` →
+  `dsh web 没起来 ✗ 原因：3080 被另一个实例占着（PID 152050，不是 systemd 管的）` +
+  `现在能用的还是那个实例：http://127.0.0.1:3080/（token 没记下或实测已失效）` +
+  `→ 让它接管：…` + `systemd: activating/auto-restart（已重试 98 次，每 30s 一次）` + 手机地址。
+  其中：`ss -ltnp` 的 PID、`systemctl --user show -p SubState/NRestarts`、
+  `is-active`、旧 token 实测 **401**（`curl`）都是当场读的；
+  **没有动用户正在跑的那个实例**（只读 + 只删自己的两个标记文件）。
+- **四态离线**：`sh tests/run_tests.sh` → **556 通过 0 失败**（跑 3 次稳定；
+  其中一次带 `-v`），O 节 108 条里含四态 × 两 shell、`态②`断言"原因是实测 PID"、
+  `态②b`断言"token 实测有效才打出来"、`态⑥`断言"旧 `web-url.txt` 不许冒充刚起来"。
+- **代理**：桩环境里带六个坏代理变量 → 子进程 `env | grep -i proxy` 里六个都没了、
+  `no_proxy`/`NO_PROXY` 还在；`web_proxy=` 与 `DSH_REMOTE_WEB_PROXY`（覆盖）两条路都对；
+  **真机**：`dsh-web.service` 下一次重试的 journal 里出现
+  `[dsh-web-run] 代理: 已清空（…；no_proxy 保留：没设）`。
+- **踩到并修掉的一个假阴性**：一开始用 `test -nt` 判"`web-url.txt` 是不是刚写的"，
+  测试里时好时坏 —— 同一毫秒内写两个文件时 mtime **一模一样**（文件时间戳用粗粒度时钟），
+  `-nt` 为假。改成"比标记新 **或** 内容变了"之后连跑三次都稳（这个坑写进了
+  ADR-0020 与 `architecture.md` §3.5.1）。
+
+**没验 / 风险**
+
+- 坏代理的**现场**没有复现（要动用户正在用的机器：开机注入 + 重启用户管理器）；
+- 四态里只有"端口被非 systemd 实例占"是**真机**实测，另外三态在桩里跑
+  （真去制造 `failed` / 卸单元要走 `systemctl`，越权）；
+- `ss -ltnp` 看不到别人进程属主时会退化成"PID 拿不到"（代码里是显式降级，真机没遇到）；
+- 前台 `harness` 那条**故意不碰代理**（用户自己的会话，ADR-0021 决定 4）。
+
+**补记（同一天 21:17，只读复核）**：再跑一次真机 `harness` 时，第二行变成了
+`现在能用的还是那个实例：http://127.0.0.1:3080/?token=…（token 实测有效）` ——
+因为状态目录里 `current-token.txt` 的 mtime 已经是 **21:12:39**（不是原先那个 10-07 的旧值），
+文件里那个 token 用真请求探**有效**。**我这次观察到它被重写过、没定位到是谁写的**
+（不是本轮的读操作：`harness` 的复用分支一个字节都不写）。
+这件事顺带说明"探一次 token"这条判据是有用的：文件变没变、里面的值还灵不灵，
+输出跟着实测走，不会拿旧值骗人。
+（另记一条**既有的**锐边：`harness` 每次启动都会 `rm -f .harness-wrote-token`，
+所以**同时**在另一个终端跑着的 `harness` 退出时就不再删它自己写的 token 文件 ——
+这是旧行为、本轮没改；broker 会 302 到一个死 token，等下次 harness 起来才恢复。）
+
+**并行改动（同仓另一个代理的在制品，**不是**本轮）**：提交前工作树里还有
+`bin/dsh-remote`（+601 行）、`bin/dsh-token-broker`（+420 行）、`scripts/install.sh`
+（命令列表加了第 5 条 `dsh-force-restart-dsh-remote`）以及未跟踪的
+`bin/dsh-force-restart-dsh-remote`。在这份**混着别人未提交改动**的工作树里跑
+`sh tests/run_tests.sh` 会红 2 条 —— I 节两句硬编码的"有 N 条源没找到"
+（命令多了一条，6/5 变成 7/6），**与本轮改动无关**。
+本轮的数是这样量出来的：把工作树拷到临时目录、把那三个文件还原成 `HEAD`、
+删掉那个未跟踪命令（= "HEAD + 本轮改动"），再跑一次 → **556 通过 0 失败**。
+提交用 pathspec 只提交本轮的文件。

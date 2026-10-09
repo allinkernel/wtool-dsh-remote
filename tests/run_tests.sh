@@ -39,7 +39,11 @@
 #   L 二维码（矩阵对账 / PNG / SVG / 终端画）
 #   M server（一条命令装好：自检失败指引、--dry-run 不写、部署失败不能吞）
 #   N passwd（改密码：只换那一行哈希、只 restart、新密码 302 旧密码 401）
-#   O dsh web 常驻 + harness 复用（单元渲染 / 复用分支 / 逃生阀）
+#   O dsh web 常驻 + harness 四态（单元渲染 / 端口被占不抢 / 逃生阀 /
+#     **harness 的输出契约**：状态行 + 原因行 + 判据命令，四态各一条
+#     —— 服务在跑 / 端口被非 systemd 实例占 / 服务 failed / 没有服务走前台，
+#     外加"刚被 systemd 拉起""等超时"；**dsh-web-run 的代理处理**：
+#     桩 npx 把子进程的 `env | grep -i proxy` dump 出来对账，日志那行也要对）
 #
 # 要 docker 的两条在 tests/ 下单独放：caddy-validate.sh（3 条）、relay-e2e.sh（9 条）。
 # 它们**没有 docker 时 exit 77**（跳过码）—— 别把 77 当通过（H8）。
@@ -1615,7 +1619,7 @@ check_contains "拒绝时说清为什么（单引号）" "别用单引号" "$(ca
 check_contains "help 里有 passwd" "dsh-remote passwd" "$("$remote" help)"
 
 # ------------------------------------------------- O dsh web 常驻 + harness 复用
-printf 'O. dsh web 常驻：单元渲染 / 端口被占不抢 / harness 复用\n'
+printf 'O. dsh web 常驻：单元渲染 / 端口被占不抢 / harness 四态输出契约 / 代理\n'
 
 # ① serve-install --dry-run 的单元内容（一个字节都不写）
 "$remote" serve-install --dry-run >"$TMP/o1.out" 2>&1
@@ -1663,24 +1667,189 @@ check_contains "提示不去抢端口" "已经有会话在跑" "$(cat "$TMP/o3.o
 kill "$opid" 2>/dev/null || true
 wait "$opid" 2>/dev/null || true
 
-# ④ harness 复用分支：真监听一个端口 → 必须"复用"，不起第二个会话
-python3 -c 'import socket,time
+# ④ harness 的输出契约（2026-10-09 用户要求）：**四态**都要"一眼看出来起没起来 + 为什么"，
+#    第一行永远是"状态 + 原因"，不许"交给常驻服务…"然后沉默等待（ADR-0020）。
+#    两份 env 用**同一张表**跑（zsh 没装就 skip —— 项目规矩：两份必须逐字等价）。
+#    态① 服务在跑（systemd 托管）／态② 端口被非 systemd 实例占（服务 activating）／
+#    态③ 服务 failed／态④ 没有服务 → 走前台；外加"刚被 systemd 拉起""等超时"两条。
+hstub="$TMP/hstub"
+mkdir -p "$hstub"
+cat >"$hstub/systemctl" <<'STUB'
+#!/bin/sh
+case "$*" in
+*"cat dsh-web.service"*) [ "${H_HAVE_UNIT:-1}" = 1 ] && exit 0 || exit 1 ;;
+*is-active*) printf '%s\n' "${H_ACTIVE:-active}"; [ "${H_ACTIVE:-active}" = active ] && exit 0; exit 3 ;;
+*"-p MainPID"*) printf '%s\n' "${H_MAINPID:-0}" ;;
+*"-p SubState"*) printf '%s\n' "${H_SUBSTATE:-running}" ;;
+*"-p NRestarts"*) printf '%s\n' "${H_NRESTARTS:-0}" ;;
+*"-p RestartUSec"*) printf '%s\n' "${H_RESTARTUSEC:-30s}" ;;
+*"-p ExecMainStatus"*) printf '%s\n' "${H_EXECSTATUS:-0}" ;;
+*"start --no-block dsh-web.service"*)
+    [ -n "${H_START_URL:-}" ] && printf '%s\n' "$H_START_URL" >"$H_STATE/web-url.txt"
+    if [ -n "${H_START_LISTEN:-}" ]; then
+        python3 -c "import socket,time
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(("127.0.0.1",3997)); s.listen(1); time.sleep(25)' &
-hpid=$!
-sleep 1
-mkdir -p "$TMP/oconf2"
-printf 'local_port=3997\npublic_url=https://example.invalid:8443\n' >"$TMP/oconf2/remote.conf"
-printf 'OTOK2\n' >"$os/dsh-remote/current-token.txt"
-DSH_REMOTE_CONF_DIR="$TMP/oconf2" XDG_STATE_HOME="$os" \
-    sh -c '. "$1/env.bash"; harness' sh "$proj" >"$TMP/o4.out" 2>&1
-check "harness 复用分支退出码 0" "0" "$?"
-check_contains "明说是复用" "复用，没开新的" "$(cat "$TMP/o4.out")"
-check_contains "给出带 token 的本地地址" "token=OTOK2" "$(cat "$TMP/o4.out")"
-check_contains "给出手机固定地址" "example.invalid:8443" "$(cat "$TMP/o4.out")"
-check_contains "提示 serve-install" "serve-install" "$(cat "$TMP/o4.out")"
-kill "$hpid" 2>/dev/null || true
-wait "$hpid" 2>/dev/null || true
+s.bind(('127.0.0.1',$H_START_LISTEN)); s.listen(1); time.sleep(20)" >/dev/null 2>&1 &
+        printf '%s\n' "$!" >"$H_STATE/.h-stub-listen.pid"
+    fi
+    exit 0 ;;
+esac
+exit 0
+STUB
+cat >"$hstub/journalctl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "${H_JOURNAL:-（桩 journal 没有内容）}"
+STUB
+cat >"$hstub/npx" <<'STUB'
+#!/bin/sh
+printf 'dsh web: http://127.0.0.1:3982/?token=HTOK (LAN: http://10.0.0.9:3982)\n'
+STUB
+chmod +x "$hstub/systemctl" "$hstub/journalctl" "$hstub/npx"
+
+hrun() { # hrun <shell> <状态目录> <配置目录> [KEY=VAL…] → 输出落 $TMP/o-hr-<shell>.out
+    _sh=$1
+    _hs=$2
+    _hc=$3
+    shift 3
+    env "$@" DSH_REMOTE_STATE_DIR="$_hs" DSH_REMOTE_CONF_DIR="$_hc" \
+        PATH="$hstub:$PATH" "$_sh" -c ". '$proj/env.$_sh'; harness" >"$TMP/o-hr-$_sh.out" 2>&1
+}
+listen_on() { # 真监听一个端口（拿真 PID 给 ss -ltnp / cgroup 判）
+    python3 -c "import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',$1)); s.listen(1); time.sleep(20)" >/dev/null 2>&1 &
+    printf '%s' "$!"
+}
+http_tok() { # <port> <token>：带对 token → 303，别的 → 401（验 harness 的 token 实测那条）
+    python3 -c "import http.server,sys
+port=int(sys.argv[1]); tok=sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(303 if tok in self.path else 401)
+        self.send_header('Content-Length','0'); self.end_headers()
+    def log_message(self,*a): pass
+http.server.HTTPServer(('127.0.0.1',port),H).serve_forever()" "$1" "$2" >/dev/null 2>&1 &
+    printf '%s' "$!"
+}
+hr_states() {
+    _sh=$1
+    _hs=$TMP/o-hstate
+    _hc=$TMP/o-hconf
+    mkdir -p "$_hs" "$_hc"
+
+    # 态① 服务在跑：端口上那个 PID 就是单元的 MainPID
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3984\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    _lp=$(listen_on 3984)
+    sleep 1
+    printf 'http://127.0.0.1:3984/?token=MTOK\n' >"$_hs/web-url.txt"
+    printf 'MTOK\n' >"$_hs/current-token.txt"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=active H_MAINPID="$_lp" H_SUBSTATE=running
+    check "$_sh 态①：退出码 0" "0" "$?"
+    check_contains "$_sh 态①：状态行「已在跑 ✓」" "已在跑 ✓" "$(cat "$TMP/o-hr-$_sh.out")"
+    check_contains "$_sh 态①：说清是 systemd 托管" "dsh-web.service 托管" "$(cat "$TMP/o-hr-$_sh.out")"
+    check_contains "$_sh 态①：给出带 token 的地址" "token=MTOK" "$(cat "$TMP/o-hr-$_sh.out")"
+    check_contains "$_sh 态①：给出手机固定地址" "example.invalid:8443" "$(cat "$TMP/o-hr-$_sh.out")"
+    check "$_sh 态①：行数 ≤ 3（不废话）" "yes" \
+        "$([ "$(wc -l <"$TMP/o-hr-$_sh.out")" -le 3 ] && echo yes || echo no)"
+    kill "$_lp" 2>/dev/null || true
+
+    # 态② 端口被非 systemd 实例占着，而服务在 activating（本机现状就是这样）
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3983\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    _lp=$(listen_on 3983)
+    sleep 1
+    printf 'STALE-TOK\n' >"$_hs/current-token.txt"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=activating H_MAINPID=0 H_SUBSTATE=auto-restart \
+        H_NRESTARTS=84 H_RESTARTUSEC=30s
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check "$_sh 态②：退出码 0（地址还能用，只是不是 systemd 的）" "0" "$?"
+    check_contains "$_sh 态②：状态行「没起来 ✗ 原因：」" "没起来 ✗ 原因：" "$_out"
+    check_contains "$_sh 态②：原因 = 端口被另一个实例占着" "被另一个实例占着" "$_out"
+    check_contains "$_sh 态②：原因里点明「不是 systemd 管的」" "不是 systemd 管的" "$_out"
+    case $_out in
+    *"PID $_lp"*) ok "$_sh 态②：原因是**实测的 PID**（ss -ltnp 那个）" ;;
+    *) bad "$_sh 态②：原因是**实测的 PID**（ss -ltnp 那个）" "输出里没有 PID $_lp：$_out" ;;
+    esac
+    check_contains "$_sh 态②：给出怎么让它接管" "DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的" "$_out"
+    check_contains "$_sh 态②：systemd 那几个实测值（activating/auto-restart）" "activating/auto-restart" "$_out"
+    check_contains "$_sh 态②：带上重试次数（NRestarts）" "已重试 84 次" "$_out"
+    check_contains "$_sh 态②：给出看日志的命令" "journalctl --user -u dsh-web.service -n 20" "$_out"
+    check_contains "$_sh 态②：手机固定地址照样打" "example.invalid:8443" "$_out"
+    check_not_contains "$_sh 态②：失效的 token 不能当成可用地址打出去" "token=STALE-TOK" "$_out"
+    check "$_sh 态②：行数 ≤ 5（不废话）" "yes" \
+        "$([ "$(wc -l <"$TMP/o-hr-$_sh.out")" -le 5 ] && echo yes || echo no)"
+
+    # 态②b 同一个端口，但 token 拿真请求验过是有效的 → 必须给出来
+    kill "$_lp" 2>/dev/null || true
+    sleep 1
+    _hp=$(http_tok 3983 TOKOK)
+    sleep 1
+    printf 'TOKOK\n' >"$_hs/current-token.txt"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=activating H_MAINPID=0 H_SUBSTATE=auto-restart H_NRESTARTS=84
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态②b：token 实测有效 → 打出来" "token=TOKOK" "$_out"
+    check_contains "$_sh 态②b：并说明是实测的" "token 实测有效" "$_out"
+    kill "$_hp" 2>/dev/null || true
+
+    # 态③ 服务 failed：原因 = exit code + journal 最后一行原文
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3982\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=failed H_SUBSTATE=failed H_NRESTARTS=84 H_EXECSTATUS=1 \
+        H_JOURNAL="dsh-web.service: Failed with result 'exit-code'." DSH_REMOTE_HARNESS_WAIT=2
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态③：先明说在等（有限、有秒数）" "等 systemd 写出地址（最多 2s）" "$_out"
+    check_contains "$_sh 态③：状态行「没起来 ✗ 原因：」" "没起来 ✗ 原因：" "$_out"
+    check_contains "$_sh 态③：原因 = 服务失败 + exit 1" "dsh-web.service 失败（exit 1）" "$_out"
+    check_contains "$_sh 态③：附 journal 最后一行**原文**" "日志最后一行：dsh-web.service: Failed with result 'exit-code'." "$_out"
+    check_contains "$_sh 态③：给出看日志的命令" "看：journalctl --user -u dsh-web.service -n 20" "$_out"
+
+    # 态④ 没有服务 → 走前台（老行为不变：抓 token、退出时清掉）
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3982\n' >"$_hc/remote.conf"
+    hrun "$_sh" "$_hs" "$_hc" H_HAVE_UNIT=0
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check "$_sh 态④：退出码 0" "0" "$?"
+    check_contains "$_sh 态④：说清没有服务、走前台" "没有 dsh-web.service" "$_out"
+    check_contains "$_sh 态④：前台照样抓到 token" "已捕获 token" "$_out"
+    check_contains "$_sh 态④：前台退出时清掉自己写的那份 token（broker 回 503）" "token 文件已清掉" "$_out"
+    check "$_sh 态④：退出后 token 文件不在" "yes" \
+        "$([ -s "$_hs/current-token.txt" ] && echo no || echo yes)"
+
+    # 态⑤ 没人在听 → 交给 systemd，start 后真写出地址 → 成功结论行
+    rm -f "$_hs/current-token.txt" "$_hs/web-url.txt"
+    printf 'local_port=3981\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    hrun "$_sh" "$_hs" "$_hc" H_STATE="$_hs" H_ACTIVE=active H_SUBSTATE=running H_MAINPID=4242 \
+        H_START_LISTEN=3981 H_START_URL='http://127.0.0.1:3981/?token=FRESH-TOK' \
+        DSH_REMOTE_HARNESS_WAIT=5
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态⑤：先明说在等（有限、有秒数）" "等 systemd 写出地址（最多 5s）" "$_out"
+    check_contains "$_sh 态⑤：结论行「已由 systemd 拉起 ✓」" "已由 systemd 拉起 ✓" "$_out"
+    check_contains "$_sh 态⑤：给出它写出来的地址" "token=FRESH-TOK" "$_out"
+    check_contains "$_sh 态⑤：给出手机固定地址" "example.invalid:8443" "$_out"
+    # 桩 start 起的那个监听器要收掉，否则下一个 shell 跑态⑤时端口还被占着（会走成"复用"）
+    [ -f "$_hs/.h-stub-listen.pid" ] && kill "$(cat "$_hs/.h-stub-listen.pid")" 2>/dev/null
+    rm -f "$_hs/.h-stub-listen.pid"
+
+    # 态⑥ 等超时：单元没在跑、端口没人听、web-url.txt 还是上一次的
+    printf 'local_port=3980\npublic_url=https://example.invalid:8443\n' >"$_hc/remote.conf"
+    printf 'http://127.0.0.1:3980/?token=OLD-TOK\n' >"$_hs/web-url.txt"
+    rm -f "$_hs/current-token.txt"
+    hrun "$_sh" "$_hs" "$_hc" H_ACTIVE=inactive H_SUBSTATE=dead H_NRESTARTS=3 DSH_REMOTE_HARNESS_WAIT=2
+    _out=$(cat "$TMP/o-hr-$_sh.out")
+    check_contains "$_sh 态⑥：原因 = 等 Ns 没等到地址" "等了 2s 没等到 systemd 写出地址" "$_out"
+    check_contains "$_sh 态⑥：原因里带上 systemd 实测状态" "systemd=inactive/dead" "$_out"
+    check_contains "$_sh 态⑥：给判据命令" "判据：ss -ltn | grep :3980 ; systemctl --user is-active dsh-web.service" "$_out"
+    check_contains "$_sh 态⑥：点明地址文件是旧的（不许拿旧文件冒充刚起来）" "web-url.txt 还是上一次的，没被重写" "$_out"
+    check_not_contains "$_sh 态⑥：不许把旧 token 当成现在的地址" "token=OLD-TOK" "$_out"
+}
+for shname in bash zsh; do
+    if command -v "$shname" >/dev/null 2>&1; then
+        hr_states "$shname"
+    else
+        ok "没有 $shname：跳过 harness 四态里它那份（装 zsh 才有完整对账）"
+    fi
+done
 
 # ⑤ 逃生阀：DSH_REMOTE_HARNESS_NO_REUSE=1 → 不去复用/不起服务（前台路）
 mkdir -p "$TMP/oconf3"
@@ -1699,6 +1868,61 @@ check_contains "逃生阀 → 走前台（抓到 GUARD）" "已捕获 token" "$(
 PATH="$ostub:$PATH" DSH_REMOTE_CONF_DIR="$TMP/oconf2" "$remote" serve-status >"$TMP/o6.out" 2>&1
 check "serve-status 退出码 0" "0" "$?"
 check_contains "报告里有 web 单元" "web 单元" "$(cat "$TMP/o6.out")"
+
+# ⑦ dsh-web-run 的代理处理（2026-10-09 实测的"坏代理把服务卡死"；hazards H28 / ADR-0021）
+#    判据不是"读代码"，而是**子进程里 `env | grep -i proxy` 的真实内容**：
+#    桩 npx 把它整个 dump 到探针文件，再断言 —— 日志说"已清空"但子进程还带着代理，
+#    这一条就会红。
+pstub="$TMP/pstub"
+mkdir -p "$pstub" "$TMP/pstate" "$TMP/pconf"
+cat >"$pstub/npx" <<'STUB'
+#!/bin/sh
+env | grep -i proxy | sort >"$P_PROBE"
+printf 'dsh web: http://127.0.0.1:3979/?token=PTOK (LAN: http://10.0.0.9:3979)\n'
+STUB
+chmod +x "$pstub/npx"
+prun() { # prun <remote.conf 内容> <探针文件> [KEY=VAL…]
+    printf '%s\n' "$1" >"$TMP/pconf/remote.conf"
+    shift
+    _probe=$1
+    shift
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        "$@" P_PROBE="$_probe" PATH="$pstub:$PATH" \
+        DSH_REMOTE_STATE_DIR="$TMP/pstate" DSH_REMOTE_CONF_DIR="$TMP/pconf" \
+        DSH_REMOTE_NO_TUNNEL_RESTART=1 sh "$proj/bin/dsh-web-run" --port 3979 >"$TMP/o-p.out" 2>&1
+}
+# ⑦① 环境里带着坏代理（WSL autoProxy 那个形状）→ 默认必须清空
+prun 'local_port=3979' "$TMP/p-a.txt" \
+    http_proxy=http://127.0.0.1:7897 https_proxy=http://127.0.0.1:7897 \
+    HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 \
+    all_proxy=socks5://127.0.0.1:7897 ALL_PROXY=socks5://127.0.0.1:7897 \
+    no_proxy=localhost NO_PROXY=localhost
+_pa=$(cat "$TMP/p-a.txt" 2>/dev/null)
+check "代理①：dsh-web-run 退出 0" "0" "$?"
+check_contains "代理①：日志打「代理: 已清空」" "代理: 已清空" "$(cat "$TMP/o-p.out")"
+check_not_contains "代理①：子进程里没有小写 http_proxy" "http_proxy=" "$_pa"
+check_not_contains "代理①：子进程里没有大写 HTTP_PROXY" "HTTP_PROXY=" "$_pa"
+check_not_contains "代理①：子进程里没有 https_proxy" "https_proxy=" "$_pa"
+check_not_contains "代理①：子进程里没有 all_proxy" "all_proxy=" "$_pa"
+check_not_contains "代理①：子进程里没有 ALL_PROXY" "ALL_PROXY=" "$_pa"
+check_contains "代理①：no_proxy 保留（那是白名单，不是代理）" "no_proxy=localhost" "$_pa"
+check_contains "代理①：NO_PROXY 也保留" "NO_PROXY=localhost" "$_pa"
+
+# ⑦② remote.conf 的 web_proxy= → 显式设上（六个变量都设成它）
+prun 'local_port=3979
+web_proxy=http://127.0.0.1:7897' "$TMP/p-b.txt" no_proxy=localhost
+_pb=$(cat "$TMP/p-b.txt" 2>/dev/null)
+check_contains "代理②：日志打「代理: =<值>」并说来自哪" "代理: =http://127.0.0.1:7897（来自 remote.conf 的 web_proxy" "$(cat "$TMP/o-p.out")"
+check_contains "代理②：子进程里 http_proxy 就是这个值" "http_proxy=http://127.0.0.1:7897" "$_pb"
+check_contains "代理②：HTTPS_PROXY 也设了" "HTTPS_PROXY=http://127.0.0.1:7897" "$_pb"
+check_contains "代理②：ALL_PROXY 也设了" "ALL_PROXY=http://127.0.0.1:7897" "$_pb"
+
+# ⑦③ DSH_REMOTE_WEB_PROXY 覆盖 remote.conf（临时改一次不用改文件）
+prun 'local_port=3979
+web_proxy=http://127.0.0.1:7897' "$TMP/p-c.txt" no_proxy=localhost DSH_REMOTE_WEB_PROXY=http://10.0.0.1:8888
+_pc=$(cat "$TMP/p-c.txt" 2>/dev/null)
+check_contains "代理③：环境变量优先于 remote.conf" "代理: =http://10.0.0.1:8888（来自 DSH_REMOTE_WEB_PROXY" "$(cat "$TMP/o-p.out")"
+check_contains "代理③：子进程里 http_proxy 是环境变量那个" "http_proxy=http://10.0.0.1:8888" "$_pc"
 
 
 # ---------------------------------------------------------------- 汇总

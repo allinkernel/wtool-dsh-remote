@@ -4,8 +4,10 @@
 # 为什么要它：`npx @deepseek-ai/dsh web` 自己会起会话并打印一行带 token 的 URL，但
 #   * 前台跑 → 关掉终端会话就没了；
 #   * 没人把那个 token 记下来 → 云上 broker 没法 302（手机入口 503）。
-# 它做两件事：把 dsh web 跑在**前台**（systemd 才看得到进程），并把输出里的
-# `dsh web: http://…?token=…` 解析出来写进 state 目录。
+# 它做三件事：把 dsh web 跑在**前台**（systemd 才看得到进程）、把输出里的
+# `dsh web: http://…?token=…` 解析出来写进 state 目录、并在起 npx **之前把代理
+# 环境显式处理掉**（默认清空 —— 开机时继承到的坏代理会让 npx 永久卡住，见下面
+# "代理"那段和 hazards H28）。
 #
 # 与 env.zsh/env.bash 里 `harness` 函数的区别：**退出时不删 token 文件**
 # —— 服务是要一直活着的；重启服务会重新抓一次、覆盖旧 token。
@@ -23,6 +25,36 @@ mkdir -p -- "$STATE_DIR" 2>/dev/null
 : >"$STATE_DIR/dsh-web-run.log" 2>/dev/null
 
 log() { printf '[dsh-web-run] %s\n' "$*"; }
+
+# ── 代理：**默认清空**（2026-10-09 实测；hazards H28、ADR-0021）────────────────
+# WSL 的 autoProxy=true 会把 Windows 注册表里的系统代理注入环境；开机时
+# `systemd --user` 抓到它，这个包装里的 `npx` 就**永久卡住、永远不写 token**
+# （用户看到的是"harness 等 20s 没等到地址"），而手工 `proxy_off` 之后 npx 正常。
+# 服务要的是"连得上 npm/dsh"，不是"跟着桌面会话的代理走" —— 所以显式清掉，别继承。
+#   要指定：DSH_REMOTE_WEB_PROXY=<url>（优先）或 remote.conf 里 web_proxy=<url>；
+#   no_proxy / NO_PROXY **保留** —— 那是"哪些不走代理"的名单，清掉只会更误伤。
+# 判据：① 这行日志；② 服务进程里 `env | grep -i proxy` 只剩 no_proxy；
+#       ③ 反例：手工 `proxy_off` 之后 npx 就正常（2026-10-09 实测）。
+WEB_PROXY=${DSH_REMOTE_WEB_PROXY:-}
+WEB_PROXY_FROM=DSH_REMOTE_WEB_PROXY
+if [ -z "$WEB_PROXY" ] && [ -f "$CONF" ]; then
+    WEB_PROXY=$(sed -n 's/^[[:space:]]*web_proxy[[:space:]]*=[[:space:]]*//p' "$CONF" | tail -n 1)
+    WEB_PROXY_FROM="remote.conf 的 web_proxy（$CONF）"
+fi
+_keep=${no_proxy:-${NO_PROXY:-没设}}
+if [ -n "$WEB_PROXY" ]; then
+    http_proxy=$WEB_PROXY
+    https_proxy=$WEB_PROXY
+    HTTP_PROXY=$WEB_PROXY
+    HTTPS_PROXY=$WEB_PROXY
+    all_proxy=$WEB_PROXY
+    ALL_PROXY=$WEB_PROXY
+    export http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+    log "代理: =$WEB_PROXY（来自 $WEB_PROXY_FROM；no_proxy 保留：$_keep）"
+else
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+    log "代理: 已清空（http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY/all_proxy/ALL_PROXY；no_proxy 保留：$_keep）"
+fi
 
 # ── 端口被占 = 已经有一个会话在跑：不要去抢，退出（systemd 会按 RestartSec 再来）────
 # 这条是有意的：用户在终端里手起的 harness/serve 不该被开机服务打断。

@@ -113,11 +113,11 @@ SVG 的 `width`/`height` 与 PNG 一致（`viewBox` 用模块坐标，放大不�
 
 ### 会话常驻与"开机就有会话"（2026-10-07 起）
 
-`harness` 现在**幂等**：
+`harness` 现在**幂等**，而且**每次都先告诉你"起没起来 + 为什么"**（正常 2–5 行）：
 
 ```sh
-harness                      # 已经有会话在跑 → 直接复用（打印带 token 的地址 + 手机固定地址）
-                             # 没有会话、但装了常驻服务 → 交给 systemctl 起，然后打印地址
+harness                      # 已经有会话在跑 → 直接复用（不打断它）
+                             # 没有会话、但装了常驻服务 → 交给 systemctl 起，等它写出地址（最多 20s）
                              # 都没有 → 还跟前台老行为一样（前台跑 dsh web，Ctrl-C 结束）
 
 dsh-remote serve-install     # 把 dsh web 装成 systemd --user 常驻：**开机自动开会话**
@@ -125,11 +125,32 @@ dsh-remote serve-status      # 看：单元在不在 / 端口有没有人听 / t
 dsh-remote serve-uninstall   # 撤掉常驻服务（**不动**正在跑的会话）
 ```
 
+第一行永远是**状态**；没起来时给**实测出来的原因** + **自己复现的判据命令**，例如：
+
+```
+harness: dsh web 已在跑 ✓  http://127.0.0.1:3080（PID 152050，非 systemd）
+harness: dsh web 已由 systemd 拉起 ✓  http://127.0.0.1:3080/?token=…（PID 152051，dsh-web.service）
+harness: dsh web 没起来 ✗ 原因：3080 被另一个实例占着（PID 152050，不是 systemd 管的）
+harness:   → 让它接管：先退出那个实例；或 DSH_REMOTE_HARNESS_NO_REUSE=1 harness 起新的
+harness:   systemd: activating/auto-restart（已重试 84 次，每 30s 一次）  看：journalctl --user -u dsh-web.service -n 20
+```
+
+原因**不是猜的**：`ss -ltnp`（谁占着端口）、`systemctl --user is-active / show`
+（状态 / 重试次数 / 退出码）、`journalctl -o cat -n 1`（最后一行原文），
+再加上拿真请求探一次 token（本地那个 token 无效 = 401，就不会被当成能用的地址打出去）。
+
 - 常驻服务用 `Restart=always` + **`RestartSec=30`**；**端口被别人占着（你手起的会话）时它不抢**，
   每 30 秒试一次，等你那个会话结束再接管 —— **不会打断正在用的会话**。
 - 会话真正起来（抓到 token）之后，`dsh-web-run` 会自动
   `systemctl --user try-restart dsh-tunnel.service`，把去阿里云的转发重连一次。
+- 常驻服务里的 `npx` **不再继承桌面会话的代理**：`dsh-web-run` 起 npx 前会清掉
+  `http_proxy` / `https_proxy` / `HTTP_PROXY` / `HTTPS_PROXY` / `all_proxy` / `ALL_PROXY`
+  （`no_proxy` / `NO_PROXY` 保留），日志里打一行「代理: 已清空」。要指定代理就
+  `remote.conf` 里写 `web_proxy=<url>`（或临时 `DSH_REMOTE_WEB_PROXY=<url>`，它优先）。
+  **为什么**：WSL 的 autoProxy 会把 Windows 的系统代理注入环境，开机时 `systemd --user`
+  抓到它 → 里面的 npx 永久卡住、永远不写 token；判据见 `docs/hazards.md` H28。
 - 想强制"再起一个前台会话"：`DSH_REMOTE_HARNESS_NO_REUSE=1 harness`。
+- 等 systemd 写出地址的上限默认 20 秒；想改：`DSH_REMOTE_HARNESS_WAIT=<秒> harness`。
 - 开机自启需要 `loginctl enable-linger <你>`（本机已开，实测不需要 sudo）。
 
 ## 3. 命令
@@ -332,7 +353,7 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 199 条（以输出为准），不联网、不碰真 $HOME
+sh tests/run_tests.sh        # 556 条（以输出为准），不联网、不碰真 $HOME
                              #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
                              #   跑几次 docker run …（第一次会把 caddy:2.11.4 拉下来，约 50MB）
 sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
@@ -362,11 +383,12 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-09 实测，合计 **468**）：语法 A 10 / `env` 两份 B 6 /
+逐节条数（2026-10-09 实测，合计 **556**）：语法 A 10 / `env` 两份 B 6 /
 `dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
 `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 55 / **常驻隧道 J 100** /
 **固定地址那条链路 K 55** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22** /
-**dsh web 常驻 O 20**。
+**dsh web 常驻 + harness 四态输出 O 108**（含 `dsh-web-run` 的代理处理：
+桩 npx 把子进程的 `env | grep -i proxy` dump 出来对账）。
 K 节里 broker 起**真进程**、`dsh web` 用 `tests/fake_dsh_web.py` 这个**假夹具**
 （按 cookie 的值造 200/401/303/500/慢响应），所以"过期 cookie → 跳转""有效 cookie →
 代发首页""判断不出来 → 503"三条都**离线**测得出来。
@@ -374,6 +396,8 @@ J 节的隧道单元与自愈检查也全在临时目录 + 桩命令里跑（`sy
 跑完还会比对真 `$HOME` 里那几个文件的指纹。
 J 节用 `DSH_REMOTE_UNIT_DIR` 把单元落点钉到临时目录、`systemctl`/`tmux` 全是桩，
 跑完比一次真 `~/.config/systemd/user` 的指纹（真 tmux 上可能正跑着生产隧道）。
+O 节的 harness 四态（服务在跑 / 端口被非 systemd 实例占 / 服务 failed / 没有服务走前台）
+用 `systemctl`/`journalctl` 桩 + 真回环监听，**bash 和 zsh 各跑一遍同一张表**。
 
 `caddy-validate.sh` 还会故意塞一条坏配置，确认这个测试**能失败**
 （永远绿的测试等于没测）。

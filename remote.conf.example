@@ -25,6 +25,14 @@ remote_port=18080
 # 家里 harness 的端口（dsh web 听的）
 local_port=3080
 
+# 常驻服务里的 npx 走哪个代理。**默认（不写这一行）是清空**：dsh-web-run 起 npx 前会
+# unset http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY/all_proxy/ALL_PROXY —— WSL 的
+# autoProxy 会把 Windows 的系统代理注入环境，开机时 systemd --user 抓到它，npx 就
+# 永久卡住、永远不写 token（docs/hazards.md H28）。no_proxy / NO_PROXY 保留。
+# 真要指定就填一个，例：web_proxy=http://127.0.0.1:7897
+# （临时覆盖用环境变量 DSH_REMOTE_WEB_PROXY=<url>，它优先于这一行）
+# web_proxy=
+
 # ---------------------------------------------- token broker（手机固定地址那条）
 # `dsh web` 的 token 每个进程随机、只在内存里，手机每次重启后都要重抄地址。
 # 家里这个 302 小服务（`dsh-remote broker-install` 装成 dsh-token-broker.service）

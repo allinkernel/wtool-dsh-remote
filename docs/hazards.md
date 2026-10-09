@@ -988,3 +988,44 @@ grep -c 'reverse_proxy @entry 127.0.0.1:3082' <(sh -c "$(cat /tmp/cmd) --dry-run
   13:49 那次是助手在**沙箱**里跑渲染出来的脚本（`systemctl` 是桩、**没有**真重启），
   但它**没给 `logger` 打桩**，所以真 journal 里多了两行 —— 拿这个脚本做实验时记得
   连 `logger` 一起桩掉（`tests/run_tests.sh` 的 J 节就是这么干的）。
+
+---
+
+## H28. 开机时 `systemd --user` 抓到的**坏代理**会把常驻服务卡死（npx 永远不写 token）
+
+- **现象**（2026-10-09 用户实测）：`dsh-web.service` 起来了却**永远不写 `web-url.txt`** ——
+  `harness` 那边表现为"等 20s 没等到 systemd 写出地址"；`dsh-token-broker` 因为没有 token
+  回 **503**，手机打开固定地址只看到"还没有当前 token"。
+  而**手工**在终端里跑 `npx @deepseek-ai/dsh web` 之前先 `proxy_off` → 一切正常。
+  同一台机器、同一个 npx、同样的网络：终端里好、服务里死。
+- **根因**：WSL 的 `autoProxy=true` 会把 **Windows 注册表里的系统代理**注入环境。
+  `systemd --user` 是在**开机那一刻**把环境**快照**下来的（之后不跟着你的 shell 变），
+  那次快照里带着一个**连不通的代理端口**（比如桌面代理软件还没起 / 端口已经换了）。
+  服务里的 `npx` 于是把每个请求都送去那个死端口 —— 表现是**永久卡住**（不是报错退出，
+  所以 `Restart=always` 也救不了：进程活着、什么都没做）。
+- **判据（怎么看出来）**：
+
+  ```sh
+  systemctl --user show-environment | grep -i proxy     # 服务管理器手里那份**快照**（关键证据）
+  journalctl --user -u dsh-web.service -n 5 -o cat      # 修完之后这里应有「[dsh-web-run] 代理: 已清空（…）」
+  ss -ltnp | grep ':3080'                               # 端口在听、但 web-url.txt 一直没被写 → 像这条
+  ls -l ~/.local/state/dsh-remote/web-url.txt           # 时间戳停在上一次，不是这次服务起的时刻
+  ```
+  **反例（用来确认是代理而不是别的）**：手工 `proxy_off` 之后再跑一次 npx → 正常。
+  ⚠️ 别把它读成"代理不能用"：本机代理平时是好的（`~/.dsh/AGENTS.md` 的"代理"一节
+  已经因为过度概括吃过一次亏）；这条只讲"**服务不能在开机时继承一个可能已经不存在的代理**"。
+- **修法**（ADR-0021）：`bin/dsh-web-run` 在起 npx **之前**默认 `unset`
+  `http_proxy` / `https_proxy` / `HTTP_PROXY` / `HTTPS_PROXY` / `all_proxy` / `ALL_PROXY`
+  （保留 `no_proxy` / `NO_PROXY`），并往日志打一行 `代理: 已清空（…）`；
+  要代理就 `remote.conf` 写 `web_proxy=<url>`，或临时 `DSH_REMOTE_WEB_PROXY=<url>`（优先），
+  那时日志写 `代理: =<值>（来自 …）`。
+  **只动服务这条链**：用户在交互 shell 里跑的前台 `harness` 不碰代理（他有 `proxy_on/off`）。
+  回归守卫：O 节 ⑦ 用桩 npx 把**子进程**里 `env | grep -i proxy` 的全文 dump 出来对账。
+- **验证程度**：现象来自用户 2026-10-09 的实测（本轮**没有**再去制造一次坏代理环境 ——
+  那要动用户正在用的机器）；本轮实测到的是"修完之后的行为"：
+  ① 桩环境里带六个坏代理变量启动 `dsh-web-run`，子进程里那六个**都不在**、`no_proxy`/`NO_PROXY` 还在
+  （O 节 3 条）；② 显式 `web_proxy=` / `DSH_REMOTE_WEB_PROXY` 时子进程拿到的就是那个值（O 节 4 条）；
+  ③ **真机**：`dsh-web.service` 下一次重试的 journal 里出现了
+  `[dsh-web-run] 代理: 已清空（http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY/all_proxy/ALL_PROXY；no_proxy 保留：没设）`
+  （2026-10-09 20:5x 当场读到；那时本机 `systemctl --user show-environment | grep -i proxy` 已经没有代理变量了
+  —— 注入是开机那次的事，现在看不到，所以**这条 hazard 的现场没有被本轮复现**）。
