@@ -38,7 +38,7 @@ warn() { printf '%s: 警告：%s\n' 'tools/dsh-remote' "$*" >&2; }
 # 路径全部问引擎要，**不把影子 HOME（~/.wtool）的内部布局写死进脚本**
 #
 #   WTOOL_PROJECT_DIR  项目检出目录 —— 引擎对项目脚本的正式契约
-#                      （bootstrap/wtool.sh 的 wt_run_project_script：
+#                      （wtool-base-tools/wtool.sh 的 wt_run_project_script：
 #                       `export WTOOL_PROJECT_DIR="$_rs_dir"`）。
 #                      手工跑（没设这个变量）时按 $0 自己推 <项目>/scripts/.. 。
 #   WTOOL_HOME         引擎管理的那个家目录，默认 $HOME。**落点从它推** ——
@@ -46,7 +46,7 @@ warn() { printf '%s: 警告：%s\n' 'tools/dsh-remote' "$*" >&2; }
 #   WTOOL_PREFIX       命令落点，默认 $WTOOL_HOME/.wtool/usr。
 #
 # 为什么"源"不用稳定中转链接（$WTOOL_HOME/.wtool/wtool-work-dir/links/<项目>）：
-# 那一格是**引擎的内部布局**（bootstrap/lib/wtool_plan.py 的 WORK_DIR_NAME，
+# 那一格是**引擎的内部布局**（wtool-base-tools/lib/wtool_plan.py 的 WORK_DIR_NAME，
 # 2026-09-23 才从 ~/.wtool/links/ 挪过去）—— 写进项目脚本就有了两份真相：
 #   * 影子家里（WTOOL_HOME != $HOME）它一定指丢：中转链接建在
 #     $WTOOL_HOME/.wtool/... 下，脚本却去**真家目录**那格（写死的 `~/.wtool/...`）找；

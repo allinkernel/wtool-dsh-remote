@@ -10,6 +10,16 @@
 
 ---
 
+## ✅ 改名：安装器 `bootstrap` → `wtool-base-tools`、文档仓 `wtool-base` → `wtool-doc`、纯配置项目 `shell/zsh` → `shell/shell-rc`（ADR-0045 §7.1，2026-10-13）
+
+本仓只是引用方：文档/注释里指向这几个项目的路径与仓名全部跟着改
+（`bootstrap/{lib,scripts,tests,...}` → `wtool-base-tools/…`、
+`wtool-base/README.md` → `wtool-doc/README.md`、`allinkernel/wtool` → `allinkernel/wtool-doc`、
+`shell/zsh` → `shell/shell-rc`）。
+`wtool bootstrap` / `wtool sudo-bootstrap` 是**引擎命令名**，本轮不改，保留。
+
+⚠️ 本地目录改名 + `wtool move` 属于一次性切换（会改用户真账本），本轮没做。
+
 ## 🔴 仍未做 / 未验证（一览，2026-10-09 更新）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
@@ -169,7 +179,7 @@ total 0                                  ← 一条命令都没有
 
 **根因**：`scripts/install.sh:31` 把"源"写死成引擎的内部布局
 `link_dir="$HOME/.wtool/wtool-work-dir/links/tools/dsh-remote"`
-（`bootstrap/lib/wtool_plan.py` 的 `WORK_DIR_NAME`），第 96/112 行拿它当源。
+（`wtool-base-tools/lib/wtool_plan.py` 的 `WORK_DIR_NAME`），第 96/112 行拿它当源。
 两种情况下立刻指丢：① `WTOOL_HOME != $HOME`（影子家 / 临时家 / 测试）—— 中转链接
 建在 `$WTOOL_HOME/.wtool/...`，脚本却去真家目录那格找；② 引擎以后再挪一次那一格
 （2026-09-23 已经挪过一次，`tools/android_repack` 就是在那一挪之后坏掉的）。
@@ -180,7 +190,7 @@ total 0                                  ← 一条命令都没有
 **改动**（`f8da57c`，都在 `ds_dev` 上）：
 
 1. `scripts/install.sh`：
-   * 源 = **`WTOOL_PROJECT_DIR`**（引擎对项目脚本的契约，见 `bootstrap/wtool.sh` 的
+   * 源 = **`WTOOL_PROJECT_DIR`**（引擎对项目脚本的契约，见 `wtool-base-tools/wtool.sh` 的
      `wt_run_project_script`：`export WTOOL_PROJECT_DIR="$_rs_dir"`），手跑时按 `$0`
      自推 `<项目>/scripts/..`；
    * 落点 = `WTOOL_PREFIX`（默认从 `WTOOL_HOME` 推）、`~/.config` / `~/.local/state`
@@ -256,7 +266,7 @@ wtool: error: wtool.xml 里的 id='tools/dsh-remote' 已经取消：项目身份
        删掉这个属性即可（.../wtool.xml）
 ```
 
-`id=` 是**硬报错**（`bootstrap/lib/wtool_plan.py:214-219`，用户 2026-10-04 拍板，
+`id=` 是**硬报错**（`wtool-base-tools/lib/wtool_plan.py:214-219`，用户 2026-10-04 拍板，
 不留兼容窗口）—— 带着它，`scripts/install.sh` **根本没机会跑**，上面那条修复
 也就用不上。工作区里其它项目（`android_repack` / `dsh-conf` / `astronvim_v5` /
 `git-repo-sh-tools` …）都已经删掉了，只剩 `tools/dsh-remote` 和 `terminal/tmux`。
