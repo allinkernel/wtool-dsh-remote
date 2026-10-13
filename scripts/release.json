@@ -36,8 +36,8 @@
       "sha256": "ce9aa6d5a90ca481b6393da4697e3652f52d1cb7c74ab8e4549b48bbc8eef544"
     }
   ],
-  "how": "wtool download-release tools/dsh-remote   # 下到项目的 __release/（按本文件的 sha256 校验）\nwtool unpack-release tools/dsh-remote     # 拼分卷 + 把源码铺回项目目录\nwtool install tools/dsh-remote            # 装到本机\n\n# 断网机（没有 wtool，也不联网）：从离线 tag offline-<日期> 的发布页人工下载\nunzip source-offline.zip && cp -a wtool/. \"$WTOOL_HOME/wtool/\"   # ① 源码即产物\nwtool install tools/dsh-remote            # 东西都在包里，不联网",
-  "offlineTag": "",
+  "how": "wtool download-release tools/dsh-remote   # 下到项目的 __release/（按本文件的 sha256 校验）\nwtool unpack-release tools/dsh-remote     # 拼分卷 + 把源码铺回项目目录\nwtool install tools/dsh-remote            # 装到本机\n\n# 断网机（没有 wtool，也不联网）：从离线 tag offline-2026-10-14 的发布页人工下载\nunzip source-offline.zip && cp -a wtool/. \"$WTOOL_HOME/wtool/\"   # ① 源码即产物\nwtool install tools/dsh-remote            # 东西都在包里，不联网",
+  "offlineTag": "offline-2026-10-14",
   "artifacts": {
     "source-offline.zip": [
       {
