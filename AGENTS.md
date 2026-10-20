@@ -1,4 +1,4 @@
-# AGENTS.md —— tools/dsh-remote
+# AGENTS.md —— dsh-projects/dsh-remote
 
 > 先读用户级 `~/.dsh/AGENTS.md`（工作区通用规则）和仓库根 `AGENTS.md`（多仓库工作区规则），
 > 本文件只讲**这个项目**的事：文档在哪、必须遵守什么、怎么交付。
@@ -9,7 +9,7 @@
 basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），外加一条
 "卡在等你回答 / 一轮跑完"的推送。
 
-**它是独立项目**：`wtool install tools/dsh-remote` 之后才有 `dsh-remote` /
+**它是独立项目**：`wtool install dsh-projects/dsh-remote` 之后才有 `dsh-remote` /
 `dsh-notify` 两条命令。仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档），
 证书 / 密码 / 密钥 / 日志一律在安装落点，不进 git。
 
@@ -95,7 +95,7 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 | **云上（阿里云那台）的任何操作都要用户同意** | 那是用户的真机器。`cloud-install` 会 scp + ssh + `sudo sh relay.sh`（起容器、开端口）；助手不代跑，也不改安全组 |
 | **`cloud/relay.sh` 在云上跑要 root + docker** | 它要 `docker compose up -d`、写 `/opt/dsh-relay/Caddyfile`、起 host 网络的容器；`--dry-run` 不需要 root。`--install-docker` 才会 apt 装 docker |
 | **不跑 docker** | `tests/relay-e2e.sh` / `tests/caddy-validate.sh` 要 docker，**只写清怎么人工跑，不代跑**；`tests/run_tests.sh` 在**装了 docker 的机器上**它的 D 节会经 `relay.sh --dry-run` 调一次 `caddy validate`（见 hazards H8） |
-| **真机安装要用户点头** | 本项目天生装在真机上才有用（手机连的就是这台机器），但用户级规矩（2026-10-04）是"wtool 的项目只在容器 / 影子家装、测"—— 助手不得自行 `wtool install tools/dsh-remote` |
+| **真机安装要用户点头** | 本项目天生装在真机上才有用（手机连的就是这台机器），但用户级规矩（2026-10-04）是"wtool 的项目只在容器 / 影子家装、测"—— 助手不得自行 `wtool install dsh-projects/dsh-remote` |
 | **钩子桥未证实会触发** | 不许把"会话卡住会推手机"写成已有能力；复查用 `dsh-remote check-hooks`（ADR-006、hazards H3） |
 | **token 是密钥** | `current-token.txt` / `web-url.txt` / `phone-qr.*` 都是运行期状态（600，在 `$WTOOL_PREFIX/var/dsh-remote/` 下），**不进仓库**；二维码里**不编 token**（ADR-0014） |
 | **云上写只限 `/home/mindul/dsh-relay/**`，特权动作只限 `sudo docker run/restart/ps/logs/rm`（限 `dsh-relay`）** | 用户三条硬约束；不许 apt / 改 `/etc` / 动安全组 / 碰 nginx 与 80/443 |
@@ -118,7 +118,7 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 **README 与代码不一致 = 缺陷**，不是"以后补"。README 里**不写"怎么手工跑
 `scripts/install.sh`"** —— 它是 `wtool install` 调的，安装只有一句话
-（`wtool install tools/dsh-remote`）。README 里也**不写进度和决策**
+（`wtool install dsh-projects/dsh-remote`）。README 里也**不写进度和决策**
 （进度去 `BACKLOG.md`，为什么去 `docs/adr/`）。
 
 ---
@@ -126,19 +126,19 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 ## `wtool.xml` 要跟上引擎（它现在会硬报错）
 
 - **`id=` 属性已经取消**（引擎 `wtool_plan.py` 硬报错，不留兼容窗口）：
-  项目身份就是它相对工作区根的路径。`tools/dsh-remote` 这个属性是 2026-10-04
+  项目身份就是它相对工作区根的路径。`dsh-projects/dsh-remote` 这个属性是 2026-10-04
   端到端验证时发现并删掉的 —— 带着它会 `wtool install` 直接 exit 2，
   `scripts/install.sh` 根本没机会跑。
 - 旧标签 `<env src= shells=>`（每次解析都告警）已改成
   `<zshrc src="env.zsh"/>` + `<bashrc src="env.bash"/>`；`<link src= dest=>` 同理。
-- 改完跑 `wtool validate tools/dsh-remote`（只读）应打印 `ok: tools/dsh-remote`。
+- 改完跑 `wtool validate dsh-projects/dsh-remote`（只读）应打印 `ok: dsh-projects/dsh-remote`。
 
 ---
 
 ## 测试
 
 ```sh
-cd tools/dsh-remote
+cd dsh-projects/dsh-remote
 sh tests/run_tests.sh         # 675 条（以跑出来的 PASS 行为准），两三分钟
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）

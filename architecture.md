@@ -1,4 +1,4 @@
-# tools/dsh-remote 架构（现状）
+# dsh-projects/dsh-remote 架构（现状）
 
 > 这份文档**只讲现在**：命令、参数、路径、文件的真实行为，全部以代码为准
 > （写这份时逐行核对过 `bin/dsh-remote` / `bin/dsh-notify` / `cloud/relay.sh` /
@@ -80,7 +80,7 @@
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
 | `README.md` / `AGENTS.md` / `BACKLOG.md` / `architecture.md` / `journal.md` / `docs/` | — | 文档 |
 
-`wtool.xml` 的实质内容（无 `id=`，项目身份 = 路径 `tools/dsh-remote`）：
+`wtool.xml` 的实质内容（无 `id=`，项目身份 = 路径 `dsh-projects/dsh-remote`）：
 
 ```xml
 <wtool schema="1" priority="47">
@@ -523,7 +523,7 @@ Windows 弹"找不到文件"框 —— 用户实测，H32）。三档退：
 systemctl --user is-active dsh-web.service      # activating
 systemctl --user show dsh-web.service -p SubState -p NRestarts --value   # auto-restart / 100+
 ss -ltnp | grep ':3080'                          # 有人听（PID 是手起那个，不在 dsh-web.service 的 cgroup 里）
-bash -c '. ~/self/wtool/tools/dsh-remote/env.bash; harness'   # 一行"已在跑 ✓（…手工起的）"+ 开浏览器
+bash -c '. ~/self/wtool/dsh-projects/dsh-remote/env.bash; harness'   # 一行"已在跑 ✓（…手工起的）"+ 开浏览器
 ```
 
 #### 3.5.3 `harness-remote`：云上那半的管理器（ADR-0024）
@@ -817,7 +817,7 @@ WTOOL_PROJECT_DIR / 按脚本位置自推）"，末尾交代跳过了几条；**
 `env.zsh` / `env.bash`（两份内容等价，只有标题的 shell 名不同）导出三个变量：
 
 ```
-DSH_REMOTE_DIR       = ${WTOOL_PROJECT_DIR:-${WTOOL_HOME:-$HOME}/.wtool/wtool-work-dir/links/tools/dsh-remote}
+DSH_REMOTE_DIR       = ${WTOOL_PROJECT_DIR:-${WTOOL_HOME:-$HOME}/.wtool/wtool-work-dir/links/dsh-projects/dsh-remote}
 DSH_REMOTE_CONF_DIR  = ${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}
 DSH_REMOTE_STATE_DIR = ${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
 ```
@@ -983,7 +983,7 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 
 ## 12. 装完在磁盘上长什么样
 
-`wtool install tools/dsh-remote` 之后（`$WTOOL_HOME` 默认就是 `$HOME`，
+`wtool install dsh-projects/dsh-remote` 之后（`$WTOOL_HOME` 默认就是 `$HOME`，
 `$WTOOL_PREFIX` 默认 `$WTOOL_HOME/.wtool/usr`）：
 
 | 落点 | 是什么 |
