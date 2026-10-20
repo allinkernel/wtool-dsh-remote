@@ -22,7 +22,7 @@
 #                              起回来（打断会话；只为了拿新 token）。手机上的按钮是云上 /reset
 #   dsh-remote systemd         旧名字：只生成单元、不 enable（= tunnel-install --no-enable）
 #   dsh-remote url             打印手机该收藏的地址
-#   dsh-remote notify-test     推一条测试消息到手机
+#   dsh-remote notify-test     推一条测试消息到手机/邮箱（--provider graph 可只测 Graph）
 #   dsh-remote notify-enable   打开"会话卡住/跑完就推手机"（写配置目录的 hooks.json + profile patch）
 #   dsh-remote notify-disable  关掉它（把 patch 里那一段删掉）
 #   dsh-remote passwd          改中继的 basic auth 密码（云上只改那一行 + 重启 + 验旧/新）
@@ -1992,7 +1992,10 @@ cmd_systemd() { # 旧名字：保留，等价 tunnel-install --no-enable（以�
 }
 
 # ------------------------------------------------------------------ 推送
-cmd_notify_test() { "$NOTIFY" --test; say "已尝试推送，看手机。失败细节：$STATE_DIR/notify.log"; }
+cmd_notify_test() { # [--provider <名字>]：原样转给 dsh-notify（例如只测 Graph）
+    "$NOTIFY" --test "$@"
+    say "已尝试推送，看手机/邮箱。失败细节：$STATE_DIR/notify.log"
+}
 
 cmd_url() {
     pub=$(conf_any public_url PUBLIC_URL 2>/dev/null || printf '')
@@ -2763,7 +2766,10 @@ systemd)
     cmd_systemd "$@"
     ;;
 url) cmd_url ;;
-notify-test) cmd_notify_test ;;
+notify-test)
+    shift
+    cmd_notify_test "$@"
+    ;;
 notify-enable) cmd_notify_enable ;;
 notify-disable) cmd_notify_disable ;;
 server)

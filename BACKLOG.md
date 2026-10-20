@@ -23,7 +23,8 @@
 ## 🔴 仍未做 / 未验证（一览，2026-10-09 更新）
 
 > 用户 2026-10-07 原话："之前写了一半，我没有做任何测试。"
-> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **675 通过 0 失败**，2026-10-09 实跑），
+> ——**本机自动测试是跑过的**（`sh tests/run_tests.sh` → **675 通过 0 失败**，2026-10-09 实跑；
+> 2026-10-21 又跑到 **764 通过 0 失败**，新增 C2 节 76 条，见 U21），
 > 真机端到端也在 2026-10-07 当天走通了（中继 + 公网 + 常驻隧道），
 > 2026-10-09 又按"固定地址"那 7 条判据从家里经公网复验了一遍。
 > 下表是"还剩什么"的全集，展开在后面的小节里。
@@ -50,6 +51,7 @@
 | U18 | ✅ | **一键强制重置 + 手机上的按钮** | 2026-10-09 用户批准"要有强制重置按钮"：`force-restart-dsh-remote`（安全档绝不碰 `dsh web`；`--restart-web --yes` 是受限例外）+ 云上 `/reset`（确认页 + POST，走 broker、异步、一次性 nonce）。真机 + 真公网实测。见下面 U18 节（ADR-0022/0023、hazards H29/H30） |
 | U20 | ✅ | **`harness` 重做成"本地管理器" + 新增 `harness-remote`** | 2026-10-09 用户重做（ADR-0024）：`harness` = **有则开、无则起、绝不起第二个、不等待**（`ss -ltnp` 先看端口；有 → 一行状态 + 立刻开浏览器；没有 → 优先 `dsh-web.service`，最多等 10s 端口出现，或前台 `npx … --port`），输出 **≤3 行**，**开浏览器绝不经 shell**（node+`open` 包 → explorer.exe/wslview/xdg-open → 只打印 URL，失败不算失败）；新增用户点名的 `harness-remote`（云上那半：`status`/`open`/`url`/`qr`/`reset`/`passwd`，薄封装转发给现成的 `dsh-remote` 子命令）。**验证程度**：3082 真跑（端口上原 PID 前后同一个 = 没起第二个；桩 opener 收到 argv 逐字节 `argc=1`；真 `open` 包开出一个 Chrome 新标签）；`harness-remote status/open/reset/passwd --dry-run` 各真跑一次（status 只读、reset 走安全档、passwd **只 `--dry-run`**、**没改密码**）；`tests/run_tests.sh` **684 通过 0 失败**（O 节 79 + 新增 Q 节 65）；**3080 的 PID（17169）全程没变**。见下面 U20 节 |
 | U19 | ✅ | **`harness` "没起来"那一档不许再含糊** | 2026-10-09 用户现场发火：超时分支只会说"端口被占 / npx 卡住都可能是这个"。改成**先看端口**（有人听 = "被别人占着 + 实测 PID + 那个实例的 token 验没验过"），没人听才分"服务失败 exit N / 还在起第 N 次重试 / 服务没在跑"三档，每档一条判据命令。3181+ 上验过四档（见下面 U19 节）。另记一条 hazard H31：**打印了 URL ≠ 这个实例活着** |
+| U21 | ✅ | **Outlook / Microsoft Graph 推送（`provider=graph`）+ 一次性授权 + 教程** | 2026-10-21：`dsh-notify` 新增 `provider=graph`（refresh token 换 access token → `/me/sendMail`，**成功=HTTP 202**；access token 缓存 600、refresh token 轮换回写、Graph/OAuth 错误码透出、`--provider` 覆盖）；新增 `bin/dsh-notify-graph-setup`（device code flow，写 600 的 `notify.conf`，保留其它键 + 备份）；教程 `docs/notify-outlook-graph.md`。**验证程度**：本地假端点（`tests/fake_graph.py`）C2 节 76 条全过，`tests/run_tests.sh` **764 通过 0 失败**；**真微软端点一次都没调、真账号一次都没授权**（明天用户自己配）。见下面 U21 那节 |
 
 **明确"没有"的能力**（别当成已有）：会话卡住自动推手机（钩子桥未证实）；
 **"网络真断"（ServerAlive 那条路）的重连、重启机器后服务会不会自己起来**（linger 已开、
@@ -843,3 +845,58 @@ docker 时它的 D 节会经 `relay.sh --dry-run` 真跑 `docker run --rm caddy:
 （所以"绑不上端口也会先打印一个 token"这个说法**本轮没有复现**）；能确认的只有
 "**打印了 URL ≠ 这个实例活着**" —— 判据是 `ss -ltnp` + 拿那个 token 直连一次。
 **全量**：`sh tests/run_tests.sh` → **675 通过 0 失败**；跑完 3080 的 PID 没变。
+
+## ✅ U21 Outlook / Microsoft Graph 推送（`provider=graph`）+ 一次性授权 + 教程（2026-10-21 做完并自测）
+
+**做了什么**
+
+1. `bin/dsh-notify` 新增 `provider=graph`（别名 `outlook` / `msgraph` / `o365`）：
+   - 读 `notify.conf` 的 `GRAPH_CLIENT_ID` / `GRAPH_TENANT` / `GRAPH_REFRESH_TOKEN` /
+     `MAIL_TO`（可选 `GRAPH_SCOPE`、`MAIL_SUBJECT_PREFIX`）；
+   - 先用 `grant_type=refresh_token` 换 access token
+     （`POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`），
+     再 `POST https://graph.microsoft.com/v1.0/me/sendMail`（Bearer + JSON，
+     `saveToSentItems:true`）；**HTTP 202 才算成功**；
+   - **不依赖 jq**：JSON 生成/解析全用 python3；refresh token 走
+     `curl --data-urlencode name@file`，**不进 argv**；
+   - access token 缓存在 `$STATE_DIR/graph-token.json`（600，60 秒余量）；
+     token 响应带新 refresh token 时**回写 `notify.conf` 那一行**（保留其它键/注释）；
+   - 失败把 Graph 的 `error.code` / `error.message` 或 OAuth 的
+     `error` / `error_description` / `error_codes` 打一行到 stderr + `notify.log`，
+     **不打印 token**；
+   - 新增 `--provider <名字>`，所以 `dsh-notify --test --provider graph` 与
+     `dsh-remote notify-test --provider graph` 都能只测这一条（`dsh-remote` 的
+     `notify-test` 现在把参数原样转发）。
+2. `bin/dsh-notify-graph-setup`（新命令，`install.sh` 会装）：
+   - device code flow（scope `offline_access Mail.Send openid profile`）→ 打印
+     `verification_uri` + `user_code` → 按 `interval` 轮询；
+     `authorization_pending` 继续、`slow_down` 间隔 +5、`expires_in` 到点退出、
+     连续 3 次网络失败放弃；
+   - 拿到 refresh token 写 `notify.conf`（provider=graph + GRAPH_* + MAIL_TO），
+     **保留其它键和注释**，写前备份 `.bak-graph-setup-<时间>-<pid>`，文件 600；
+   - 已有 `GRAPH_REFRESH_TOKEN` 时先问；非交互 + 没 `--yes` 一律不覆盖；
+   - 结尾直接打印 `dsh-remote notify-test` / `--provider graph` 的下一步。
+3. 教程 `docs/notify-outlook-graph.md`（中文）：个人 outlook.com vs 公司 M365、
+   Azure 应用注册逐步（委派 `Mail.Send`、公共客户端流、**不需要客户端密钥**）、
+   授权/验证、排错表（`AADSTS50076/50079/65001/700016/70008`、
+   `ErrorSendAsDenied`、`MailboxNotEnabledForRESTAPI`、`SMTP AUTH disabled`、条件访问）、
+   安全与撤销（refresh token = 密码；Entra/我的应用撤销同意或删应用；改密码不保证撤销）。
+4. `notify.conf.example` 加 graph 段（**全是占位符**）；
+   `README.md` / `architecture.md` / `AGENTS.md` / 本节 / `journal.md` / ADR-0025 同轮更新。
+
+**验证到什么程度（如实）**
+
+- `sh tests/run_tests.sh` → **764 通过 0 失败**（2026-10-21 实跑；基线 685，
+  新增 C2 节 76 条 + A 节 2 条 + I 节 1 条）。
+- C2 节用 `tests/fake_graph.py`（只绑 127.0.0.1，**不联网、不碰微软**）覆盖：
+  换 token 成功/失败、sendMail **202 成功**、Graph 错误码透出（403
+  `ErrorSendAsDenied`）、**HTTP 200 不算成功**、refresh token 轮换回写、
+  access token 缓存命中/过期、`--provider` 覆盖、`dsh-remote notify-test` 转发、
+  device code 授权脚本的 pending / slow_down / declined / expired、配置 600 +
+  保留其它键 + 备份。
+- **没有验的**：真微软端点一次都没调（按用户要求：不要真的发信、不要填真实凭据）；
+  真账号的 device code 授权、真 refresh token 轮换、真 Graph 配额/条件访问，
+  都要等用户明天按教程跑。测试里的 token 全是 `FAKE-*`。
+- 已知的"现实世界变量"：Entra 门户菜单名/措辞可能变；公司租户可能要求管理员同意
+  或条件访问放行；个人账户的 `common` 租户行为微软可能调整 —— 教程里都给了判据和
+  排错表，但**没有一条是在真租户上验过的**。

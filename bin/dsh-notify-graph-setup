@@ -1,0 +1,334 @@
+#!/bin/sh
+# dsh-notify-graph-setup —— 一次性授权：用 device code flow 拿一个 Outlook / Microsoft
+# Graph 的 refresh token，写进 notify.conf（600）。之后 provider=graph 就能发信了。
+#
+# 用法：
+#   dsh-notify-graph-setup                      交互：问 client id 和收件人
+#   dsh-notify-graph-setup --client-id <id> --mail-to a@b.com,c@d.com
+#   dsh-notify-graph-setup --tenant organizations
+#   dsh-notify-graph-setup --conf /path/to/notify.conf
+#
+# 它只写这几个键（**别的键和注释原样保留**）：
+#   provider=graph
+#   GRAPH_CLIENT_ID / GRAPH_TENANT / GRAPH_SCOPE / GRAPH_REFRESH_TOKEN
+#   MAIL_TO（给了才写）
+# 写之前把原来的 notify.conf 备份成 notify.conf.bak-graph-setup-<时间>-<pid>。
+#
+# 安全：refresh token 等同密码。它只写进 600 的临时文件 / notify.conf，
+# **不打印到屏幕、不进 argv、不进 git**。想撤销授权看
+# docs/notify-outlook-graph.md 的"安全与撤销"一节。
+#
+# 前置：在 Entra（Azure AD）注册一个应用，加**委派**权限 Microsoft Graph →
+# Mail.Send（+ offline_access、openid、profile），并在"身份验证"里打开
+# "允许公共客户端流"。客户端密钥**不需要**。完整步骤见
+# docs/notify-outlook-graph.md。
+
+set -u
+umask 077
+
+: "${DSH_REMOTE_HOME:=}"
+CONF_DIR=${DSH_REMOTE_CONF_DIR:-${DSH_REMOTE_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}}
+CONF=${DSH_NOTIFY_CONF:-$CONF_DIR/notify.conf}
+
+DEFAULT_TENANT=common
+# 授权时请求的 scope：offline_access 才拿得到 refresh_token；openid/profile 是
+# device code 流的常规搭配。写进配置的 GRAPH_SCOPE 默认只要 refresh 够用的那两个。
+AUTH_SCOPE='offline_access Mail.Send openid profile'
+DEFAULT_CONF_SCOPE='offline_access Mail.Send'
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s: 警告：%s\n' 'dsh-notify-graph-setup' "$*" >&2; }
+die() {
+    printf '%s: %s\n' 'dsh-notify-graph-setup' "$*" >&2
+    exit 1
+}
+
+usage() {
+    awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# 从已有配置里取一个键（和 dsh-notify 的 conf() 同一个口径：取最后一个）
+conf_get() {
+    [ -f "$CONF" ] || return 1
+    _v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -n 1)
+    _v=$(printf '%s' "$_v" | sed -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    [ -n "$_v" ] || return 1
+    printf '%s' "$_v"
+}
+
+# 从 JSON 文件里取一个顶层字段（取不到就退出 1）
+json_field() { # <文件> <键>
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(1)
+v = d.get(sys.argv[2])
+if v is None or v == "":
+    sys.exit(1)
+sys.stdout.write(str(v))
+PY
+}
+
+# ------------------------------------------------------------------ 参数
+CLIENT_ID=
+TENANT=
+MAIL_TO=
+CONF_SCOPE=
+ASSUME_YES=0
+
+while [ $# -gt 0 ]; do
+    case $1 in
+    --client-id) [ $# -ge 2 ] || die "--client-id 后面要跟值"; CLIENT_ID=$2; shift ;;
+    --client-id=*) CLIENT_ID=${1#*=} ;;
+    --tenant) [ $# -ge 2 ] || die "--tenant 后面要跟值"; TENANT=$2; shift ;;
+    --tenant=*) TENANT=${1#*=} ;;
+    --mail-to) [ $# -ge 2 ] || die "--mail-to 后面要跟值"; MAIL_TO=$2; shift ;;
+    --mail-to=*) MAIL_TO=${1#*=} ;;
+    --scope) [ $# -ge 2 ] || die "--scope 后面要跟值"; CONF_SCOPE=$2; shift ;;
+    --scope=*) CONF_SCOPE=${1#*=} ;;
+    --conf) [ $# -ge 2 ] || die "--conf 后面要跟值"; CONF=$2; shift ;;
+    --conf=*) CONF=${1#*=} ;;
+    --yes | -y) ASSUME_YES=1 ;;
+    --help | -h) usage; exit 0 ;;
+    *) die "不认识的参数：$1（--help 看用法）" ;;
+    esac
+    shift
+done
+
+CONF_DIR=$(dirname -- "$CONF")
+command -v python3 >/dev/null 2>&1 || die "需要 python3（解析 JSON；不用 jq）"
+command -v curl >/dev/null 2>&1 || die "需要 curl"
+
+# ------------------------------------------------------------------ 补参数
+if [ -z "$CLIENT_ID" ]; then
+    CLIENT_ID=$(conf_get GRAPH_CLIENT_ID 2>/dev/null || printf '')
+fi
+if [ -z "$CLIENT_ID" ]; then
+    [ -t 0 ] || die "非交互运行：请用 --client-id <应用(客户端) ID>"
+    printf 'Azure 应用的 Application (client) ID：'
+    IFS= read -r CLIENT_ID || CLIENT_ID=
+    [ -n "$CLIENT_ID" ] || die "client id 不能为空"
+fi
+
+if [ -z "$TENANT" ]; then
+    TENANT=$(conf_get GRAPH_TENANT 2>/dev/null || printf '')
+fi
+[ -n "$TENANT" ] || TENANT=$DEFAULT_TENANT
+
+[ -n "$CONF_SCOPE" ] || CONF_SCOPE=$DEFAULT_CONF_SCOPE
+
+if [ -z "$MAIL_TO" ]; then
+    MAIL_TO=$(conf_get MAIL_TO 2>/dev/null || printf '')
+fi
+if [ -z "$MAIL_TO" ] && [ -t 0 ]; then
+    printf '收件人邮箱（多个用逗号分隔，留空就之后自己往 notify.conf 里加）：'
+    IFS= read -r MAIL_TO || MAIL_TO=
+elif [ -z "$MAIL_TO" ]; then
+    warn "没给 --mail-to，MAIL_TO 也没配 —— 推送时会报「缺 MAIL_TO」，记得补进 $CONF"
+fi
+
+# 已经有 refresh token 时先问一句（覆盖前会备份）
+if [ -f "$CONF" ] && conf_get GRAPH_REFRESH_TOKEN >/dev/null 2>&1; then
+    if [ "$ASSUME_YES" != 1 ]; then
+        say "notify.conf 里已经有一个 GRAPH_REFRESH_TOKEN（$CONF）。"
+        say "重新授权会覆盖它（覆盖前会先备份），继续？[y/N]"
+        if [ -t 0 ]; then
+            printf '> '
+            IFS= read -r _answer || _answer=
+        else
+            _answer=
+        fi
+        case $_answer in
+        y | Y | yes | YES) ;;
+        *) die "已取消，什么都没改" ;;
+        esac
+    fi
+fi
+
+# 先建目录/临时文件；只有真要写的时候才动配置
+[ -d "$CONF_DIR" ] || {
+    mkdir -p -- "$CONF_DIR" || die "建不了配置目录 $CONF_DIR"
+    chmod 700 -- "$CONF_DIR" 2>/dev/null || true
+}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/dsh-graph-setup.XXXXXX") || die "建不了临时目录"
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# ------------------------------------------------------------------ device code
+DEVICECODE_URL=${GRAPH_DEVICECODE_URL:-https://login.microsoftonline.com/$TENANT/oauth2/v2.0/devicecode}
+TOKEN_URL=${GRAPH_TOKEN_URL:-https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token}
+
+say "租户：$TENANT    客户端：$CLIENT_ID"
+say "向 Microsoft 申请 device code……"
+_code=$(curl -sS -m 30 -o "$TMP/devicecode.json" -w '%{http_code}' -X POST "$DEVICECODE_URL" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "scope=$AUTH_SCOPE" 2>"$TMP/devicecode.curl.err")
+_rc=$?
+if [ "$_rc" -ne 0 ]; then
+    die "申请 device code 失败（curl 退出码 $_rc）：$(tr '\n' ' ' <"$TMP/devicecode.curl.err" | cut -c 1-300)"
+fi
+if [ "$_code" != 200 ]; then
+    _err=$(json_field "$TMP/devicecode.json" error 2>/dev/null || printf '?')
+    _desc=$(json_field "$TMP/devicecode.json" error_description 2>/dev/null || printf '')
+    [ -n "$_desc" ] || _desc=$(head -c 300 "$TMP/devicecode.json" 2>/dev/null | tr '\n' ' ')
+    die "申请 device code 失败（HTTP $_code）：error=$_err $_desc"
+fi
+
+USER_CODE=$(json_field "$TMP/devicecode.json" user_code) || die "device code 响应里没有 user_code"
+VERIFY_URI=$(json_field "$TMP/devicecode.json" verification_uri 2>/dev/null || printf 'https://microsoft.com/devicelogin')
+DEVICE_CODE=$(json_field "$TMP/devicecode.json" device_code) || die "device code 响应里没有 device_code"
+DEVICE_EXPIRES=$(json_field "$TMP/devicecode.json" expires_in 2>/dev/null || printf 900)
+INTERVAL=$(json_field "$TMP/devicecode.json" interval 2>/dev/null || printf 5)
+case $DEVICE_EXPIRES in '' | *[!0-9]*) DEVICE_EXPIRES=900 ;; esac
+case $INTERVAL in '' | *[!0-9]*) INTERVAL=5 ;; esac
+
+say ""
+say "============================================================"
+say " 1) 在浏览器打开：$VERIFY_URI"
+say " 2) 输入代码：    $USER_CODE"
+say ""
+say "（$DEVICE_EXPIRES 秒内有效。脚本会自己等你完成，别关这个窗口）"
+say "============================================================"
+say ""
+
+# device code 不放进 argv（ps 看得见）
+printf '%s' "$DEVICE_CODE" >"$TMP/device_code"
+chmod 600 "$TMP/device_code" 2>/dev/null || true
+
+# ------------------------------------------------------------------ 轮询
+DEADLINE=$(( $(date +%s) + DEVICE_EXPIRES ))
+NETFAIL=0
+while :; do
+    NOW=$(date +%s)
+    if [ "$NOW" -ge "$DEADLINE" ]; then
+        die "等待超时（$DEVICE_EXPIRES 秒内没在浏览器里完成授权）。重新跑一次本脚本即可。"
+    fi
+    _code=$(curl -sS -m 30 -o "$TMP/token.json" -w '%{http_code}' -X POST "$TOKEN_URL" \
+        --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+        --data-urlencode "client_id=$CLIENT_ID" \
+        --data-urlencode "device_code@$TMP/device_code" 2>"$TMP/token.curl.err")
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        NETFAIL=$((NETFAIL + 1))
+        warn "轮询请求失败（curl 退出码 $_rc，第 $NETFAIL 次）：$(tr '\n' ' ' <"$TMP/token.curl.err" | cut -c 1-200)"
+        [ "$NETFAIL" -lt 3 ] || die "连续 3 次网络失败，放弃（浏览器里的授权可能已经完成，重跑本脚本会重新走一遍）"
+        sleep "$INTERVAL"
+        continue
+    fi
+    NETFAIL=0
+    if [ "$_code" = 200 ]; then
+        break
+    fi
+    _err=$(json_field "$TMP/token.json" error 2>/dev/null || printf '')
+    case $_err in
+    authorization_pending)
+        ;;
+    slow_down)
+        INTERVAL=$((INTERVAL + 5))
+        say "（微软要求放慢轮询，间隔改成 ${INTERVAL} 秒）"
+        ;;
+    *)
+        _desc=$(json_field "$TMP/token.json" error_description 2>/dev/null || printf '')
+        [ -n "$_desc" ] || _desc=$(head -c 300 "$TMP/token.json" 2>/dev/null | tr '\n' ' ')
+        die "授权失败（HTTP $_code）：error=${_err:-?} $_desc"
+        ;;
+    esac
+    sleep "$INTERVAL"
+done
+
+# ------------------------------------------------------------------ 取 refresh token
+if ! python3 - "$TMP/token.json" "$TMP/refresh_token" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    d = json.load(fh)
+rt = d.get("refresh_token") or ""
+if not rt:
+    print("授权成功但响应里没有 refresh_token —— 应用权限里少了 offline_access？",
+          file=sys.stderr)
+    sys.exit(1)
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(rt)
+PY
+then
+    die "没拿到 refresh token（见上面的原因）"
+fi
+
+# ------------------------------------------------------------------ 写 notify.conf
+BACKUP=
+if [ -f "$CONF" ]; then
+    BACKUP="$CONF.bak-graph-setup-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -p -- "$CONF" "$BACKUP" || die "备份 $CONF 失败，什么都没改"
+    chmod 600 -- "$BACKUP" 2>/dev/null || true
+fi
+
+if ! python3 - "$CONF" "$CLIENT_ID" "$TENANT" "$CONF_SCOPE" "$MAIL_TO" "$TMP/refresh_token" <<'PY'
+import os, re, sys
+
+conf, cid, tenant, scope, mailto, rtfile = sys.argv[1:7]
+with open(rtfile, encoding="utf-8") as fh:
+    rt = fh.read().strip()
+if not rt:
+    print("refresh token 是空的，什么都没写", file=sys.stderr)
+    sys.exit(1)
+
+items = [("provider", "graph"),
+         ("GRAPH_CLIENT_ID", cid),
+         ("GRAPH_TENANT", tenant)]
+if scope:
+    items.append(("GRAPH_SCOPE", scope))
+if mailto:
+    items.append(("MAIL_TO", mailto))
+items.append(("GRAPH_REFRESH_TOKEN", rt))
+
+try:
+    with open(conf, encoding="utf-8") as fh:
+        lines = fh.readlines()
+except FileNotFoundError:
+    lines = []
+
+for key, value in items:
+    pattern = re.compile(r"^\s*%s\s*=" % re.escape(key))
+    out = []
+    replaced = False
+    for line in lines:
+        if pattern.match(line):
+            if not replaced:
+                out.append("%s=%s\n" % (key, value))
+                replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append("%s=%s\n" % (key, value))
+    lines = out
+
+tmp = "%s.tmp.%d" % (conf, os.getpid())
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.writelines(lines)
+os.replace(tmp, conf)
+os.chmod(conf, 0o600)
+PY
+then
+    [ -n "$BACKUP" ] && say "原文件备份在：$BACKUP"
+    die "写 $CONF 失败"
+fi
+
+PERM=$(stat -c %a -- "$CONF" 2>/dev/null || printf '600')
+say ""
+say "✅ 授权成功，refresh token 已写入：$CONF（权限 $PERM）"
+[ -n "$BACKUP" ] && say "   原文件备份：$BACKUP"
+say ""
+say "配置里现在是：provider=graph，收件人 MAIL_TO=${MAIL_TO:-（还没写，记得补）}"
+say ""
+say "下一步（复制粘贴就行）："
+say "  dsh-remote notify-test                     # 用配置里的 provider 发一封测试信"
+say "  dsh-remote notify-test --provider graph    # 只想单独测 Graph 这一条"
+say "  dsh-notify --test --provider graph         # 没装 dsh-remote 时的等价写法"
+say ""
+say "如果还没装命令：wtool install dsh-projects/dsh-remote"
+say "失败时看 ~/.local/state/dsh-remote/notify.log；排错表见 docs/notify-outlook-graph.md"

@@ -13,6 +13,7 @@
 # telegram    Telegram Bot（国内要挂代理：curl 认 https_proxy 环境变量）
 # bark        iOS 的 Bark App（可以自建 server）
 # generic     任意 HTTP 端点：POST 正文是 text/plain
+# graph       Microsoft Graph 发 Outlook 邮件（个人 outlook.com / 公司 M365；不用 SMTP AUTH）
 
 provider=serverchan
 
@@ -35,6 +36,21 @@ provider=serverchan
 
 # --------------------------------------------------------------- 通用 webhook
 #URL=https://example.com/hook
+
+# --------------------------------------------------------------- Outlook / Microsoft Graph
+# 用 Microsoft Graph 的 /me/sendMail 发信。**走 Graph 就不需要 SMTP AUTH**。
+# 一次性授权（device code flow：浏览器打开一个地址、输一个短码）：
+#   dsh-notify-graph-setup
+# 它会自动写 GRAPH_* 和 MAIL_TO，并把上面那行改成 provider=graph。
+# 完整教程（注册 Azure 应用、权限、排错表、怎么撤销）：docs/notify-outlook-graph.md
+#
+#GRAPH_CLIENT_ID=<你的 client_id>
+#GRAPH_TENANT=common
+#GRAPH_REFRESH_TOKEN=<跑一次 dsh-notify-graph-setup 自动写入；别手抄、别贴群里>
+#MAIL_TO=me@outlook.com,other@example.com
+#GRAPH_SCOPE=offline_access Mail.Send
+# 邮件标题前缀（自动加一个空格）
+#MAIL_SUBJECT_PREFIX=[dsh]
 
 # --------------------------------------------------------------- 行为开关
 # 每一轮跑完也推一条（0 = 只在"等用户回答"时推）

@@ -4,6 +4,7 @@
 # 用法：
 #   dsh-notify "标题" "正文"          直接推一条
 #   dsh-notify --test                 推一条测试消息（看配置通不通）
+#   dsh-notify --test --provider graph  只测 Graph 这一条（不管 provider= 写的什么）
 #   dsh-notify --hook [--async]       给 DSH 的 hook 桥用：从 stdin 读 Claude Code
 #                                     格式的 hook JSON，自动拼出"会话在等你回答"之类的消息
 #
@@ -15,6 +16,10 @@
 #   provider=telegram     BOT_TOKEN=... CHAT_ID=...
 #   provider=bark         BARK_KEY=...            （iOS，Bark App；可选 BARK_SERVER）
 #   provider=generic      URL=https://...         （POST，正文是 text/plain）
+#   provider=graph        GRAPH_CLIENT_ID=... GRAPH_TENANT=common
+#                         GRAPH_REFRESH_TOKEN=... MAIL_TO=a@b.com[,c@d.com]
+#                         （Microsoft Graph 发 Outlook 邮件；一次性授权跑
+#                          dsh-notify-graph-setup，教程 docs/notify-outlook-graph.md）
 #
 # 退出码**永远是 0**。这是有意的：
 #   它会挂在 PreToolUse 钩子上，而钩子退出码 2 = 阻止这次工具调用。
@@ -22,6 +27,7 @@
 #   失败只写一行到 ~/.local/state/dsh-remote/notify.log。
 #
 # 只依赖 curl；解析 hook JSON 时优先用 python3，没有就退化成"只发事件名"。
+# **例外**：provider=graph 必须要 python3（生成/解析 JSON，不依赖 jq）。
 
 set -u
 
@@ -31,6 +37,10 @@ CONF_DIR=${DSH_REMOTE_CONF_DIR:-${DSH_REMOTE_HOME:-${XDG_CONFIG_HOME:-$HOME/.con
 STATE_DIR=${DSH_REMOTE_STATE_DIR:-${DSH_REMOTE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}}
 CONF=${DSH_NOTIFY_CONF:-$CONF_DIR/notify.conf}
 LOG=${DSH_NOTIFY_LOG:-$STATE_DIR/notify.log}
+# provider=graph 的 access token 缓存（**access token，不是 refresh token**；
+# refresh token 只放在 600 的 notify.conf 里）。三个 GRAPH_*_URL 是测试用的覆盖，
+# 正常不用设 —— 见 tests/fake_graph.py。
+GRAPH_TOKEN_CACHE=${GRAPH_TOKEN_CACHE:-$STATE_DIR/graph-token.json}
 
 log() {
     [ -n "$LOG" ] || return 0
@@ -68,10 +78,311 @@ clip() {
     printf '%s' "$1" | cut -c "1-${2:-60}"
 }
 
+# ---------------------------------------------------------------- Graph
+# provider=graph —— 用 Microsoft Graph 发 Outlook / M365 邮件。
+#
+# **只用 python3 处理 JSON，不依赖 jq**（机器上可能没有 jq）。配置键都在
+# notify.conf：GRAPH_CLIENT_ID / GRAPH_TENANT / GRAPH_REFRESH_TOKEN / MAIL_TO，
+# 可选 GRAPH_SCOPE（默认 "offline_access Mail.Send"）与 MAIL_SUBJECT_PREFIX。
+#
+# 失败时把 OAuth / Graph 的 error.code / error.message（或 error_description）
+# 打到 stderr 并写 notify.log —— **任何 token 都不打印**。
+# 教程：docs/notify-outlook-graph.md；一次性授权：dsh-notify-graph-setup。
+
+graph_need() { # <键名>
+    printf 'dsh-notify: provider=graph 缺 %s（配置：%s）\n' "$1" "$CONF" >&2
+    log "graph 缺 $1（$CONF）"
+}
+
+# 把错误 body 摊成一行：Graph 的 error 是对象，OAuth 的 error 是字符串。
+graph_error_detail() {
+    [ -s "$1" ] || return 0
+    python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(0)
+err = d.get("error")
+if isinstance(err, dict):
+    code = err.get("code") or "?"
+    msg = str(err.get("message") or "").replace("\n", " ")
+    print("error.code=%s error.message=%s" % (code, msg))
+elif err:
+    desc = str(d.get("error_description") or "").replace("\n", " ")
+    codes = d.get("error_codes") or []
+    suffix = (" error_codes=" + ",".join(str(c) for c in codes)) if codes else ""
+    print("error=%s error_description=%s%s" % (err, desc, suffix))
+else:
+    print("响应=%s" % json.dumps(d, ensure_ascii=False)[:300])
+PY
+}
+
+graph_fail() { # <阶段> <HTTP 码> <body 文件>
+    _detail=$(graph_error_detail "$3")
+    if [ -n "$_detail" ]; then
+        printf 'dsh-notify: graph %s（HTTP %s）：%s\n' "$1" "$2" "$_detail" >&2
+        log "graph $1（HTTP $2）：$_detail"
+    else
+        _raw=$(head -c 300 "$3" 2>/dev/null | tr '\n' ' ')
+        printf 'dsh-notify: graph %s（HTTP %s）：%s\n' "$1" "$2" "$_raw" >&2
+        log "graph $1（HTTP $2）：$_raw"
+    fi
+}
+
+# 缓存里未过期的 access token（过期 / 换了 client / 换了 refresh token 就什么也不输出）。
+# 缓存绑定 client_id + tenant + refresh token 的 sha256：重新授权换了账号以后，
+# 旧 access token 不会继续替旧账号发信。留 60 秒余量。
+graph_cache_token() { # <client_id> <tenant> <refresh_token>
+    [ -f "$GRAPH_TOKEN_CACHE" ] || return 0
+    python3 - "$GRAPH_TOKEN_CACHE" "$1" "$2" "$3" <<'PY' 2>/dev/null
+import hashlib, json, sys, time
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(0)
+tok = d.get("access_token") or ""
+try:
+    exp = int(d.get("expires_at") or 0)
+except (TypeError, ValueError):
+    exp = 0
+want = hashlib.sha256(sys.argv[4].encode("utf-8")).hexdigest()
+if d.get("client_id") != sys.argv[2] or d.get("tenant") != sys.argv[3]:
+    sys.exit(0)
+if d.get("refresh_token_sha256") != want:
+    sys.exit(0)
+if tok and exp > int(time.time()) + 60:
+    sys.stdout.write(tok)
+PY
+}
+
+# 用 refresh token 换 access token。stdout **只放 token**，诊断全走 stderr。
+# 响应里带了新的 refresh_token 就回写 notify.conf（轮换；保留其它键和注释）。
+graph_refresh() ( # <临时目录> <client_id> <tenant> <refresh_token> <scope>
+    _gt=$1
+    _cid=$2
+    _tenant=$3
+    _rt=$4
+    _scope=$5
+    _url=${GRAPH_TOKEN_URL:-https://login.microsoftonline.com/$_tenant/oauth2/v2.0/token}
+    # refresh token 不进 argv（ps 看得见）：curl 的 name@file 会读文件并 urlencode
+    printf '%s' "$_rt" >"$_gt/refresh-token"
+    chmod 600 "$_gt/refresh-token" 2>/dev/null || true
+    _code=$(curl -sS -m 30 -o "$_gt/token.json" -w '%{http_code}' -X POST "$_url" \
+        --data-urlencode "client_id=$_cid" \
+        --data-urlencode "grant_type=refresh_token" \
+        --data-urlencode "refresh_token@$_gt/refresh-token" \
+        --data-urlencode "scope=$_scope" 2>"$_gt/token.curl.err")
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        _err=$(tr '\n' ' ' <"$_gt/token.curl.err" 2>/dev/null | cut -c 1-300)
+        printf 'dsh-notify: graph 换 token 请求失败（curl 退出码 %s）：%s\n' "$_rc" "$_err" >&2
+        log "graph 换 token 请求失败（curl $_rc）：$_err"
+        exit 1
+    fi
+    if [ "$_code" != 200 ]; then
+        graph_fail "换 token 失败" "$_code" "$_gt/token.json"
+        exit 1
+    fi
+    if ! python3 - "$_gt/token.json" "$GRAPH_TOKEN_CACHE" "$CONF" "$_gt/access-token" \
+        "$_gt/refresh-token" "$_cid" "$_tenant" <<'PY'
+import hashlib, json, os, re, sys, time
+
+resp_path, cache_path, conf_path, access_path, old_rt_path, cid, tenant = sys.argv[1:8]
+
+try:
+    with open(resp_path, encoding="utf-8") as fh:
+        d = json.load(fh)
+except Exception as exc:
+    print("dsh-notify: graph 换 token 的响应不是 JSON：%s" % exc, file=sys.stderr)
+    sys.exit(1)
+
+tok = d.get("access_token")
+if not tok:
+    print("dsh-notify: graph 换 token 的响应里没有 access_token", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    expires_in = int(d.get("expires_in") or 3600)
+except (TypeError, ValueError):
+    expires_in = 3600
+
+# 轮换后的 refresh token 才是配置里最终的那个 —— 缓存绑定它。
+new_rt = d.get("refresh_token")
+old_rt = ""
+try:
+    with open(old_rt_path, encoding="utf-8") as fh:
+        old_rt = fh.read()
+except OSError:
+    pass
+
+# access token 缓存：600，先写临时文件再 rename（免得留下半截文件）
+cache_dir = os.path.dirname(os.path.abspath(cache_path))
+os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+tmp = "%s.tmp.%d" % (cache_path, os.getpid())
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump({"access_token": tok,
+               "expires_at": int(time.time()) + expires_in,
+               "scope": d.get("scope") or "",
+               "client_id": cid,
+               "tenant": tenant,
+               "refresh_token_sha256":
+                   hashlib.sha256((new_rt or old_rt).encode("utf-8")).hexdigest()}, fh)
+os.replace(tmp, cache_path)
+try:
+    os.chmod(cache_path, 0o600)
+except OSError:
+    pass
+
+with open(access_path, "w", encoding="utf-8") as fh:
+    fh.write(tok)
+try:
+    os.chmod(access_path, 0o600)
+except OSError:
+    pass
+
+# refresh token 轮换：响应里带新的才回写，保留 notify.conf 里其它键和注释。
+if new_rt and new_rt != old_rt:
+    try:
+        with open(conf_path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        lines = []
+    pattern = re.compile(r"^\s*GRAPH_REFRESH_TOKEN\s*=")
+    out = []
+    replaced = False
+    for line in lines:
+        if pattern.match(line):
+            if not replaced:
+                out.append("GRAPH_REFRESH_TOKEN=%s\n" % new_rt)
+                replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append("GRAPH_REFRESH_TOKEN=%s\n" % new_rt)
+    try:
+        tmp_conf = "%s.tmp.%d" % (conf_path, os.getpid())
+        fd = os.open(tmp_conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.writelines(out)
+        os.replace(tmp_conf, conf_path)
+        os.chmod(conf_path, 0o600)
+        print("dsh-notify: refresh token 已轮换，回写到 %s" % conf_path,
+              file=sys.stderr)
+    except OSError as exc:
+        # 回写失败不该让这次推送失败 —— access token 已经拿到了
+        print("dsh-notify: 警告：refresh token 轮换回写失败（%s）" % exc,
+              file=sys.stderr)
+PY
+    then
+        printf 'dsh-notify: graph 换 token 的响应解析失败（%s）\n' "$_gt/token.json" >&2
+        log "graph 换 token 响应解析失败"
+        exit 1
+    fi
+    cat "$_gt/access-token"
+    exit 0
+)
+
+# POST /me/sendMail。**成功判据是 HTTP 202**（Graph 的契约；200 不算成功）。
+graph_send() ( # <临时目录> <access_token> <收件人> <标题> <正文>
+    _gt=$1
+    _tok=$2
+    _to=$3
+    _subject=$4
+    _body=$5
+    _url=${GRAPH_SENDMAIL_URL:-https://graph.microsoft.com/v1.0/me/sendMail}
+    if ! python3 - "$_to" "$_subject" "$_body" >"$_gt/mail.json" <<'PY'
+import json, sys
+
+to = [a.strip() for a in sys.argv[1].replace(";", ",").split(",") if a.strip()]
+if not to:
+    print("MAIL_TO 里没有收件人", file=sys.stderr)
+    sys.exit(2)
+print(json.dumps({
+    "message": {
+        "subject": sys.argv[2],
+        "body": {"contentType": "Text", "content": sys.argv[3]},
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+    },
+    "saveToSentItems": True,
+}, ensure_ascii=False))
+PY
+    then
+        printf 'dsh-notify: graph 生成发信 JSON 失败（检查 MAIL_TO：%s）\n' "$_to" >&2
+        log "graph 生成发信 JSON 失败（MAIL_TO=$_to）"
+        exit 1
+    fi
+    _code=$(curl -sS -m 30 -o "$_gt/send.json" -w '%{http_code}' -X POST "$_url" \
+        -H "Authorization: Bearer $_tok" \
+        -H 'Content-Type: application/json' \
+        --data-binary "@$_gt/mail.json" 2>"$_gt/send.curl.err")
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        _err=$(tr '\n' ' ' <"$_gt/send.curl.err" 2>/dev/null | cut -c 1-300)
+        printf 'dsh-notify: graph 发信请求失败（curl 退出码 %s）：%s\n' "$_rc" "$_err" >&2
+        log "graph 发信请求失败（curl $_rc）：$_err"
+        exit 1
+    fi
+    if [ "$_code" = 202 ]; then
+        if [ "$MODE" = test ]; then
+            printf 'graph: 已交给 Microsoft Graph（HTTP 202），收件人：%s\n' "$_to" >&2
+        fi
+        log "graph: 已发送（HTTP 202）收件人=$_to 标题=$_subject"
+        exit 0
+    fi
+    graph_fail "发信失败" "$_code" "$_gt/send.json"
+    exit 1
+)
+
+graph_push() ( # <标题> <正文>
+    _g_title=$1
+    _g_body=$2
+    _g_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dsh-notify-graph.XXXXXX" 2>/dev/null) || {
+        printf 'dsh-notify: graph 建不了临时目录\n' >&2
+        log "graph 建不了临时目录"
+        exit 1
+    }
+    trap 'rm -rf "$_g_tmp"' EXIT INT TERM
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'dsh-notify: provider=graph 需要 python3（生成/解析 JSON；不用 jq）\n' >&2
+        log "graph 需要 python3"
+        exit 1
+    fi
+    _g_cid=$(conf GRAPH_CLIENT_ID) || { graph_need GRAPH_CLIENT_ID; exit 1; }
+    _g_tenant=$(conf GRAPH_TENANT 2>/dev/null || printf '')
+    [ -n "$_g_tenant" ] || _g_tenant=common
+    _g_rt=$(conf GRAPH_REFRESH_TOKEN) || { graph_need GRAPH_REFRESH_TOKEN; exit 1; }
+    _g_scope=$(conf GRAPH_SCOPE 2>/dev/null || printf '')
+    [ -n "$_g_scope" ] || _g_scope='offline_access Mail.Send'
+    _g_to=$(conf_any MAIL_TO mail_to 2>/dev/null || printf '')
+    [ -n "$_g_to" ] || { graph_need MAIL_TO; exit 1; }
+    _g_prefix=$(conf MAIL_SUBJECT_PREFIX 2>/dev/null || printf '')
+    [ -n "$_g_body" ] || _g_body=$_g_title
+
+    _g_token=$(graph_cache_token "$_g_cid" "$_g_tenant" "$_g_rt")
+    if [ -z "$_g_token" ]; then
+        _g_token=$(graph_refresh "$_g_tmp" "$_g_cid" "$_g_tenant" "$_g_rt" "$_g_scope") || exit 1
+    fi
+    [ -n "$_g_token" ] || {
+        printf 'dsh-notify: graph 没拿到 access token\n' >&2
+        log "graph 没拿到 access token"
+        exit 1
+    }
+    _g_subject=$_g_title
+    [ -n "$_g_prefix" ] && _g_subject="$_g_prefix $_g_title"
+    graph_send "$_g_tmp" "$_g_token" "$_g_to" "$_g_subject" "$_g_body" || exit 1
+    exit 0
+)
+
 push() {
     title=$(clip "$1" 60)
     body=$2
-    provider=$(conf_any provider PROVIDER 2>/dev/null || printf '')
+    provider=${PROVIDER_OVERRIDE:-$(conf_any provider PROVIDER 2>/dev/null || printf '')}
     [ -n "$provider" ] || provider=serverchan
 
     case $provider in
@@ -106,6 +417,9 @@ ${body}" >/dev/null
         url=$(conf_any URL url WEBHOOK) || { log "generic: 缺 URL"; return 1; }
         printf '%s\n%s\n' "$title" "$body" |
             curl -fsS -m 20 -X POST -H 'Content-Type: text/plain; charset=utf-8' --data-binary @- "$url" >/dev/null
+        ;;
+    graph | outlook | msgraph | o365)
+        graph_push "$title" "$body"
         ;;
     none | off | '')
         log "provider=none，什么也不发"
@@ -178,11 +492,14 @@ usage() {
 
 ASYNC=0
 MODE=plain
+PROVIDER_OVERRIDE=
 while [ $# -gt 0 ]; do
     case $1 in
     --hook) MODE=hook ;;
     --async) ASYNC=1 ;;
     --test) MODE=test ;;
+    --provider) shift; [ $# -gt 0 ] && PROVIDER_OVERRIDE=$1 ;;
+    --provider=*) PROVIDER_OVERRIDE=${1#*=} ;;
     --help | -h) usage; exit 0 ;;
     --) shift; break ;;
     -*) printf 'dsh-notify: 不认识的参数 %s\n' "$1" >&2; exit 0 ;;

@@ -868,3 +868,64 @@ rewrite 历史，所以在这里点名那个提交。
    不想重启时用 `dsh-remote tunnel-status --probe`。
 
 `sh tests/run_tests.sh` → **685 通过 0 失败**（新增 1 条漂移正例断言）。
+
+## 2026-10-21 / `provider=graph`：用 Outlook / Microsoft Graph 发推送（+ 一次性授权 + 教程）
+
+**用户要求**：`dsh-notify` 加 `provider=graph`（refresh token 换 access token →
+`/me/sendMail`，成功 = 202；token 缓存 600；refresh token 轮换回写；错误码透出；
+不依赖 jq），一次性 device code 授权脚本，中文教程 `docs/notify-outlook-graph.md`，
+测试用本地假端点且基线全绿。**明确不许真发信、不许填真凭据、不许碰微软端点。**
+
+**代码**
+
+- `bin/dsh-notify`（238 → 555 行）：`graph` 分支 + `graph_push` / `graph_refresh` /
+  `graph_send` / `graph_cache_token` / `graph_error_detail` / `graph_fail`；
+  `--provider <名字>` 覆盖；access token 缓存 `$STATE_DIR/graph-token.json`（600）；
+  轮换用 python 只改 `GRAPH_REFRESH_TOKEN=` 那一行并 600；refresh token 经
+  `curl --data-urlencode "refresh_token@<600 文件>"` 传，不进 argv；失败打
+  `error.code` / `error.message`（Graph）或 `error` / `error_description` /
+  `error_codes`（OAuth）。
+- `bin/dsh-notify-graph-setup`（新，334 行）：device code flow、pending/slow_down/
+  expires_in、拿 refresh token 后写 600 的 `notify.conf`（保留其它键 + 备份），
+  已有 refresh token 时先问；非交互 + 没 `--yes` 不覆盖。
+- `bin/dsh-remote`：`notify-test` 把参数原样转给 `dsh-notify`（所以
+  `dsh-remote notify-test --provider graph` 可用）。
+- `scripts/install.sh`：装/卸清单都加 `dsh-notify-graph-setup`。
+- `notify.conf.example`：graph 段（全是 `<你的 …>` 占位符）。
+- `tests/fake_graph.py`（新）：假 devicecode / token / sendMail，按 URL 第一段选
+  场景（ok / rotated / tokenfail / senderr / send200 / slow / denied / expired），
+  每条请求记 jsonl 给测试对账；只绑 127.0.0.1。
+- `tests/run_tests.sh`：新增 **C2 节 76 条**；A 节加新脚本的 `sh -n`/`bash -n`
+  （+2）；I 节加"setup 也装进 `$WTOOL_PREFIX/bin`"（+1），"源找不到"的条数
+  8→9 / 7→8 跟着改。
+
+**实测**
+
+- `sh tests/run_tests.sh`（不带 `-v`）→ **764 通过 0 失败**；
+  再跑一次 `-v` 取逐节：A 16 / B 6 / C 22 / **C2 76** / D 34 / E 53 / F 14 / G 8 /
+  H 6 / I 57 / J 101 / K 57 / L 17 / M 46 / N 22 / O 79 / P 85 / Q 65 = **764**。
+  （基线本轮开工时实测 **685 通过 0 失败**；仓库文档里之前写的 684 是旧的。）
+- 人工另跑过（同样只打假端点）：`rotated` 场景确实把 `GRAPH_REFRESH_TOKEN` 改成
+  `ROTATED-REFRESH-TOKEN`、其它键/注释保留；`tokenfail` 打出
+  `error=invalid_grant ... AADSTS70008`；`senderr` 打出
+  `error.code=ErrorSendAsDenied`；`send200` 按失败处理；授权脚本 `slow_down`
+  把间隔从 1s 加到 6s（实测 8s 完成）。
+- 测试全程**没有**调用 `login.microsoftonline.com` / `graph.microsoft.com`；
+  仓库里的 token 全是 `FAKE-*`。
+
+**没验 / 风险**
+
+- **真微软端点、真账号授权、真 refresh token 轮换一次都没验**（用户明确要求
+  不要真发信/不要真凭据）。用户明天按教程自己跑；Entra 菜单措辞、管理员同意、
+  条件访问、真租户的 device code 行为都只能到时看。
+- 教程里的排错表是从微软公开错误码语义整理的，**没有一条在真租户上复现过**；
+  真撞上时以 `dsh-remote log` 打出的原文为准。
+- 跑测试的机器上有 docker，D 节照旧真跑 `caddy validate`（与这轮无关）。
+
+**中间一次假红（如实记，不当规律）**：有一轮测试跑到 C2 时我同时在改
+`bin/dsh-notify-graph-setup`（只动注释和换行），C2⑬ 那次红了；之后不再动任何文件、
+干净重跑是 764/0。**没定位到原因**（最可能是脚本运行中被我改到），也没有复现，
+所以不写成"这个测试不稳"。
+
+**判据**：`git show --stat` 的文件清单；`sh tests/run_tests.sh` 的末两行；
+`ss -ltnp | grep ':3080 '` 的 PID 全程未变（17169）。

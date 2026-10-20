@@ -38,6 +38,7 @@
 | 22 | [`force-restart-dsh-remote`：一键兜底，以及"绝不重启 `dsh web`"的唯一例外](0022-force-restart-command-and-restart-web-exception.md) | 2026-10-09 用户批准"要有强制重置按钮"：当天实测三类故障（隧道风暴停下 / 手工实例的 token 抓不到 / 服务被端口占着 activating）都要人回家敲命令。**限定 ADR-0005**：默认档绝不碰 `dsh web`，`--restart-web --yes` 是显式例外（只 SIGTERM 占着端口的那一个 PID + 用服务起回来） |
 | 24 | [`harness` = 本地管理器（**有则开、无则起**），`harness-remote` = 云上那半](0024-harness-as-local-manager-and-opener.md) | 2026-10-09 用户重做："任意时刻执行 `harness`，有 dsh web 就立刻开浏览器，没有就自己起一个；**不许再有等 20 秒**"。**部分取代 ADR-0020**（输出契约收窄成 ≤3 行、不再等待）；含"opener 绝不经 shell"的实测坑（`cmd /c start` 把 URL 转成 `http \127.0.0.1 …`）与三档退、为什么 opener 失败不算失败、`harness-remote` 的边界 |
 | 23 | [手机上的"重置按钮"走云上 `/reset` → 家里 token broker，而不是直连 `dsh web`](0023-reset-button-through-token-broker.md) | 2026-10-09：broker 已经在家、已经有隧道、和命令同一个 `bin/`，所以由它代跑安全档（只跑命令、不重写逻辑）；POST 先回 202 再动隧道（实测 0.126s）、一次性 nonce 挡 CSRF、云上永不允许 `--restart-web` |
+| 25 | [Outlook 推送走 Microsoft Graph（device code + refresh token），不走 SMTP AUTH](0025-outlook-graph-device-code.md) | 2026-10-21：`provider=graph` + `dsh-notify-graph-setup`；含"为什么不要客户端密钥 / 不依赖 jq / 202 才算成功 / refresh token 轮换回写"与"真微软端点没调过"这条验证边界 |
 
 > **1–11 是同一条线（2026-09-20 的初版 `13734e3` + 2026-10-04 的修复）**，
 > 2026-10-07 补记成 ADR。当时只写了 `README.md` 的"为什么这么设计"一节和代码注释，

@@ -10,17 +10,17 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 "卡在等你回答 / 一轮跑完"的推送。
 
 **它是独立项目**：`wtool install dsh-projects/dsh-remote` 之后才有 `dsh-remote` /
-`dsh-notify` 两条命令。仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档），
+`dsh-notify` / `dsh-notify-graph-setup` 三条命令。仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档），
 证书 / 密码 / 密钥 / 日志一律在安装落点，不进 git。
 
 | 东西 | 在哪 |
 |---|---|
-| 家这头的命令 | `bin/dsh-remote`、`bin/dsh-notify` |
+| 家这头的命令 | `bin/dsh-remote`、`bin/dsh-notify`、`bin/dsh-notify-graph-setup`（一次性授权 Outlook/Graph） |
 | 云端（阿里云）的一条命令装好 | `cloud/relay.sh` + `cloud/Caddyfile.*` + `cloud/docker-compose.yml` |
 | hook 桥的模板 | `hooks/claude-hooks.json`（`dsh-remote notify-enable` 渲染进配置目录） |
 | shell 集成（zsh/bash 各一份） | `env.zsh` / `env.bash` |
 | 服务清单 | `wtool.xml` |
-| 给用户的说明书 | `README.md` |
+| 给用户的说明书 | `README.md`；Outlook 邮件教程在 `docs/notify-outlook-graph.md` |
 
 ---
 
@@ -139,10 +139,11 @@ basic auth）→ SSH 反向隧道 → 家里 `127.0.0.1:3080`（`dsh web`），�
 
 ```sh
 cd dsh-projects/dsh-remote
-sh tests/run_tests.sh         # 675 条（以跑出来的 PASS 行为准），两三分钟
+sh tests/run_tests.sh         # 764 条（以跑出来的 PASS 行为准），两三分钟
                               #   不联网、不碰真 $HOME；连 python3；
                               #   ⚠️ 本机装了 docker 时 D 节会跑一次 docker run … caddy validate（hazards H8）
                               #   J 节用 DSH_REMOTE_UNIT_DIR + systemctl/tmux 桩，不碰真 unit / 真 tmux
+                              #   C2 节：provider=graph，全打 tests/fake_graph.py（只绑回环，绝不碰微软）
                               #   K/L/M/N 节：broker 起真进程（只绑回环）、dsh-qr 比对向量、server/passwd 用假 ssh/scp
                               #   O 节：harness 四态用 systemctl/journalctl 桩 + 真回环监听，
                               #         bash/zsh 各跑一遍同一张表；dsh-web-run 的代理用桩 npx dump 子进程环境对账
@@ -150,11 +151,12 @@ sh tests/caddy-validate.sh    # 3 条，要 docker（caddy:2 镜像，本地没�
 sh tests/relay-e2e.sh         # 9 条，要 docker + python3，会起容器再自己撤 —— 人工跑
 ```
 
-`run_tests.sh` 逐节（2026-10-09 实测）：A 语法 10 / B `env.*` 等价 6 /
-C `dsh-notify` 22 / D Caddyfile 渲染 34 / E 子命令 53 / F `cloud-install` 14 /
-G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 55 / J 常驻隧道 100 /
-K token 固定地址 55 / L 二维码 17 / M 一条命令装好 46 / N 改密码 22 /
-O dsh web 常驻 + harness 四态 + 代理 142 / P 一键强制重置 + 手机 `/reset` 85 = **675**。
+`run_tests.sh` 逐节（2026-10-21 实测）：A 语法 16 / B `env.*` 等价 6 /
+C `dsh-notify` 22 / **C2 provider=graph 76** / D Caddyfile 渲染 34 / E 子命令 53 /
+F `cloud-install` 14 / G `~/.dsh` 边界 8 / H `check-hooks` 6 / I 安装脚本 57 /
+J 常驻隧道 101 / K token 固定地址 57 / L 二维码 17 / M 一条命令装好 46 / N 改密码 22 /
+O dsh web 常驻 + harness 四态 + 代理 79 / P 一键强制重置 + 手机 `/reset` 85 /
+Q `harness-remote` 65 = **764**。
 条数是手写的、会过期 —— **以跑出来的 PASS 行为准**。
 
 ### ⚠️ 验证的铁律：**绝不碰 3080**（2026-10-09 用户明确要求）
@@ -189,7 +191,7 @@ O dsh web 常驻 + harness 四态 + 代理 142 / P 一键强制重置 + 手机 `
 
 ## 已知缺口（别当成已经有能力）
 
-**完整的"还剩什么"在 `BACKLOG.md` 的 U1–U11**；这里只列最容易被误当能力的：
+**完整的"还剩什么"在 `BACKLOG.md` 的 U1–U21**；这里只列最容易被误当能力的：
 
 - **hook 桥还没被证实会触发**（2026-09-21 实测：profile patch 挂上了，但
   `SessionStart`/`Stop`/`PreToolUse` 一个都没触发）。在证实之前，

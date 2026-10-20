@@ -7,6 +7,8 @@
 #
 #   $WTOOL_PREFIX/bin/dsh-remote        -> <项目>/bin/dsh-remote        （命令）
 #   $WTOOL_PREFIX/bin/dsh-notify        -> <项目>/bin/dsh-notify
+#   $WTOOL_PREFIX/bin/dsh-notify-graph-setup -> <项目>/bin/dsh-notify-graph-setup
+#                                       （一次性授权：Outlook/Graph 的 refresh token）
 #   $WTOOL_PREFIX/bin/dsh-token-broker  -> <项目>/bin/dsh-token-broker  （token 重定向小服务）
 #   $WTOOL_PREFIX/bin/dsh-remote-server -> <项目>/bin/dsh-remote-server  （server 的薄封装）
 #   $WTOOL_PREFIX/bin/dsh-force-restart-dsh-remote -> <项目>/bin/dsh-force-restart-dsh-remote
@@ -128,7 +130,7 @@ link_dir_out() { # <home 下的路径> <prefix 下的目标>
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
-    for n in dsh-remote dsh-notify dsh-token-broker dsh-remote-server dsh-force-restart-dsh-remote harness-remote; do
+    for n in dsh-remote dsh-notify dsh-notify-graph-setup dsh-token-broker dsh-remote-server dsh-force-restart-dsh-remote harness-remote; do
         if [ -L "$bin_dir/$n" ]; then
             rm -f -- "$bin_dir/$n"
             say "已移除 $bin_dir/$n"
@@ -147,7 +149,7 @@ fi
 
 # 1) 命令：$WTOOL_PREFIX/bin/<名字> -> <项目>/bin/<名字>
 n_cmd=0
-for n in dsh-remote dsh-notify dsh-token-broker dsh-remote-server dsh-force-restart-dsh-remote harness-remote; do
+for n in dsh-remote dsh-notify dsh-notify-graph-setup dsh-token-broker dsh-remote-server dsh-force-restart-dsh-remote harness-remote; do
     src="$proj/bin/$n"
     dst="$bin_dir/$n"
     if [ ! -x "$src" ]; then
@@ -199,7 +201,7 @@ fi
 
 say ""
 say "源（项目检出目录）：$proj"
-say "  命令      $bin_dir/dsh-remote、$bin_dir/dsh-notify、$bin_dir/dsh-token-broker、$bin_dir/dsh-remote-server、$bin_dir/dsh-force-restart-dsh-remote、$bin_dir/harness-remote（这次到位 $n_cmd 条）"
+say "  命令      $bin_dir/dsh-remote、$bin_dir/dsh-notify、$bin_dir/dsh-notify-graph-setup、$bin_dir/dsh-token-broker、$bin_dir/dsh-remote-server、$bin_dir/dsh-force-restart-dsh-remote、$bin_dir/harness-remote（这次到位 $n_cmd 条）"
 if [ "$found_sample" = 1 ]; then
     say "  配置实体  $etc_dir          （$conf_link 是它的软链）"
     say "  日志实体  $var_dir          （$state_link 是它的软链）"

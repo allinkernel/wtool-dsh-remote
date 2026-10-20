@@ -57,13 +57,14 @@
 
 | 文件 | 行数 | 是什么 |
 |---|---|---|
-| `bin/dsh-remote` | 2777 | 家里这头的主命令（24 个子命令） |
+| `bin/dsh-remote` | 2789 | 家里这头的主命令（24 个子命令） |
 | `bin/dsh-token-broker` | 386 | **固定地址的入口小服务**（纯 python 标准库）：不带 token 的 `/` 与 `/go` 做 302；**带 `dsh-auth-*` cookie 的 `GET /` 先探测一次、有效就把这一条首页代发**（见 §3.2，ADR-0018） |
 | `bin/dsh-qr` | 573 | **自带二维码**（纯 python；字节模式 + RS 纠错 + 标准罚分挑掩码；终端/PNG/SVG，见 §3.3） |
 | `bin/dsh-remote-server` | 8 | `dsh-remote server` 的薄封装（用户先说的是这个名字，两个入口等价） |
 | `bin/harness-remote` | 426 | **云上那半的管理器**（2026-10-09 加，ADR-0024）：`status`/`open`/`reset`/`passwd`/`url`/`qr`，薄封装转发给 `dsh-remote` 的现成子命令 + 同一套 opener；见 §3.6 |
-| `bin/dsh-notify` | 238 | 推送脚本；也是 hook 桥调用的那个命令 |
-| `scripts/install.sh` | 215 | `wtool install` 调它：铺命令软链（含 `harness-remote`）+ 配置/日志软链 |
+| `bin/dsh-notify` | 555 | 推送脚本（6 种 provider；graph 见 §7）；也是 hook 桥调用的那个命令 |
+| `bin/dsh-notify-graph-setup` | 334 | **一次性授权**（device code flow）：换 refresh token 写进 600 的 `notify.conf`，只碰那几个 GRAPH_* 键（§7） |
+| `scripts/install.sh` | 217 | `wtool install` 调它：铺命令软链（含 `harness-remote`）+ 配置/日志软链 |
 | `cloud/relay.sh` | 412 | **在云上跑**：渲染 Caddyfile → 起 Caddy 容器 → 自检（compose / 用户空间两种模式） |
 | `cloud/Caddyfile.domain` | 74 | 域名模式模板（占位符 `{{...}}`） |
 | `cloud/Caddyfile.ip` | 77 | IP 模式模板（`tls internal` 自签 + `default_sni`） |
@@ -72,12 +73,13 @@
 | `env.zsh` / `env.bash` | 484 / 484 | shell 集成：导出三个目录变量 + **`harness` 函数**（本地管理器：只读探测 `_hr_*` + 开浏览器 `_hr_open`/`_hr_open_pkg`）；两份**逐字等价**（只差第 1 行标题），必须同改 |
 | `wtool.xml` | 33 | 服务清单：`<zshrc>` / `<bashrc>` / `<publish kind="source"/>` |
 | `remote.conf.example` | 58 | 隧道配置样板（含 `web_proxy=`：常驻服务里 npx 的代理开关，默认清空） |
-| `notify.conf.example` | 44 | 推送配置样板 |
-| `tests/run_tests.sh` | 2573 | **684 条**（2026-10-09 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
+| `notify.conf.example` | 60 | 推送配置样板（含 graph 段，全是占位符） |
+| `tests/run_tests.sh` | 2810 | **764 条**（2026-10-21 实测），不联网 / 不碰真 `$HOME` / 不碰真 `~/.config/systemd/user` 与真 tmux / 不碰真云；**装了 docker 的机器上 D 节会真跑** `docker run --rm caddy:2.11.4 caddy hash-password / version / validate` |
 | `tests/fake_dsh_web.py` | 194 | 测试零件：假 `dsh web`（按 cookie 的值造 200/401/303/500/慢响应；只给 K 节用，见 §10） |
 | `tests/caddy-validate.sh` | 73 | 3 条，用 `caddy:2.11.4` 真校验 Caddyfile（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/relay-e2e.sh` | 139 | 9 条，真起 Caddy 容器验 HTTPS+basic auth+反代（要 docker；没 docker 时 **`exit 77`**） |
 | `tests/http_sink.py` | 40 | 测试零件：把每次 POST 的 body 追加写进文件的本地接收端 |
+| `tests/fake_graph.py` | 221 | 测试零件：假 Microsoft 登录端点 + 假 `/me/sendMail`（按场景回 pending / slow_down / invalid_grant / 202 / 403 / 200；只绑 127.0.0.1，见 §7、§10） |
 | `README.md` / `AGENTS.md` / `BACKLOG.md` / `architecture.md` / `journal.md` / `docs/` | — | 文档 |
 
 `wtool.xml` 的实质内容（无 `id=`，项目身份 = 路径 `dsh-projects/dsh-remote`）：
@@ -728,6 +730,7 @@ restart 循环（实测，hazards H6）。
 ```
 dsh-notify "标题" "正文"        # 直接推；标题默认为 "DSH 消息"
 dsh-notify --test              # 推一条测试消息（带主机名/时间/配置路径）
+dsh-notify --test --provider graph   # 只测 graph 这一条（覆盖配置里的 provider=）
 dsh-notify --hook [--async]    # 从 stdin 读 Claude Code 格式的 hook JSON
 ```
 
@@ -746,11 +749,13 @@ dsh-notify --hook [--async]    # 从 stdin 读 Claude Code 格式的 hook JSON
 | `telegram` | `tg` | `BOT_TOKEN` + `CHAT_ID` | `POST https://api.telegram.org/bot<tok>/sendMessage`（国内要代理，curl 认 `https_proxy`） |
 | `bark` | — | `BARK_KEY`（可选 `BARK_SERVER`，默认 `https://api.day.app`） | `POST <server>/<key>` |
 | `generic` | `webhook` / `http` | `URL` | `POST`，正文 `text/plain`，格式是"标题\n正文" |
+| `graph` | `outlook` / `msgraph` / `o365` | `GRAPH_CLIENT_ID` + `GRAPH_TENANT`（默认 `common`）+ `GRAPH_REFRESH_TOKEN` + `MAIL_TO`；可选 `GRAPH_SCOPE`（默认 `offline_access Mail.Send`）、`MAIL_SUBJECT_PREFIX` | `POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`（`grant_type=refresh_token`）换 access token → `POST https://graph.microsoft.com/v1.0/me/sendMail`（Bearer + JSON：`subject` / `body{contentType:"Text"}` / `toRecipients` / `saveToSentItems:true`）；**成功 = HTTP 202** |
 | `none` | `off` | — | 什么都不发，写一行日志 |
 
 其它：`on_stop`（默认 `1`）= 0/off/no/false/none 时 `Stop` 事件不推；
 非 `--test` 的推送会把 `public_url` 附在正文最后；标题 `cut -c 1-60` 截断；
-所有请求 `curl -fsS -m 20`。
+其它 provider 的请求是 `curl -fsS -m 20`（graph 要读状态码，用 `-sS -m 30`，
+见下）。`--provider <名字>` 可以覆盖配置里的 `provider=`，只对这一次生效。
 
 `--hook` 的消息拼装（`hook_message`）：优先 `python3` 解析 stdin 的 JSON；
 没有 `python3` 就退化成固定的"DSH 有事找你"。
@@ -762,6 +767,44 @@ dsh-notify --hook [--async]    # 从 stdin 读 Claude Code 格式的 hook JSON
 | `Stop` | `✅ 这一轮跑完了` | 工作区名 |
 | `SessionStart` | `▶️ 新会话开始了` | 工作区名 |
 | 其它 / 解析不出事件名 | `DSH hook：<事件>` | 工作区名 |
+
+### `provider=graph`（Outlook / Microsoft Graph，2026-10-21）
+
+- **只用 `curl` + `python3`**：JSON 的生成/解析全交给 python3，**不依赖 jq**
+  （没 python3 时 graph 直接失败并写日志，别的 provider 不受影响）。
+- **换 token**：读 600 的 `notify.conf`，用 refresh token 走
+  `POST https://login.microsoftonline.com/$GRAPH_TENANT/oauth2/v2.0/token`
+  （`grant_type=refresh_token`、`scope=$GRAPH_SCOPE`）。refresh token 经
+  `curl --data-urlencode "refresh_token@<600 临时文件>"` 传，**不进 argv**。
+- **access token 缓存**：`$STATE_DIR/graph-token.json`（600；
+  `{"access_token","expires_at","scope","client_id","tenant","refresh_token_sha256"}`）。
+  缓存绑定 client_id + tenant + 当前 refresh token 的 sha256 —— 重新授权换了账号后，
+  旧 access token 不会被继续用来替旧账号发信。`expires_at` 比 `now` 多 60 秒才算有效，
+  有效就不换；换成功后原子写回（临时文件 + `rename`）。
+- **refresh token 轮换**：token 响应里带 `refresh_token` 且和旧的不同 → 用 python
+  重写 `notify.conf` 的 `GRAPH_REFRESH_TOKEN=` 那一行（**其它键/注释原样保留**，
+  重复键收敛成一行，权限 600）。回写失败只警告，不影响这次发信。
+- **发信**：`/me/sendMail`，`saveToSentItems:true`；`MAIL_TO` 支持英文逗号
+  （也认分号），每项 trim 后进 `toRecipients`；标题 = `<MAIL_SUBJECT_PREFIX> <标题>`
+  （前缀非空时自动补一个空格）。
+  **只有 202 算成功**；200/4xx/5xx 都算失败。
+- **诊断**：换 token 非 200、发信非 202 时把响应里的 `error.code` / `error.message`（Graph）或
+  `error` / `error_description` / `error_codes`（OAuth）打成一行到 stderr + `notify.log`；
+  **绝不打印 token**。以 `--test` 跑时成功也打一行 `HTTP 202`。
+- **一次性授权**：`bin/dsh-notify-graph-setup` —— device code flow
+  （`POST .../devicecode`，scope `offline_access Mail.Send openid profile`），
+  打印 `verification_uri` + `user_code`，按 `interval` 轮询 token 端点；
+  `authorization_pending` 继续、`slow_down` 间隔 +5 秒、`expires_in` 到点退出；
+  拿到 refresh token 后写 `notify.conf`（provider=graph + GRAPH_* + MAIL_TO，
+  保留其它键，先备份成 `.bak-graph-setup-<时间>-<pid>`，600）。
+- 测试用的覆盖（正常别设）：`GRAPH_TOKEN_URL` / `GRAPH_SENDMAIL_URL` /
+  `GRAPH_DEVICECODE_URL` / `GRAPH_TOKEN_CACHE`，假端点见 `tests/fake_graph.py`。
+
+**验证程度**：换 token（成功/失败）、202、Graph 错误码透出、refresh token 轮换回写、
+token 缓存命中/过期、`--provider` 覆盖、`dsh-remote notify-test --provider graph`
+转发、授权脚本的 pending/slow_down/declined/expired 与配置写回 —— **全部用本地假端点
+实测**（C2 节 76 条）。**没有、也不该有**对真微软端点的调用；真账号的首次授权由用户
+按 `docs/notify-outlook-graph.md` 自己跑（明天）。
 
 `--async` 的实现：`( push … ) </dev/null >>"$LOG" 2>&1 &` 然后父进程立刻 `exit 0`。
 **三个 fd 都要重定向走**，否则钩子 runner 会一直等管道 EOF，`--async` 就成了摆设（hazards H2）。
@@ -800,7 +843,9 @@ state_link= ${XDG_STATE_HOME:-$home/.local/state}/dsh-remote     # $home 里的�
 
 安装动作：
 
-1. `dsh-remote` / `dsh-notify`：源可执行才 `ln -sfn` 到 `$bin_dir`；已经是同一条软链就跳过
+1. `dsh-remote` / `dsh-notify` / `dsh-notify-graph-setup` / `dsh-token-broker` /
+   `dsh-remote-server` / `dsh-force-restart-dsh-remote` / `harness-remote`：源可执行才
+   `ln -sfn` 到 `$bin_dir`；已经是同一条软链就跳过
    （幂等）；目标存在且**不是**软链 → 警告跳过，不覆盖。
 2. 两份样板 `notify.conf.example` / `remote.conf.example`：源在就 `cp -f` 进 `$etc_dir`
    （已存在就不重拷）。**两张样板一个都找不到 = 这一摊整段跳过**（连目录都不建）。
@@ -811,7 +856,7 @@ state_link= ${XDG_STATE_HOME:-$home/.local/state}/dsh-remote     # $home 里的�
 **"源找不到"的语义**（脚本头两条硬规矩）：只跳过那一条 + 打印"找的地方：…（来自
 WTOOL_PROJECT_DIR / 按脚本位置自推）"，末尾交代跳过了几条；**整脚本仍然 exit 0**
 （不能把一个项目的问题变成整个 `wtool install` 失败），但**一个字节都不写** ——
-不留空目录、不留悬空软链。`--uninstall` 只撤两条命令软链和两条目录软链，
+不留空目录、不留悬空软链。`--uninstall` 只撤命令软链和两条目录软链，
 `etc/` / `var/` 里的实体（用户的配置和日志）留着，并提醒用 `notify-disable` 关钩子。
 
 `env.zsh` / `env.bash`（两份内容等价，只有标题的 shell 名不同）导出三个变量：
@@ -862,10 +907,11 @@ dsh-remote check-hooks     # 触发 → 退出码 0；没触发 → 1，并打�
 
 | 脚本 | 条数（2026-10-09 实测 / 静态数） | 要什么 | 覆盖 |
 |---|---|---|---|
-| `tests/run_tests.sh` | **684 通过 0 失败**（A 14 / B 6 / C 22 / **D 34** / E 53 / F 14 / G 8 / H 6 / I 56 / **J 100** / **K 57** / **L 17** / M 46 / **N 22** / **O 79** / **P 85** / **Q 65**；2026-10-09 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节，57 条：harness 前台那条路两个 shell 各抓一次 token 并验"退出即清" / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + `harness` 的新语义（O 节，79 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；**六种情形** = 端口有人听（手工起的）／端口有人听且是 systemd 托管／有**本端口**的 `web-url.txt` 就开那个／没人听但有单元（`start` 之后端口出现）／没人听也没单元（前台 npx：端口一出现就开浏览器 + 参数原样透传 + token 抓/清）／命令行换了端口（不拿服务去顶）；两条硬判据 = **那个端口上的 PID 前后不变**（证明没起第二个）+ 桩 opener 收到的第一个参数**逐字节**等于完整 URL、`argc=1`；外加 opener 三档退与 `dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）**、**一键强制重置 + 手机 `/reset`（P 节，85 条：`--help` 与薄封装等价、安全档在"隧道健康/不健康""token 有效/过期""端口有人听/没人听"几种桩状态下输出的关键行、`--restart-web` 无 `--yes` 拒绝 + `--yes` 只 SIGTERM 那一个真 PID、cmdline 不含 dsh 时拒绝杀、`DSH_REMOTE_FROM_BROKER=1` 下不重启 broker 也拒绝 `--restart-web`、`--json` 每行合法、broker 真进程的 `GET/POST /reset`（nonce 一次性、重放 403、结果页渲染、两处都无 token/密码泄漏）、两份 Caddyfile 的 `@reset` 位置）**、**`harness-remote`（Q 节，65 条：`--help` 说清"本地那半是 harness"／`status` ≤6 行且数据来自 `tunnel-status --probe` + `force-restart --json` 两条现成输出（调用数用桩记账断言）／`open` 用同一套 opener（argv 逐字节）／`reset` 走安全档且**拒绝** `--restart-web`（调用数不涨）／`passwd` 原样转发／`url`/`qr`／参数写错要指路 —— 全程桩 `dsh-remote`，绝不碰云上）** |
+| `tests/run_tests.sh` | **764 通过 0 失败**（A 16 / B 6 / C 22 / **C2 76** / **D 34** / E 53 / F 14 / G 8 / H 6 / I 57 / **J 101** / **K 57** / **L 17** / M 46 / **N 22** / **O 79** / **P 85** / **Q 65**；2026-10-21 实测） | `sh`、`python3`；B 节要 `zsh`，没有就打印 skip；**装了 docker 时 D 节要 docker**（镜像不在本地会去拉） | 语法（dash+bash）、`env.*` 等价、推送真发到本地接收端、**`provider=graph`（C2 节 76 条：假 Microsoft 端点验换 token / 202 / 错误码 / 轮换回写 / 缓存 / `--provider` 覆盖 / device code 授权脚本）**、Caddyfile 渲染（含 IP 模式 `default_sni`、用户空间模式）、子命令、`cloud-install` 参数拼装（假 ssh/scp）、`~/.dsh` 边界、`check-hooks` 两条路、安装脚本五大场景、常驻隧道的单元渲染/幂等/冲突/卸载 + **防风暴三个键 + 自愈件（脚本落点与可执行、两个单元、timer enable、假端口演练非 0、卸载撤三件）**（J 节，单元落点/自愈脚本落点与 systemctl/tmux/ssh/logger 全是桩）、**固定地址那条链路（K 节，57 条：harness 前台那条路两个 shell 各抓一次 token 并验"退出即清" / broker 起真进程 + 假 dsh web 夹具验"过期 cookie → 302 并清 cookie""有效 cookie → 代发首页 200""判断不出 → 503" / Caddyfile 只按 token 排）**、**自带二维码（L 节：矩阵 sha256 与独立实现对过账、PNG/SVG/终端画、太长要报错）**、**`server` 一条命令（M 节：四类自检失败的指引、`--dry-run` 不写、全参非交互跑通、部署失败不能被吞、薄封装走同一条路）**、**`passwd`（N 节）**、**dsh web 常驻 + `harness` 的新语义（O 节，79 条：`systemctl`/`journalctl` 桩 + 真回环监听，bash/zsh 各跑一遍同一张表；**六种情形** = 端口有人听（手工起的）／端口有人听且是 systemd 托管／有**本端口**的 `web-url.txt` 就开那个／没人听但有单元（`start` 之后端口出现）／没人听也没单元（前台 npx：端口一出现就开浏览器 + 参数原样透传 + token 抓/清）／命令行换了端口（不拿服务去顶）；两条硬判据 = **那个端口上的 PID 前后不变**（证明没起第二个）+ 桩 opener 收到的第一个参数**逐字节**等于完整 URL、`argc=1`；外加 opener 三档退与 `dsh-web-run` 的代理用"桩 npx dump 子进程 `env \| grep -i proxy`"对账）**、**一键强制重置 + 手机 `/reset`（P 节，85 条：`--help` 与薄封装等价、安全档在"隧道健康/不健康""token 有效/过期""端口有人听/没人听"几种桩状态下输出的关键行、`--restart-web` 无 `--yes` 拒绝 + `--yes` 只 SIGTERM 那一个真 PID、cmdline 不含 dsh 时拒绝杀、`DSH_REMOTE_FROM_BROKER=1` 下不重启 broker 也拒绝 `--restart-web`、`--json` 每行合法、broker 真进程的 `GET/POST /reset`（nonce 一次性、重放 403、结果页渲染、两处都无 token/密码泄漏）、两份 Caddyfile 的 `@reset` 位置）**、**`harness-remote`（Q 节，65 条：`--help` 说清"本地那半是 harness"／`status` ≤6 行且数据来自 `tunnel-status --probe` + `force-restart --json` 两条现成输出（调用数用桩记账断言）／`open` 用同一套 opener（argv 逐字节）／`reset` 走安全档且**拒绝** `--restart-web`（调用数不涨）／`passwd` 原样转发／`url`/`qr`／参数写错要指路 —— 全程桩 `dsh-remote`，绝不碰云上）** |
 | `tests/caddy-validate.sh` | **3 条**（ok 调用点 2 个模板 + 1 条反证） | **docker**（`caddy:2.11.4`）；没有 docker 时打印"跳过"并 **exit 77** | 用真 `caddy validate` 验两份渲染结果；再故意塞坏配置确认这个测试**能失败** |
 | `tests/relay-e2e.sh` | **9 条**（数 ok 调用点；中途失败会提前 exit 1） | **docker** + `python3`；没有 docker 时打印跳过并 **exit 77** | 真起 `caddy` 容器（host 网络）+ 假后端：渲染成功、`compose up` 成功、没密码 401、密码对 200、body 真的来自后端、`Host` 被改写成 `127.0.0.1:3080`、密码错 401、`compose down -v` 干净、容器撤掉 |
 | `tests/http_sink.py` | — | `python3` | 测试零件：POST 的 body 追加写进文件（换行转义成 `\n`），只绑 127.0.0.1 |
+| `tests/fake_graph.py` | — | `python3` | 测试零件：假 Microsoft 登录端点 + 假 Graph `sendMail`；URL 第一段选场景（`ok` / `rotated` / `tokenfail` / `senderr` / `send200` / `slow` / `denied` / `expired`），每条请求记进 jsonl 给 C2 节对账。只绑 127.0.0.1 |
 | `tests/fake_dsh_web.py` | — | `python3` | 测试零件（2026-10-09 加）：假 `dsh web` —— `?token=` 换 cookie（303）、按 `dsh-auth-*` cookie 的值回 200 首页 / 401 / 303 回入口 / 500 / 拖过超时；`--log` 记每条请求，给 K 节数"探测+代发"用。只绑 127.0.0.1 |
 
 ⚠️ **跟 docker 有关的两件事**（2026-10-07 实测 + 当天修掉，细节在 hazards H8）：
@@ -957,6 +1003,7 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 | `DSH_NOTIFY_BIN` | dsh-remote | hook/patch 里要写的 `dsh-notify` 路径（测试用来钉住） |
 | `DSH_NOTIFY_CONF` | dsh-notify | 换 `notify.conf` 路径 |
 | `DSH_NOTIFY_LOG` | dsh-notify | 换日志路径 |
+| `GRAPH_TOKEN_URL` / `GRAPH_SENDMAIL_URL` / `GRAPH_DEVICECODE_URL` / `GRAPH_TOKEN_CACHE` | dsh-notify、dsh-notify-graph-setup | **测试用覆盖**：token / sendMail / device code 端点和 access token 缓存路径（正常不设，见 §7、`tests/fake_graph.py`） |
 | `XDG_CONFIG_HOME` / `XDG_STATE_HOME` | 上述全部 | 标准 XDG 覆盖 |
 | `CADDY_IMAGE` | relay.sh、两个 docker 测试 | Caddy 镜像，**默认钉住的 `caddy:2.11.4`**（换版本用环境变量覆盖；别用浮动 tag，hazards H13） |
 | `AUTOSSH_GATETIME` | dsh-remote tunnel | 用 autossh 时置 0（第一次连不上也继续重试） |
@@ -988,9 +1035,9 @@ journald / `WantedBy` / `BatchMode` / 端口与 identity 替换；`StartLimitInt
 
 | 落点 | 是什么 |
 |---|---|
-| `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify` | 软链 → 项目检出目录的 `bin/` |
+| `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify`、`dsh-notify-graph-setup` | 软链 → 项目检出目录的 `bin/` |
 | `$WTOOL_PREFIX/etc/dsh-remote/` | 配置**实体**：install 只放两份 `*.example`；`remote.conf` / `notify.conf` / `hooks.json` 是之后由人和 `notify-enable` 写进去的 |
-| `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期**实体**：`notify.log`（推送）、`web.log`（harness 输出）、`web-url.txt`（带 token 的地址）、`cloud-install.log` |
+| `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期**实体**：`notify.log`（推送）、`web.log`（harness 输出）、`web-url.txt`（带 token 的地址）、`cloud-install.log`、`graph-token.json`（Graph 的 access token 缓存，600） |
 | `~/.config/dsh-remote` | 软链 → `$WTOOL_PREFIX/etc/dsh-remote` |
 | `~/.local/state/dsh-remote` | 软链 → `$WTOOL_PREFIX/var/dsh-remote` |
 | `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染；旁边可能留 `.bak-<时间戳>`）。由 systemd 自己读，**不在** `$WTOOL_PREFIX` 里 —— systemd 只认 `$XDG_CONFIG_HOME/systemd/user` |

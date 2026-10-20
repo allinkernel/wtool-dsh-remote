@@ -36,7 +36,7 @@
 ```
 
 外加一条**推送**：会话卡在"等你回答"或者一轮跑完时，手机上收一条消息
-（Server酱 / 钉钉 / Telegram / Bark / 任意 webhook）。推送走 DSH 官方的
+（Server酱 / 钉钉 / Telegram / Bark / 任意 webhook / Outlook 邮件）。推送走 DSH 官方的
 hook 桥（`@deepseek-ai/dsh-hooks-claude-code`），不是去猜会话日志的格式。
 
 ---
@@ -62,6 +62,8 @@ wtool install dsh-projects/dsh-remote
 cp ~/.config/dsh-remote/notify.conf.example ~/.config/dsh-remote/notify.conf
 vi ~/.config/dsh-remote/notify.conf      # 选一个渠道（provider=…）并把 key 填进去
 dsh-remote notify-test                   # 结果：手机收到一条「🔔 dsh-notify 测试」；没收到看日志
+#    想用 Outlook / M365 邮件（不走 Server酱，也不用 SMTP AUTH）：
+#    dsh-notify-graph-setup                 # 一次性授权，注册应用的步骤见 docs/notify-outlook-graph.md
 
 # 2. 打开"卡住就推我"的钩子
 dsh-remote notify-enable      # 写 ~/.config/dsh-remote/hooks.json + profile patch；web profile 的 patchReload 是 live，正常情况下不用重启
@@ -210,7 +212,7 @@ harness-remote --help        # 全部子命令
 | **`force-restart-dsh-remote`** | **一键兜底**：`reset-failed` + 重启隧道和 token broker，然后复验"云上两个隧道口 / 本地 dsh web / token 还新鲜吗 / 公网入口"，每步都打一行**状态 + 为什么**和一条**判据命令**，最后给结论。**默认绝不碰 `dsh web`**（所以在跑的那个会话不受影响）。手机连不上、隧道被占、服务一直起不来时先跑它 |
 | `force-restart-dsh-remote --restart-web --yes` | 上面那条的**例外**：`dsh web` 是**手工**起的、token 已经过期（手机固定地址回 401）时，只有重启它才能拿到新 token。它会**只对占着 3080 的那一个进程**发 SIGTERM，然后用 `dsh-web.service` 起回来（这样新 token 才会被记下来），**会打断正在跑的会话** —— 所以要 `--yes`（交互终端里敲 `yes` 也行）。只差这一条路才用它 |
 | `dsh-remote url` | 打印手机该收藏的地址 |
-| `dsh-remote notify-test` | 推一条测试消息 |
+| `dsh-remote notify-test` | 推一条测试消息（`--provider graph` 只测 Outlook/Graph 这一条） |
 | `dsh-remote notify-enable` / `notify-disable` | 打开 / 关掉 hook 推送 |
 | `dsh-remote cloud-install` | 真装到阿里云：传 cloud/ → 跑 relay.sh → 把地址写回配置 |
 | `dsh-remote cloud-setup` | 只打印要做的事（不动手） |
@@ -218,6 +220,7 @@ harness-remote --help        # 全部子命令
 | `dsh-remote check-hooks` | 一次性进程验证钩子桥到底会不会触发（对照实验，几十秒） |
 | `dsh-remote log` | 看推送日志（`notify.log`）和 harness 日志（`web.log`）；隧道日志在 tmux / systemd 那边 |
 | `dsh-notify "标题" "正文"` | 直接推一条（脚本里也能用，退出码永远是 0） |
+| `dsh-notify-graph-setup` | **一次性授权** Outlook / Microsoft Graph：device code 流换 refresh token，写进 600 的 `notify.conf`（教程：`docs/notify-outlook-graph.md`） |
 
 **手机上的"重置按钮"**：浏览器打开你的固定地址后面加 `/reset`
 （例：`https://<你的入口>:8443/reset`，一样要过 basic auth）—— 那是一个确认页
@@ -261,6 +264,29 @@ harness-remote --help        # 全部子命令
 **为什么不用 WireGuard / VPN？**
 公司网络常封 UDP，手机上还要常驻一个 VPN 客户端。反向隧道只用一条 TCP，
 断了自己重连，对网络环境最不挑。
+
+### 推送渠道：Outlook / Microsoft Graph（`provider=graph`，2026-10-21 新增）
+
+除了 Server酱 / 钉钉 / Telegram / Bark / 任意 webhook，`dsh-notify` 还能用
+**Microsoft Graph 的 `/me/sendMail`** 发 Outlook / M365 邮件。适合"公司只让用
+Outlook、SMTP AUTH 被禁"或者"不想再装一个推送 App"的场景。
+
+- **不用 SMTP AUTH、不用应用密码、不用客户端密钥**：微软在逐步关 basic auth，
+  M365 租户默认也常把 SMTP AUTH 关掉，Graph 是现在推荐的走法。
+- 授权走 **device code flow**：`dsh-notify-graph-setup` 打印一个地址和短码，
+  你在浏览器里登录并同意**委派**权限 `Mail.Send`（外加 `offline_access`），
+  脚本把 **refresh token** 写进 600 的 `notify.conf`。
+- 发信时用 refresh token 换 access token（缓存 1 小时，过期自动换；微软轮换
+  refresh token 时自动回写配置），然后 `POST /me/sendMail`，**HTTP 202 才算成功**。
+- 配置键：`GRAPH_CLIENT_ID` / `GRAPH_TENANT` / `GRAPH_REFRESH_TOKEN` / `MAIL_TO`，
+  可选 `GRAPH_SCOPE`、`MAIL_SUBJECT_PREFIX`（样板见 `notify.conf.example`）。
+- **refresh token 等同密码**：`notify.conf` 必须 600，不进 git、不贴群里；
+  撤销方法（Entra → 应用 → 用户同意，或删应用）见教程第 7 节。
+
+完整教程（注册 Azure 应用、个人 outlook.com vs 公司 M365、权限为什么必须是
+**委派**、排错表 `AADSTS50076/65001/70016`、`ErrorSendAsDenied`、
+`MailboxNotEnabledForRESTAPI`、条件访问、撤销授权）：
+[`docs/notify-outlook-graph.md`](docs/notify-outlook-graph.md)。
 
 **为什么推送走 hook 桥，而不是去读会话日志？**
 会话日志是 `session.v3.jsonl.zstd`，**多帧 + 自定义分帧**，用标准 zstd 解压
@@ -394,6 +420,11 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
    断掉整条路。harness 本身没有对公网监听，所以没有第二条路。
    （云上的 Caddy 是**容器**，宿主上没有 `caddy.service` 可以 `systemctl stop`。）
 
+7. **`provider=graph` 的 refresh token 等同密码**：只存在 600 的
+   `~/.config/dsh-remote/notify.conf` 里（access token 缓存在
+   `~/.local/state/dsh-remote/graph-token.json`，也是 600）。不进 git、不贴群里。
+   怀疑泄露就去 Entra 撤销同意（教程第 7 节）；测试只用假 token，绝不碰真凭据。
+
 **不做什么**：不改 `dsh web` 的默认监听（它拒绝 `0.0.0.0` 是有意的，
 那是把 RCE 直接挂网上）；不把 basic auth 换成"藏在 URL 里的 token"；
 不在仓库里放证书、密码、密钥。
@@ -403,7 +434,7 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 ## 6. 测试
 
 ```sh
-sh tests/run_tests.sh        # 684 条（以输出为准），不联网、不碰真 $HOME
+sh tests/run_tests.sh        # 764 条（以输出为准），不联网、不碰真 $HOME
                              #   ⚠️ 装了 docker 的机器上，D 节会经 relay.sh --dry-run
                              #   跑几次 docker run …（第一次会把 caddy:2.11.4 拉下来，约 50MB）
 sh tests/caddy-validate.sh   # 3 条（2 个模板 + 1 条"坏配置必须被拒"的反证），要 docker，人工跑
@@ -415,7 +446,10 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 
 `run_tests.sh` 覆盖：dash/bash 两种解释器的语法、`env.zsh`/`env.bash` 等价、
 `dsh-notify` 真发一条到本地 HTTP 接收端（含 `--hook` 解析、`on_stop` 开关、
-`--async` 不拖住钩子、**所有失败路径退出码都是 0**）、Caddyfile 渲染、
+`--async` 不拖住钩子、**所有失败路径退出码都是 0**）、**Outlook/Graph 那一条
+（C2 节 76 条：`tests/fake_graph.py` 假登录端点 + 假 `sendMail`，验换 token、202、
+错误码透出、refresh token 轮换回写、token 缓存、`--provider` 覆盖、device code
+授权脚本的 pending/slow_down/declined/expired）**、Caddyfile 渲染、
 `dsh-remote` 子命令（含 `notify-enable`/`notify-disable` 幂等和"删干净后补回 `[]`"）、
 `cloud-install` 的参数拼装（假 ssh/scp）、"自己的东西不放 `~/.dsh`"、`check-hooks`、
 **`harness` 的六种情形**（O 节：端口有人听[手工起的/服务托管的]、有带 token 的
@@ -437,10 +471,11 @@ sh tests/relay-e2e.sh        # 9 条（401 / 200 / 真代理 / Host 改写 / 密
 `.local/state/dsh-remote`）的指纹，证明这一节没写真家目录。
 `grep -F` 守着"脚本里不许出现 `$HOME/.wtool/...` 字面量"。
 
-逐节条数（2026-10-09 实测，合计 **684**）：语法 A 14 / `env` 两份 B 6 /
-`dsh-notify` C 22 / Caddyfile 渲染 D 34 / 子命令 E 53 / `cloud-install` F 14 /
-`~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 56 / **常驻隧道 J 100** /
-**固定地址那条链路 K 57** / **二维码 L 17** / **一条命令装好 M 46** / **改密码 N 22** /
+逐节条数（2026-10-21 实测，合计 **764**）：语法 A 16 / `env` 两份 B 6 /
+`dsh-notify` C 22 / **Outlook/Graph C2 76** / Caddyfile 渲染 D 34 / 子命令 E 53 /
+`cloud-install` F 14 / `~/.dsh` 边界 G 8 / `check-hooks` H 6 / 安装脚本 I 57 /
+**常驻隧道 J 101** / **固定地址那条链路 K 57** / **二维码 L 17** /
+**一条命令装好 M 46** / **改密码 N 22** /
 **`harness` 的新语义 O 79**（六种情形：端口有人听[手工起的/服务托管的]、
 有**本端口**的 `web-url.txt` 就开那个、没人听但有单元、没人听也没单元走前台 npx、
 命令行换了端口；两条硬判据 = 那个端口上的 PID 前后不变 + 桩 opener 收到的 argv
@@ -486,9 +521,9 @@ O 节的 harness 四态（服务在跑 / 端口被非 systemd 实例占 / 服务
 
   | 落点 | 是什么 |
   |---|---|
-  | `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify` | 软链 → 仓库 `bin/` 里的脚本（`$WTOOL_PREFIX/bin` 由引擎放进 PATH） |
+  | `$WTOOL_PREFIX/bin/dsh-remote`、`dsh-notify`、`dsh-notify-graph-setup` | 软链 → 仓库 `bin/` 里的脚本（`$WTOOL_PREFIX/bin` 由引擎放进 PATH） |
   | `$WTOOL_PREFIX/etc/dsh-remote/` | 配置**实体**（install 只放两份 `*.example`；`remote.conf` / `notify.conf` / `hooks.json` 是之后由你和 `notify-enable` 写进去的） |
-  | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期文件**实体**（`notify.log`、`web.log`、`web-url.txt`） |
+  | `$WTOOL_PREFIX/var/dsh-remote/` | 日志/运行期文件**实体**（`notify.log`、`web.log`、`web-url.txt`、`graph-token.json`：Graph 的 access token 缓存，600） |
   | `~/.config/dsh-remote` | 软链 → 上面那个 `etc/dsh-remote` |
   | `~/.local/state/dsh-remote` | 软链 → 上面那个 `var/dsh-remote` |
   | `~/.config/systemd/user/dsh-tunnel.service` | **常驻隧道单元**（`tunnel-install` 渲染，改配置就重跑它） |

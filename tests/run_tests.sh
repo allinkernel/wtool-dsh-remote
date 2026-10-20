@@ -13,6 +13,8 @@
 #   B env.zsh / env.bash 等价
 #   C dsh-notify：真发一条到本地 HTTP 接收端；退出码永远是 0；--hook 解析；
 #     --async 不拖住钩子；on_stop 开关
+#   C2 provider=graph：假 Microsoft 登录端点 + 假 sendMail（换 token / 202 / 错误码 /
+#     refresh token 轮换回写 / token 缓存 / --provider 覆盖 / device code 授权脚本）
 #   D cloud/relay.sh 的渲染：占位符替换干净、host/origin 改写、
 #     basic_auth、allow-ip、参数校验
 #   E dsh-remote 子命令：help/未知命令/status/notify-enable/notify-disable 幂等
@@ -99,13 +101,13 @@ check_not_contains() {
 
 TMP=$(mktemp -d)
 PATH_BASE=$PATH          # 原始 PATH：每一节跑测试前从它重建，避免"顺延膨胀/被前一段污染"
-trap 'rm -rf "$TMP"; [ -n "${sink_pid:-}" ] && kill "$sink_pid" 2>/dev/null' EXIT INT TERM
+trap 'rm -rf "$TMP"; [ -n "${sink_pid:-}" ] && kill "$sink_pid" 2>/dev/null; [ -n "${graph_pid:-}" ] && kill "$graph_pid" 2>/dev/null' EXIT INT TERM
 
 # ---------------------------------------------------------------- A 语法
 printf 'A. 语法（dash + bash）\n'
 # ⚠️ bin/dsh-token-broker 是 **python3**（只借了个 sh 头），不在这张表里
-for f in bin/dsh-remote bin/dsh-notify bin/harness-remote bin/dsh-web-run \
-    cloud/relay.sh scripts/install.sh tests/run_tests.sh; do
+for f in bin/dsh-remote bin/dsh-notify bin/dsh-notify-graph-setup bin/harness-remote \
+    bin/dsh-web-run cloud/relay.sh scripts/install.sh tests/run_tests.sh; do
     if sh -n "$proj/$f" 2>"$TMP/err"; then ok "sh -n $f"; else bad "sh -n $f" "$(cat "$TMP/err")"; fi
     if bash -n "$proj/$f" 2>"$TMP/err"; then ok "bash -n $f"; else bad "bash -n $f" "$(cat "$TMP/err")"; fi
 done
@@ -261,6 +263,265 @@ while [ ! -s "$sink_out" ] && [ "$i" -lt 50 ]; do
     i=$((i + 1))
 done
 check_contains "--async 的消息最后还是到了" "跑完了" "$(cat "$sink_out")"
+
+# ---------------------------------------------------------------- C2 graph
+# provider=graph：换 token / 发信 / 错误诊断 / 轮换回写 / 缓存 / notify-test 转发。
+# 全部打到 tests/fake_graph.py（只绑回环，**绝不碰微软**）。
+printf 'C2. provider=graph（Outlook / Microsoft Graph，本地假端点）\n'
+gport=$(pick_port)
+greq="$TMP/graph-requests.jsonl"
+: >"$greq"
+python3 "$here/fake_graph.py" "$gport" "$greq" >"$TMP/fake_graph.log" 2>&1 &
+graph_pid=$!
+i=0
+while [ "$i" -lt 40 ]; do
+    if python3 -c "import socket,sys;s=socket.socket();s.settimeout(0.3);sys.exit(0 if s.connect_ex(('127.0.0.1',$gport))==0 else 1)" 2>/dev/null; then break; fi
+    sleep 0.1
+    i=$((i + 1))
+done
+G="http://127.0.0.1:$gport"
+SETUP=$proj/bin/dsh-notify-graph-setup
+: >"$logf"
+
+gcount() { # <场景> <动作> —— 假端点收到几条
+    python3 - "$greq" "$1" "$2" <<'PY'
+import json, sys
+n = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("scenario") == sys.argv[2] and r.get("action") == sys.argv[3]:
+        n += 1
+print(n)
+PY
+}
+
+gfield() { # <场景> <动作> <字段> —— 取最后一条请求的字段
+    python3 - "$greq" "$1" "$2" "$3" <<'PY'
+import json, sys
+last = None
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("scenario") == sys.argv[2] and r.get("action") == sys.argv[3]:
+        last = r
+if last is None:
+    sys.exit(0)
+v = last.get(sys.argv[4])
+if isinstance(v, (dict, list)):
+    print(json.dumps(v, ensure_ascii=False, sort_keys=True))
+elif v is None:
+    print("")
+else:
+    print(v)
+PY
+}
+
+grun() { # <场景> <conf> <cache> <dsh-notify 参数...>
+    _scen=$1
+    _conf=$2
+    _cache=$3
+    shift 3
+    GRAPH_TOKEN_URL="$G/$_scen/token" \
+        GRAPH_SENDMAIL_URL="$G/$_scen/sendmail" \
+        GRAPH_TOKEN_CACHE="$_cache" \
+        DSH_NOTIFY_CONF="$_conf" \
+        "$NOTIFY" "$@" >"$TMP/g.out" 2>"$TMP/g.err"
+    _rc=$?
+    printf '%s' "$_rc"
+}
+
+gok="$TMP/graph-ok.conf"
+cat >"$gok" <<'EOF'
+provider=graph
+GRAPH_CLIENT_ID=fake-client-id
+GRAPH_TENANT=common
+GRAPH_REFRESH_TOKEN=OLD-REFRESH-TOKEN
+MAIL_TO=one@example.com, two@example.com
+MAIL_SUBJECT_PREFIX=[DSH]
+public_url=https://dsh.example.com/
+EOF
+chmod 600 "$gok"
+
+code=$(grun ok "$gok" "$TMP/graph-cache-ok.json" --test --provider graph)
+check "C2①：换 token + 发信成功（退出码 0）" "0" "$code"
+check "C2①：access token 缓存是 600" "600" "$(stat -c %a "$TMP/graph-cache-ok.json" 2>/dev/null || printf 缺)"
+check_contains "C2①：日志记了 202" "HTTP 202" "$(cat "$logf")"
+check_contains "C2①：--test 在屏幕上说发出去了" "已交给 Microsoft Graph" "$(cat "$TMP/g.err")"
+check "C2①：token 端点只换了一次" "1" "$(gcount ok token)"
+check "C2①：sendMail 恰好一次" "1" "$(gcount ok sendmail)"
+mail_json=$(gfield ok sendmail json)
+check_contains "C2①：subject 带 MAIL_SUBJECT_PREFIX（自动加空格）" '"subject": "[DSH] 🔔 dsh-notify 测试"' "$mail_json"
+check_contains "C2①：toRecipients 有两个" '"address": "two@example.com"' "$mail_json"
+check_contains "C2①：正文 contentType=Text" '"contentType": "Text"' "$mail_json"
+check_contains "C2①：saveToSentItems=true" '"saveToSentItems": true' "$mail_json"
+check_contains "C2①：Authorization 带 Bearer" "Bearer FAKE-ACCESS-ok" "$(gfield ok sendmail authorization)"
+token_form=$(gfield ok token form)
+check_contains "C2①：换 token 用 grant_type=refresh_token" '"grant_type": "refresh_token"' "$token_form"
+check_contains "C2①：换 token 带了 client_id" '"client_id": "fake-client-id"' "$token_form"
+check_contains "C2①：换 token 带了默认 scope" '"scope": "offline_access Mail.Send"' "$token_form"
+
+before=$(gcount ok token)
+code=$(grun ok "$gok" "$TMP/graph-cache-ok.json" --test --provider graph)
+check "C2②：未过期不重复换 token" "$before" "$(gcount ok token)"
+check "C2②：缓存命中时仍然发信成功" "0" "$code"
+
+printf '%s\n' '{"access_token": "STALE-TOKEN", "expires_at": 1}' >"$TMP/graph-cache-stale.json"
+chmod 600 "$TMP/graph-cache-stale.json"
+before=$(gcount ok token)
+code=$(grun ok "$gok" "$TMP/graph-cache-stale.json" --test --provider graph)
+check "C2③：过期缓存会重新换 token" "$((before + 1))" "$(gcount ok token)"
+check "C2③：没用过期的 access token" "0" "$(grep -c 'Bearer STALE-TOKEN' "$greq" 2>/dev/null | head -1)"
+
+# 重新授权换了 refresh token（也就是换了账号）→ 旧 access token 缓存必须作废
+greauth="$TMP/graph-reauth.conf"
+sed 's/^GRAPH_REFRESH_TOKEN=OLD-REFRESH-TOKEN/GRAPH_REFRESH_TOKEN=NEW-REFRESH-TOKEN/' \
+    "$gok" >"$greauth"
+before=$(gcount ok token)
+code=$(grun ok "$greauth" "$TMP/graph-cache-ok.json" --test --provider graph)
+check "C2③b：换了 refresh token 后不沿用旧 access token" "$((before + 1))" "$(gcount ok token)"
+check "C2③b：换 token 后照样发信" "0" "$code"
+
+: >"$logf"
+code=$(grun tokenfail "$gok" "$TMP/graph-cache-tf.json" --test --provider graph)
+check "C2④：换 token 失败时退出码仍是 0" "0" "$code"
+check_contains "C2④：打出 OAuth 的 error" "error=invalid_grant" "$(cat "$TMP/g.err")"
+check_contains "C2④：打出 AADSTS 描述" "AADSTS70008" "$(cat "$TMP/g.err")"
+check_contains "C2④：日志也记了" "换 token 失败" "$(cat "$logf")"
+check "C2④：失败后没有发信" "0" "$(gcount tokenfail sendmail)"
+
+: >"$logf"
+code=$(grun senderr "$gok" "$TMP/graph-cache-senderr.json" --test --provider graph)
+check "C2⑤：Graph 报错时退出码仍是 0" "0" "$code"
+check_contains "C2⑤：透出 error.code" "error.code=ErrorSendAsDenied" "$(cat "$TMP/g.err")"
+check_contains "C2⑤：透出 error.message" "does not have the right to send mail" "$(cat "$TMP/g.err")"
+check_contains "C2⑤：日志里也有" "ErrorSendAsDenied" "$(cat "$logf")"
+
+: >"$logf"
+code=$(grun send200 "$gok" "$TMP/graph-cache-200.json" --test --provider graph)
+check "C2⑥：HTTP 200 不算成功（退出码仍 0）" "0" "$code"
+check_contains "C2⑥：日志说 HTTP 200" "HTTP 200" "$(cat "$logf")"
+check "C2⑥：没有把它记成 202" "0" "$(grep -c 'HTTP 202' "$logf" 2>/dev/null | head -1)"
+
+grot="$TMP/graph-rotated.conf"
+cat >"$grot" <<'EOF'
+provider=graph
+GRAPH_CLIENT_ID=fake-client-id
+GRAPH_TENANT=common
+GRAPH_REFRESH_TOKEN=OLD-REFRESH-TOKEN
+MAIL_TO=one@example.com
+public_url=https://keep.me/
+on_stop=0
+EOF
+chmod 644 "$grot"
+: >"$logf"
+code=$(grun rotated "$grot" "$TMP/graph-cache-rot.json" --test --provider graph)
+check "C2⑦：轮换场景退出码 0" "0" "$code"
+check "C2⑦：refresh token 回写成新的" "ROTATED-REFRESH-TOKEN" "$(sed -n 's/^GRAPH_REFRESH_TOKEN=//p' "$grot")"
+check "C2⑦：只留一行 GRAPH_REFRESH_TOKEN" "1" "$(grep -c '^GRAPH_REFRESH_TOKEN=' "$grot")"
+check "C2⑦：配置权限变成 600" "600" "$(stat -c %a "$grot")"
+check_contains "C2⑦：别的键保留（provider）" "provider=graph" "$(cat "$grot")"
+check_contains "C2⑦：别的键保留（public_url）" "public_url=https://keep.me/" "$(cat "$grot")"
+check_contains "C2⑦：别的键保留（on_stop）" "on_stop=0" "$(cat "$grot")"
+check_contains "C2⑦：说了轮换" "轮换" "$(cat "$TMP/g.err")"
+
+gno="$TMP/graph-no-client.conf"
+printf 'provider=graph\nGRAPH_REFRESH_TOKEN=x\nMAIL_TO=a@b.c\n' >"$gno"
+code=$(grun ok "$gno" "$TMP/graph-cache-nokey.json" --test --provider graph)
+check "C2⑧：缺键时退出码仍 0" "0" "$code"
+check_contains "C2⑧：说清缺哪个键" "缺 GRAPH_CLIENT_ID" "$(cat "$TMP/g.err")"
+
+gover="$TMP/graph-override.conf"
+cat >"$gover" <<EOF
+provider=generic
+URL=http://127.0.0.1:$port/hook
+GRAPH_CLIENT_ID=fake-client-id
+GRAPH_TENANT=common
+GRAPH_REFRESH_TOKEN=OLD-REFRESH-TOKEN
+MAIL_TO=one@example.com
+EOF
+: >"$sink_out"
+before=$(gcount ok sendmail)
+code=$(grun ok "$gover" "$TMP/graph-cache-override.json" --test --provider graph)
+sleep 0.3
+check "C2⑨：--provider graph 覆盖 provider=generic（退出码 0）" "0" "$code"
+check "C2⑨：确实走了 Graph" "$((before + 1))" "$(gcount ok sendmail)"
+check "C2⑨：没走 generic 的接收端" "" "$(cat "$sink_out")"
+
+before=$(gcount ok sendmail)
+code=$(DSH_NOTIFY_BIN="$NOTIFY" DSH_REMOTE_HOME="$TMP/home" \
+    GRAPH_TOKEN_URL="$G/ok/token" GRAPH_SENDMAIL_URL="$G/ok/sendmail" \
+    GRAPH_TOKEN_CACHE="$TMP/graph-cache-override.json" DSH_NOTIFY_CONF="$gover" \
+    "$proj/bin/dsh-remote" notify-test --provider graph >"$TMP/gr.out" 2>"$TMP/gr.err"; printf '%s' "$?")
+check "C2⑩：dsh-remote notify-test --provider graph 退出 0" "0" "$code"
+check "C2⑩：参数转发到了 Graph" "$((before + 1))" "$(gcount ok sendmail)"
+check_contains "C2⑩：提示看日志" "已尝试推送" "$(cat "$TMP/gr.out")"
+
+# ---- 一次性授权脚本（device code flow），同样只打本地假端点
+gsconf="$TMP/graph-setup.conf"
+cat >"$gsconf" <<'EOF'
+# 这行注释要留着
+provider=serverchan
+SENDKEY=KEEP-ME
+public_url=https://keep.me/
+on_stop=0
+EOF
+chmod 644 "$gsconf"
+code=$(GRAPH_DEVICECODE_URL="$G/ok/devicecode" GRAPH_TOKEN_URL="$G/ok/token" \
+    "$SETUP" --client-id fake-client --tenant common \
+    --mail-to 'a@example.com,b@example.com' --conf "$gsconf" --yes \
+    >"$TMP/gs.out" 2>"$TMP/gs.err"; printf '%s' "$?")
+check "C2⑪：device code 授权脚本退出 0" "0" "$code"
+check_contains "C2⑪：打印了验证地址" "https://example.test/devicelogin" "$(cat "$TMP/gs.out")"
+check_contains "C2⑪：打印了 user_code" "CODE-OK" "$(cat "$TMP/gs.out")"
+check_contains "C2⑪：结尾打印下一步 notify-test" "dsh-remote notify-test" "$(cat "$TMP/gs.out")"
+check "C2⑪：配置是 600" "600" "$(stat -c %a "$gsconf")"
+check_contains "C2⑪：provider 改成 graph" "provider=graph" "$(cat "$gsconf")"
+check_contains "C2⑪：写 client id" "GRAPH_CLIENT_ID=fake-client" "$(cat "$gsconf")"
+check_contains "C2⑪：写 refresh token" "GRAPH_REFRESH_TOKEN=FAKE-REFRESH-TOKEN" "$(cat "$gsconf")"
+check_contains "C2⑪：写 MAIL_TO" "MAIL_TO=a@example.com,b@example.com" "$(cat "$gsconf")"
+check_contains "C2⑪：写默认 GRAPH_SCOPE" "GRAPH_SCOPE=offline_access Mail.Send" "$(cat "$gsconf")"
+check_contains "C2⑪：别的键保留（SENDKEY）" "SENDKEY=KEEP-ME" "$(cat "$gsconf")"
+check_contains "C2⑪：别的键保留（on_stop）" "on_stop=0" "$(cat "$gsconf")"
+check_contains "C2⑪：注释保留" "# 这行注释要留着" "$(cat "$gsconf")"
+check "C2⑪：有备份" "1" "$(ls "$gsconf".bak-graph-setup-* 2>/dev/null | wc -l | tr -d ' ')"
+check "C2⑪：备份也是 600" "600" "$(stat -c %a "$gsconf".bak-graph-setup-* 2>/dev/null | head -n 1)"
+
+code=$(printf 'n\n' | "$SETUP" --client-id other-client --conf "$gsconf" \
+    >"$TMP/gsd.out" 2>"$TMP/gsd.err"; printf '%s' "$?")
+check "C2⑫：已有 refresh token 时（非交互、没 --yes）不覆盖" "1" "$code"
+check "C2⑫：refresh token 没变" "FAKE-REFRESH-TOKEN" "$(sed -n 's/^GRAPH_REFRESH_TOKEN=//p' "$gsconf")"
+check_contains "C2⑫：说清已取消" "已取消" "$(cat "$TMP/gsd.err")"
+
+code=$(GRAPH_DEVICECODE_URL="$G/denied/devicecode" GRAPH_TOKEN_URL="$G/denied/token" \
+    "$SETUP" --client-id f --mail-to a@b.c --conf "$TMP/graph-denied.conf" --yes \
+    >"$TMP/gsn.out" 2>"$TMP/gsn.err"; printf '%s' "$?")
+check "C2⑬：浏览器里拒绝 → 退出码 1" "1" "$code"
+check_contains "C2⑬：打出 authorization_declined" "authorization_declined" "$(cat "$TMP/gsn.err")"
+check "C2⑬：拒绝后没写配置文件" "0" "$([ -e "$TMP/graph-denied.conf" ] && printf 1 || printf 0)"
+
+code=$(GRAPH_DEVICECODE_URL="$G/slow/devicecode" GRAPH_TOKEN_URL="$G/slow/token" \
+    "$SETUP" --client-id f --mail-to a@b.c --conf "$TMP/graph-slow.conf" --yes \
+    >"$TMP/gss.out" 2>"$TMP/gss.err"; printf '%s' "$?")
+check "C2⑭：slow_down 之后仍然授权成功" "0" "$code"
+check_contains "C2⑭：按 slow_down 放慢了" "放慢" "$(cat "$TMP/gss.out")"
+
+code=$(GRAPH_DEVICECODE_URL="$G/expired/devicecode" GRAPH_TOKEN_URL="$G/expired/token" \
+    "$SETUP" --client-id f --mail-to a@b.c --conf "$TMP/graph-expired.conf" --yes \
+    >"$TMP/gse.out" 2>"$TMP/gse.err"; printf '%s' "$?")
+check "C2⑮：device code 过期 → 退出码 1" "1" "$code"
+check_contains "C2⑮：说清是等待超时" "超时" "$(cat "$TMP/gse.err")"
+
+"$SETUP" --help >"$TMP/gs-help" 2>&1
+check "C2⑯：--help 退出 0" "0" "$?"
+check_contains "C2⑯：--help 有用法" "dsh-notify-graph-setup" "$(cat "$TMP/gs-help")"
+check_contains "C2⑯：--help 说 refresh token 不进 git" "不进 git" "$(cat "$TMP/gs-help")"
+
+kill "$graph_pid" 2>/dev/null || true
 
 # ---------------------------------------------------------------- D Caddyfile
 printf 'D. cloud/relay.sh 渲染（中继器容器化）\n'
@@ -623,6 +884,7 @@ run_install_a >"$TMP/i-a.out" 2>&1
 check "引擎调用：退出 0" "0" "$?"
 check_link "dsh-remote 装进 \$WTOOL_PREFIX/bin" "$inst/prefix/bin/dsh-remote" "$proj/bin/dsh-remote"
 check_link "dsh-notify 装进 \$WTOOL_PREFIX/bin" "$inst/prefix/bin/dsh-notify" "$proj/bin/dsh-notify"
+check_link "dsh-notify-graph-setup 装进 \$WTOOL_PREFIX/bin" "$inst/prefix/bin/dsh-notify-graph-setup" "$proj/bin/dsh-notify-graph-setup"
 check_link "配置软链 -> \$WTOOL_PREFIX/etc/dsh-remote" "$inst/xdg-conf/dsh-remote" "$inst/prefix/etc/dsh-remote"
 check_link "日志软链 -> \$WTOOL_PREFIX/var/dsh-remote" "$inst/xdg-state/dsh-remote" "$inst/prefix/var/dsh-remote"
 [ -f "$inst/xdg-conf/dsh-remote/notify.conf.example" ] &&
@@ -722,7 +984,7 @@ d_out=$(cat "$TMP/i-d.out")
 check_contains "警告里点名了缺的源（命令）" "$d_missing/bin/dsh-remote" "$d_out"
 check_contains "警告里说了去哪儿找" "找的地方：$d_missing" "$d_out"
 check_contains "警告里说明来源是 WTOOL_PROJECT_DIR" "来自 WTOOL_PROJECT_DIR" "$d_out"
-check_contains "末尾交代跳过了几条" "有 8 条源没找到" "$d_out"   # 6 条命令 + 2 张样板
+check_contains "末尾交代跳过了几条" "有 9 条源没找到" "$d_out"   # 7 条命令 + 2 张样板
 if [ ! -e "$inst/d/prefix" ] && [ ! -e "$inst/d/xdg-conf" ] && [ ! -e "$inst/d/xdg-state" ]; then
     ok "一个字节都没写：\$WTOOL_PREFIX / 配置 / 日志落点都没被建"
 else
@@ -760,7 +1022,7 @@ fi
 d2_out=$(cat "$TMP/i-d2.out")
 check_contains "警告里点名缺的样板" "$d_fake/notify.conf.example" "$d2_out"
 check_contains "警告里点名缺的命令" "$d_fake/bin/dsh-notify" "$d2_out"
-check_contains "末尾交代跳过了 7 条" "有 7 条源没找到" "$d2_out"   # 缺 5 条命令 + 2 张样板
+check_contains "末尾交代跳过了 8 条" "有 8 条源没找到" "$d2_out"   # 缺 6 条命令 + 2 张样板
 
 # ---- E --uninstall：撤掉自己铺的软链，实体（配置/日志）留着
 run_install_a --uninstall >"$TMP/i-e.out" 2>&1
