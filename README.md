@@ -354,8 +354,9 @@ Caddy 默认要占宿主 `:80` 做 http→https 跳转，80 被占（或大陆�
 
 **安装脚本为什么不自己拼路径？** `scripts/install.sh` 的"源"问引擎的
 `WTOOL_PROJECT_DIR` 要（手跑时按 `$0` 自推项目目录），"落点"从
-`WTOOL_HOME` / `WTOOL_PREFIX` 推。写死 `~/.wtool/wtool-work-dir/links/...`
-（引擎的内部布局）等于给自己留了第二份真相：换 `WTOOL_HOME` 装（影子家、
+`WTOOL_HOME` / `WTOOL_PREFIX` 推。写死引擎的内部布局（当时的
+`~/.wtool/wtool-work-dir/links/...`，现在是 `$WTOOL_HOME/wtool/...`）
+等于给自己留了第二份真相：换 `WTOOL_HOME` 装（影子家、
 临时家、测试）时它一定指丢，引擎以后再挪一次布局也一样 —— 而脚本的检查是
 "源找不到就跳过"，于是**报了"install 完成"却什么都没装**，敲 `dsh-remote`
 是 command not found。同一个病在 `tools/android_repack`（`14bf463`）和

@@ -817,7 +817,7 @@ WTOOL_PROJECT_DIR / 按脚本位置自推）"，末尾交代跳过了几条；**
 `env.zsh` / `env.bash`（两份内容等价，只有标题的 shell 名不同）导出三个变量：
 
 ```
-DSH_REMOTE_DIR       = ${WTOOL_PROJECT_DIR:-${WTOOL_HOME:-$HOME}/.wtool/wtool-work-dir/links/dsh-projects/dsh-remote}
+DSH_REMOTE_DIR       = ${WTOOL_PROJECT_DIR:-${WTOOL_HOME:-${HOME}/.wtool}/wtool/dsh-projects/dsh-remote}
 DSH_REMOTE_CONF_DIR  = ${DSH_REMOTE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-remote}
 DSH_REMOTE_STATE_DIR = ${DSH_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-remote}
 ```

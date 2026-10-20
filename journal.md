@@ -831,3 +831,25 @@ B 6 / C 22 / D 34 / E 53 / F 14 / G 8 / H 6 / I 56 / J 100 / **K 57** / L 17 / M
 **以 `ExecStart` 为准**（`dsh-web.service` 里是
 `ExecStart=…/dsh-web-run --port <local_port>`）。按仓库规矩：不许为改一句话
 rewrite 历史，所以在这里点名那个提交。
+
+## 2026-10-21 / 远程排障：token 文件错一个字符（`env.*` 兜底路径同轮换新布局）
+
+**症状**：手机打开固定地址，`GET /` 拿到 302 补 token，再打 `/?token=…` 变成 401；
+截图那台机器直接打 `127.0.0.1:3081/?token=…` 看到 broker 的"带 token 请直接打 dsh web"
+（那是设计，不是故障）。
+
+**根因**：`~/.local/state/dsh-remote/current-token.txt` 是运行中 `dsh web`（PID 17169）
+启动 token 的**错误副本** —— 43 字节、缺换行（`harness` / `dsh-web-run` 都写 44 字节），
+与正确值只差第 12 个字符；正确 token 打 3080 是 303，文件里那个是 401。broker 每次
+请求都重读该文件，于是手机每次入口都 302 到死 token。云上 Caddy 访问日志里 2026-10-20
+06:30 的手机请求正是 `GET / → 302`、`GET /?token=… → 401`，证明隧道/Caddy 路由没接反。
+
+**修**：从 `dsh web` 所在的 tmux pane（`%1`）启动行取回当前 token，原子写回
+`current-token.txt`（600，**未重启 `dsh web`**）；`env.zsh` / `env.bash` 的
+`DSH_REMOTE_DIR` 兜底从旧的中转链换到引擎现在的 L1 链接
+`${WTOOL_HOME:-${HOME}/.wtool}/wtool/dsh-projects/dsh-remote`（两份 body 仍逐字等价）。
+
+**验证**：`curl 3080/?token=<当前>` → 303；`curl 3081/` → 302；`curl 3081/?token=…` → 400
+（设计）；公网 `curl -sk --interface eth0 -u dsh:… https://123.56.158.212:8443/` → 302 →
+带 cookie 跟随 → 200（`<title>DeepSeek Harness</title>`）；`sh tests/run_tests.sh`
+684 通过 0 失败。
