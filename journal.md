@@ -853,3 +853,18 @@ rewrite 历史，所以在这里点名那个提交。
 （设计）；公网 `curl -sk --interface eth0 -u dsh:… https://123.56.158.212:8443/` → 302 →
 带 cookie 跟随 → 200（`<title>DeepSeek Harness</title>`）；`sh tests/run_tests.sh`
 684 通过 0 失败。
+
+**同轮附带修的两处**（都不是这次远程故障的根因，是排查时撞见的）：
+
+1. `tunnel-status` 的漂移检测一直是**假阳性**：它调 `unit_body` 只给了 1 个参数
+   （函数签名要 3 个），`set -u` 在 `$2` 上退出、`$()` 收到空串 → 刚装好的单元也报
+   "和现在的 remote.conf 对不上了"。改成先从单元里读 `StartLimitBurst` /
+   `StartLimitIntervalSec`，再传全三个参数。测试原来断言的是 `"一致"`——标题
+   "一致性"本身就含这两个字，所以永远绿；改成断言完整句子，并给漂移那条加
+   "重新渲染的 ExecStart 非空"。
+2. `harness-remote status` 的 README 写"**只读**"，但代码第 246 行会跑
+   `force-restart-dsh-remote --json`（安全档）—— 本轮实测它把隧道和 broker **又重启
+   了一次**（00:57:34 / 00:57:35，`dsh web` 未动）。README 改成如实描述；
+   不想重启时用 `dsh-remote tunnel-status --probe`。
+
+`sh tests/run_tests.sh` → **685 通过 0 失败**（新增 1 条漂移正例断言）。

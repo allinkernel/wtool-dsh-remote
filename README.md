@@ -182,7 +182,9 @@ harness-remote passwd --dry-run   # 改云上密码（转发给 dsh-remote passw
 harness-remote --help        # 全部子命令
 ```
 
-- `status` 是**只读**的（除了本机 systemd 的体检，还会 `ssh` 上云看一眼两个隧道口和容器）。
+- `status` 会跑一次 `force-restart-dsh-remote` 的**安全档**（`--json`）来取实时判据 ——
+  所以它**会重启隧道和 token broker**（各几秒），但**绝不碰 `dsh web`**；
+  `tunnel-status --probe` 和 `ssh` 上云看两个隧道口/容器那部分是只读的。
 - `reset` 就是 `dsh-remote force-restart-dsh-remote` 的**安全档**；想连 `dsh web` 一起重启
   必须人在家里那台机器上显式敲 `force-restart-dsh-remote --restart-web --yes`
   （`harness-remote reset` 会**拒绝**这两个参数）。

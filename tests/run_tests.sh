@@ -972,12 +972,13 @@ check "tunnel-status 退出 0" "0" "$?"
 j5=$(cat "$TMP/j5.out")
 check_contains "status：打印单元完整路径" "$TMP/junits/dsh-tunnel.service" "$j5"
 check_contains "status：打印 is-active" "is-active=active" "$j5"
-check_contains "status：参数与 remote.conf 一致" "一致" "$j5"
+check_contains "status：参数与 remote.conf 一致" "单元里的 ssh 参数和现在的 remote.conf 一致" "$j5"
 check_contains "status：说清反向隧道不该在本地听" "18099 本地没听" "$j5"
 sed 's/^remote_port=.*/remote_port=18111/' "$DSH_REMOTE_CONF" >"$TMP/j-remote2.conf"
 DSH_REMOTE_CONF="$TMP/j-remote2.conf" DSH_REMOTE_UNIT_DIR="$TMP/junits" \
     "$remote" tunnel-status >"$TMP/j6.out" 2>&1
 check_contains "status：配置改了能认出来（漂移）" "对不上了" "$(cat "$TMP/j6.out")"
+check_contains "status：漂移时打印重新渲染的 ExecStart（非空）" "现在渲染：/usr/bin/ssh" "$(cat "$TMP/j6.out")"
 J_TMUX_HAS=1 DSH_REMOTE_UNIT_DIR="$TMP/junits" "$remote" tunnel-status >"$TMP/j7.out" 2>&1
 check_contains "status：点名还在抢端口的旧 tmux 会话" "会话 dsh-j-stub 还在" "$(cat "$TMP/j7.out")"
 

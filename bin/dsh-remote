@@ -812,7 +812,13 @@ cmd_tunnel_status() {
         say "  参数    Restart=always  RestartSec=${_sec:-?}"
         if conf_any cloud_host CLOUD_HOST >/dev/null 2>&1; then
             tunnel_conf
-            _want=$(unit_body "${_sec:-3}" 2>/dev/null | sed -n 's/^ExecStart=//p')
+            # unit_body 要三个参数；只给一个时 `set -u` 会在 $2 上直接退出，$() 收空 →
+            # 永远误报"对不上"（2026-10-21 实测：刚装好的单元也报漂移）。
+            # 防风暴那两个键从**单元自己**读，缺省用 tunnel-install 的默认值。
+            _burst=$(sed -n 's/^StartLimitBurst=//p' "$uf" | head -n 1)
+            _interval=$(sed -n 's/^StartLimitIntervalSec=//p' "$uf" | head -n 1)
+            _want=$(unit_body "${_sec:-5}" "${_burst:-10}" "${_interval:-300}" 2>/dev/null |
+                sed -n 's/^ExecStart=//p')
             _have=$(sed -n 's/^ExecStart=//p' "$uf" | head -n 1)
             if [ "$_want" = "$_have" ]; then
                 say "  一致性  单元里的 ssh 参数和现在的 remote.conf 一致 ✓"
