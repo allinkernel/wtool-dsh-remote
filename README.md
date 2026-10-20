@@ -3,7 +3,7 @@
 出门在外的时候：**看**某个会话是不是卡在等你回答，**答**它，或者**直接派新活**
 （发布 wtool、发邮件……）。手机上不装任何东西，一个浏览器标签页就够。
 
-它是独立子项目：`wtool install tools/dsh-remote` 之后才有 `dsh-remote` /
+它是独立子项目：`wtool install dsh-projects/dsh-remote` 之后才有 `dsh-remote` /
 `dsh-notify` 两条命令。
 
 ---
@@ -53,7 +53,7 @@ hook 桥（`@deepseek-ai/dsh-hooks-claude-code`），不是去猜会话日志的
 
 ```sh
 # 0. 装命令（在工作区里）
-wtool install tools/dsh-remote
+wtool install dsh-projects/dsh-remote
 #    命令软链进 $WTOOL_PREFIX/bin（默认 ~/.wtool/usr/bin，已在 PATH 上）；
 #    配置实体在 $WTOOL_PREFIX/etc/dsh-remote，日志实体在 $WTOOL_PREFIX/var/dsh-remote，
 #    ~/.config/dsh-remote 和 ~/.local/state/dsh-remote 是指向它们的软链（见 §7）
@@ -478,7 +478,7 @@ O 节的 harness 四态（服务在跑 / 端口被非 systemd 实例占 / 服务
 - 仓库里只有文本（脚本 + 两个 Caddyfile 模板 + 文档）；证书、密码、密钥、
   日志一律在**安装落点**和云上的 `/opt/dsh-relay/`（证书与续期状态在命名卷
   `caddy-data` 里），不进 git。
-- `wtool install tools/dsh-remote` 装出来的东西（`$WTOOL_PREFIX` 默认
+- `wtool install dsh-projects/dsh-remote` 装出来的东西（`$WTOOL_PREFIX` 默认
   `~/.wtool/usr`，`$WTOOL_HOME` 默认 `$HOME`）：
 
   | 落点 | 是什么 |

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  tools/dsh-remote —— 用手机远程看着/接着指挥家里这台机器上的 DSH 会话。
+  dsh-projects/dsh-remote —— 用手机远程看着/接着指挥家里这台机器上的 DSH 会话。
 
   链路（Plan B，纯浏览器，不需要在手机上装任何东西）：
 
@@ -11,7 +11,7 @@
                                                              ▼
                                             家里 127.0.0.1:3080（dsh web）
 
-  **刻意做成独立项目**：只有 `wtool install tools/dsh-remote` 之后才会有
+  **刻意做成独立项目**：只有 `wtool install dsh-projects/dsh-remote` 之后才会有
   dsh-remote / dsh-notify 这两条命令。不装它就没有任何影响。
 
   两件事分开表达：
@@ -27,7 +27,9 @@
   <zshrc  src="env.zsh"/>
   <bashrc src="env.bash"/>
 
-  <!-- 没有构建步骤：源码包就是产物 -->
-  <publish kind="source"/>
+  <!-- 不参与发布（2026-10-20 用户口径）：只有开发机上需要，不该出现在任何
+       release 页里 —— 四条打包/发布命令（含 each）都跳过它，整机迁移包的
+       闭包也不含它。判据：publish-list / publish-info 的第 4 列（kind=none）。 -->
+  <publish kind="none"/>
 
 </wtool>
